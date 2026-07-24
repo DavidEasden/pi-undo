@@ -2,6 +2,19 @@ import { spawn, type ChildProcess } from "node:child_process";
 
 export const DEFAULT_STDERR_LIMIT = 64 * 1024;
 const TERMINATION_GRACE_MS = 50;
+const PROCESS_TREE_EXIT_TIMEOUT_MS = 1_000;
+const PROCESS_TREE_POLL_MS = 10;
+const activeProcessGroups = new Set<number>();
+
+process.once("exit", () => {
+	for (const processGroup of activeProcessGroups) {
+		try {
+			process.kill(-processGroup, "SIGKILL");
+		} catch {
+			// 进程组已经结束时无需处理。
+		}
+	}
+});
 
 export interface GitRunOptions {
 	readonly cwd?: string;
@@ -20,7 +33,7 @@ export interface GitRunResult {
 	readonly aborted: boolean;
 }
 
-export type GitRunErrorCode = "git_failed" | "git_spawn_failed";
+export type GitRunErrorCode = "git_failed" | "git_spawn_failed" | "git_termination_failed";
 
 export class GitRunError extends Error {
 	readonly code: GitRunErrorCode;
@@ -73,6 +86,7 @@ export class GitRunner {
 				reject(new GitRunError("git_spawn_failed", errorMessage(error)));
 				return;
 			}
+			trackProcessGroup(child);
 
 			const stdout: Buffer[] = [];
 			const stderr: Buffer[] = [];
@@ -85,6 +99,7 @@ export class GitRunner {
 			let forceKill: NodeJS.Timeout | undefined;
 			let closeResult: { code: number | null; signal: NodeJS.Signals | null } | undefined;
 			let terminationFinalized = false;
+			let terminationFailed = false;
 
 			child.stdout.on("data", (chunk: Buffer | string) => {
 				stdout.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -109,18 +124,18 @@ export class GitRunner {
 				aborted = reason === "abort";
 				signalProcessTree(child, "SIGTERM");
 				forceKill = setTimeout(() => {
-					signalProcessTree(child, "SIGKILL");
-					terminationFinalized = true;
-					finish();
+					void forceTerminateProcessTree(child).then((stopped) => {
+						terminationFailed = !stopped;
+						terminationFinalized = true;
+						finish();
+					});
 				}, TERMINATION_GRACE_MS);
-				forceKill.unref();
 			};
 
 			const onAbort = (): void => terminate("abort");
 			options.signal?.addEventListener("abort", onAbort, { once: true });
 			if (options.timeoutMs !== undefined) {
 				timeout = setTimeout(() => terminate("timeout"), options.timeoutMs);
-				timeout.unref();
 			}
 
 			const cleanUp = (): void => {
@@ -131,6 +146,7 @@ export class GitRunner {
 				if (forceKill) {
 					clearTimeout(forceKill);
 				}
+				untrackProcessGroup(child);
 				options.signal?.removeEventListener("abort", onAbort);
 			};
 
@@ -147,6 +163,10 @@ export class GitRunner {
 					timedOut,
 					aborted,
 				};
+				if (terminationFailed) {
+					reject(new GitRunError("git_termination_failed", "Git 进程组未能完全终止", result));
+					return;
+				}
 				if (!killed && closeResult.code !== 0) {
 					reject(new GitRunError("git_failed", `git 退出码为 ${String(closeResult.code)}`, result));
 					return;
@@ -173,6 +193,66 @@ export class GitRunner {
 				finish();
 			});
 		});
+	}
+}
+
+async function forceTerminateProcessTree(child: ChildProcess): Promise<boolean> {
+	if (process.platform === "win32" && child.pid !== undefined) {
+		await runTaskkill(child.pid, child);
+		return true;
+	}
+	signalProcessTree(child, "SIGKILL");
+	if (child.pid === undefined) {
+		return true;
+	}
+	const deadline = Date.now() + PROCESS_TREE_EXIT_TIMEOUT_MS;
+	while (processGroupExists(child.pid)) {
+		if (Date.now() >= deadline) {
+			return false;
+		}
+		await delay(PROCESS_TREE_POLL_MS);
+	}
+	return true;
+}
+
+function runTaskkill(pid: number, child: ChildProcess): Promise<void> {
+	return new Promise((resolve) => {
+		const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
+			stdio: "ignore",
+			windowsHide: true,
+		});
+		let settled = false;
+		const finish = (): void => {
+			if (settled) return;
+			settled = true;
+			resolve();
+		};
+		killer.once("error", () => {
+			child.kill("SIGKILL");
+			finish();
+		});
+		killer.once("close", finish);
+	});
+}
+
+function processGroupExists(processGroup: number): boolean {
+	try {
+		process.kill(-processGroup, 0);
+		return true;
+	} catch (error) {
+		return !hasErrorCode(error, "ESRCH");
+	}
+}
+
+function trackProcessGroup(child: ChildProcess): void {
+	if (process.platform !== "win32" && child.pid !== undefined) {
+		activeProcessGroups.add(child.pid);
+	}
+}
+
+function untrackProcessGroup(child: ChildProcess): void {
+	if (child.pid !== undefined) {
+		activeProcessGroups.delete(child.pid);
 	}
 }
 
@@ -209,6 +289,10 @@ function mergeEnvironment(overrides: Readonly<Record<string, string | undefined>
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+function delay(milliseconds: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function hasErrorCode(error: unknown, code: string): error is NodeJS.ErrnoException {
