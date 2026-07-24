@@ -125,4 +125,12 @@ describe("path safety", () => {
 			code: "symlink_escape",
 		});
 	});
+
+	it("允许最终 symlink 作为待替换路径", async () => {
+		const root = await temporaryRoot();
+		const outside = await temporaryRoot();
+		await symlink(outside, join(root, "link"), "dir");
+
+		await expect(assertNoSymlinkEscape(root, "link")).resolves.toBeUndefined();
+	});
 });
