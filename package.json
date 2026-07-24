@@ -1,0 +1,35 @@
+{
+	"name": "pi-undo",
+	"version": "0.1.0",
+	"description": "Persistent workspace undo and redo for Pi",
+	"type": "module",
+	"keywords": [
+		"pi-package"
+	],
+	"pi": {
+		"extensions": [
+			"./extensions/pi-undo.ts"
+		]
+	},
+	"scripts": {
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"typecheck": "tsc --noEmit"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "^0.80.10"
+	},
+	"dependencies": {
+		"proper-lockfile": "4.1.2"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "file:resources/pi-0.80.10/packages/coding-agent",
+		"@types/node": "24.12.4",
+		"@types/proper-lockfile": "4.1.4",
+		"typescript": "5.9.3",
+		"vitest": "4.1.9"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}
