@@ -28,8 +28,7 @@ export function relativeSafePath(root: string, candidate: string): string {
 	if (
 		canonicalRelative === ".." ||
 		canonicalRelative.startsWith(`..${sep}`) ||
-		isAbsolute(canonicalRelative) ||
-		canonicalRelative !== candidate
+		isAbsolute(canonicalRelative)
 	) {
 		fail("unsafe_path", "candidate 不在 root 内或不是规范路径");
 	}
@@ -48,11 +47,13 @@ export async function assertNoSymlinkEscape(root: string, relativePath: string):
 		current = join(current, parts[index]);
 		try {
 			const metadata = await lstat(current);
-			if (metadata.isSymbolicLink()) {
-				fail("symlink_escape", "路径组件不能是 symlink");
-			}
-			if (index < parts.length - 1 && !metadata.isDirectory()) {
-				fail("unsafe_path", "中间路径组件不是目录");
+			if (index < parts.length - 1) {
+				if (metadata.isSymbolicLink()) {
+					fail("symlink_escape", "中间路径组件不能是 symlink");
+				}
+				if (!metadata.isDirectory()) {
+					fail("unsafe_path", "中间路径组件不是目录");
+				}
 			}
 		} catch (error) {
 			if (hasErrorCode(error, "ENOENT")) {
