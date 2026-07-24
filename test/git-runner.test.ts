@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 
@@ -63,6 +63,22 @@ describe("GitRunner", () => {
 		expect(result.timedOut).toBe(true);
 	});
 
+	it("超时会终止 Git 进程组，避免后台子进程继续写入", async () => {
+		const markerRoot = await mkdtemp(join(tmpdir(), "pi-undo-marker-"));
+		temporaryRoots.push(markerRoot);
+		const marker = join(markerRoot, "created");
+		const fake = await fakeGit(`(sleep 0.2; touch "$MARKER") >/dev/null 2>&1 &\nsleep 5`);
+
+		const result = await new GitRunner().run([], {
+			env: { ...fake.env, MARKER: marker },
+			timeoutMs: 20,
+		});
+		await new Promise((resolve) => setTimeout(resolve, 300));
+
+		expect(result.killed).toBe(true);
+		await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
 	it("AbortSignal 终止进程并返回 killed", async () => {
 		const fake = await fakeGit("exec sleep 5");
 		const controller = new AbortController();
@@ -72,5 +88,14 @@ describe("GitRunner", () => {
 		const result = await pending;
 		expect(result.killed).toBe(true);
 		expect(result.aborted).toBe(true);
+	});
+
+	it("外部信号终止也会在错误结果中标记 killed", async () => {
+		const fake = await fakeGit("kill -TERM $$");
+
+		await expect(new GitRunner().run([], { env: fake.env })).rejects.toMatchObject({
+			code: "git_failed",
+			result: { code: null, killed: true },
+		});
 	});
 });
