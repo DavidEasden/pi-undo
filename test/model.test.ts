@@ -192,6 +192,32 @@ describe("assertManifest", () => {
 			expect.objectContaining({ code: "invalid_manifest" }),
 		);
 	});
+
+	it("拒绝通过非枚举字段脱离 checksum 的 manifest", () => {
+		const source = manifest();
+		const value = { schemaVersion: 1 } as Record<string, unknown>;
+		for (const [key, field] of Object.entries(source)) {
+			if (key === "schemaVersion" || key === "manifestId") continue;
+			Object.defineProperty(value, key, { value: field, enumerable: false });
+		}
+		Object.defineProperty(value, "manifestId", {
+			value: asManifestId(checksum(canonicalJson({ schemaVersion: 1 }))),
+			enumerable: false,
+		});
+
+		expect(() => assertManifest(value)).toThrowError(
+			expect.objectContaining({ code: "invalid_manifest" }),
+		);
+	});
+
+	it("拒绝缺少 workspace 根的 detached forest", () => {
+		const root = { ...manifest().roots[1], relativeRoot: "child", parentRoot: null };
+		const value = manifest({ roots: [root] });
+
+		expect(() => assertManifest(value)).toThrowError(
+			expect.objectContaining({ code: "invalid_manifest" }),
+		);
+	});
 });
 
 describe("assertCursor", () => {

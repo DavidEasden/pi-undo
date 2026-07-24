@@ -130,8 +130,8 @@ function encodeJson(value: unknown, ancestors: Set<object>): string {
 		throw new TypeError("canonicalJson 只接受普通对象");
 	}
 
-	if (Object.getOwnPropertySymbols(value).length > 0) {
-		throw new TypeError("canonicalJson 不接受 symbol 属性");
+	if (!hasOnlyEnumerableDataProperties(value)) {
+		throw new TypeError("canonicalJson 只接受自身的可枚举数据属性");
 	}
 
 	ancestors.add(value);
@@ -192,6 +192,9 @@ function assertRoots(value: unknown): void {
 
 	if (roots.size !== value.length) {
 		fail("noncanonical_roots", "roots 不能重复");
+	}
+	if (!roots.has(".")) {
+		fail("invalid_manifest", "roots 必须包含 workspace 根");
 	}
 	const rootPaths = [...roots];
 	for (const { relativeRoot, parentRoot } of rootParents) {
@@ -287,7 +290,19 @@ function assertRecord(value: unknown, code: ValidationCode, message: string): Re
 	if (!isPlainObject(value)) {
 		fail(code, message);
 	}
+	if (!hasOnlyEnumerableDataProperties(value)) {
+		fail(code, message);
+	}
 	return value;
+}
+
+function hasOnlyEnumerableDataProperties(value: object): boolean {
+	if (Object.getOwnPropertySymbols(value).length > 0) {
+		return false;
+	}
+	return Object.values(Object.getOwnPropertyDescriptors(value)).every(
+		(descriptor) => descriptor.enumerable && Object.hasOwn(descriptor, "value"),
+	);
 }
 
 function assertNonEmptyString(value: unknown, code: ValidationCode, message: string): asserts value is string {
