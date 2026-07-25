@@ -16,6 +16,15 @@ import type {
 
 const asManifestId = (value: string): ManifestId => value as ManifestId;
 
+function ignoredProof(coverage: string, ignoredPresentPaths: readonly string[] = []) {
+	const ignorePolicy = "git-check-ignore-v1";
+	return {
+		ignorePolicy,
+		ignoredPresentPaths,
+		ignoreClosure: checksum(canonicalJson({ coverage, ignorePolicy, ignoredPresentPaths })),
+	};
+}
+
 const discoveryRoot = {
 	relativeRoot: ".",
 	parentRoot: null,
@@ -54,7 +63,7 @@ function manifest(overrides: Partial<SnapshotManifest> = {}): SnapshotManifest {
 				privateRepositoryId: checksum(outerSourceIdentity),
 				treeId: "tree-outer",
 				coverage: "complete",
-				ignorePolicy: "git-check-ignore-v1",
+				...ignoredProof("complete"),
 				objectClosure: "a".repeat(64),
 			},
 			{
@@ -65,7 +74,7 @@ function manifest(overrides: Partial<SnapshotManifest> = {}): SnapshotManifest {
 				privateRepositoryId: checksum(childSourceIdentity),
 				treeId: "tree-child",
 				coverage: "complete",
-				ignorePolicy: "git-check-ignore-v1",
+				...ignoredProof("complete"),
 				objectClosure: "b".repeat(64),
 			},
 		],
@@ -232,6 +241,21 @@ describe("assertManifest", () => {
 		);
 	});
 
+	it.each([
+		["active", null],
+		["uninitialized", "tree-uninitialized"],
+		["broken", "tree-broken"],
+	] as const)("拒绝 state/treeId 非法组合：%s + %s", (state, treeId) => {
+		const base = manifest();
+		const value = manifest({
+			roots: [{ ...base.roots[0], state, treeId }, base.roots[1]],
+		});
+
+		expect(() => assertManifest(value)).toThrowError(
+			expect.objectContaining({ code: "invalid_manifest" }),
+		);
+	});
+
 	it.each(["invalid", "paths:not-a-checksum", "none"])("拒绝非法全局 coverage：%s", (coverage) => {
 		const value = manifest({ coverage });
 
@@ -271,6 +295,83 @@ describe("assertManifest", () => {
 		);
 	});
 
+	it("拒绝缺少 ignored-present proof 的旧 manifest", () => {
+		const base = manifest();
+		const legacyRoot = { ...base.roots[0] } as Record<string, unknown>;
+		delete legacyRoot.ignoredPresentPaths;
+		delete legacyRoot.ignoreClosure;
+		const value = manifest({
+			roots: [legacyRoot as unknown as SnapshotManifest["roots"][number], base.roots[1]],
+		});
+
+		expect(() => assertManifest(value)).toThrowError(
+			expect.objectContaining({ code: "invalid_manifest" }),
+		);
+	});
+
+	it.each([
+		["未排序", ["z.txt", "a.txt"]],
+		["重复", ["same.txt", "same.txt"]],
+		["前缀冲突", ["dir", "dir/file.txt"]],
+		["越界", ["../escape.txt"]],
+		["Git metadata", [".git/config"]],
+	] as const)("拒绝 ignored-present proof 路径%s", (_name, ignoredPresentPaths) => {
+		const base = manifest();
+		const roots = [{
+			...base.roots[0],
+			...ignoredProof(base.roots[0].coverage, ignoredPresentPaths),
+		}, base.roots[1]];
+		const value = manifest({ roots });
+
+		expect(() => assertManifest(value)).toThrowError(
+			expect.objectContaining({ code: "invalid_manifest" }),
+		);
+	});
+
+	it.each(["packages", "packages/child", "packages/child/ignored.txt"])(
+		"拒绝父 root ignored-present proof 与 descendant root 冲突：%s",
+		(ignoredPath) => {
+			const base = manifest();
+			const value = manifest({
+				roots: [{
+					...base.roots[0],
+					...ignoredProof("complete", [ignoredPath]),
+				}, base.roots[1]],
+			});
+
+			expect(() => assertManifest(value)).toThrowError(
+				expect.objectContaining({ code: "invalid_manifest" }),
+			);
+		},
+	);
+
+	it("拒绝 ignored-present proof closure 不匹配", () => {
+		const base = manifest();
+		const value = manifest({
+			roots: [{ ...base.roots[0], ignoreClosure: "0".repeat(64) }, base.roots[1]],
+		});
+
+		expect(() => assertManifest(value)).toThrowError(
+			expect.objectContaining({ code: "invalid_manifest" }),
+		);
+	});
+
+	it("拒绝 inactive root 携带 ignored-present proof", () => {
+		const base = manifest();
+		const value = manifest({
+			roots: [{
+				...base.roots[0],
+				state: "uninitialized",
+				treeId: null,
+				...ignoredProof("complete", ["ignored.txt"]),
+			}, base.roots[1]],
+		});
+
+		expect(() => assertManifest(value)).toThrowError(
+			expect.objectContaining({ code: "invalid_manifest" }),
+		);
+	});
+
 	it("拒绝不存在的 parentRoot", () => {
 		const value = manifest({
 			roots: [
@@ -297,7 +398,7 @@ describe("assertManifest", () => {
 					privateRepositoryId: checksum("source-packages"),
 					treeId: "tree-packages",
 					coverage: "complete",
-					ignorePolicy: "git-check-ignore-v1",
+					...ignoredProof("complete"),
 					objectClosure: "c".repeat(64),
 				},
 				{ ...base.roots[1], parentRoot: "." },

@@ -3,7 +3,13 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { fsyncDirectory, writeContentAddressed, writeJsonAtomic } from "./atomic-fs.ts";
-import { assertManifest, canonicalJson, checksum, topologyFingerprint } from "./encoding.ts";
+import {
+	assertManifest,
+	canonicalJson,
+	checksum,
+	ignoredPresentClosure,
+	topologyFingerprint,
+} from "./encoding.ts";
 import { GitRunner, type GitRunOptions } from "./git-runner.ts";
 import type {
 	DiscoveryRoot,
@@ -49,6 +55,8 @@ interface CapturedRootResult {
 	readonly treeId: string;
 	readonly coverage: string;
 	readonly ignorePolicy: string;
+	readonly ignoredPresentPaths: readonly string[];
+	readonly ignoreClosure: string;
 	readonly objectClosure: string;
 }
 
@@ -134,10 +142,11 @@ export class SnapshotStore {
 			const roots: SnapshotRoot[] = [];
 			for (const root of topology.roots) {
 				if (root.state !== "active") {
+					const coverage = rootCaptureCoverage(root.relativeRoot, scope);
 					roots.push(snapshotRoot(root, {
 						treeId: null,
-						coverage: rootCaptureCoverage(root.relativeRoot, scope),
-						ignorePolicy: IGNORE_POLICY,
+						coverage,
+						...ignoredPresentProof(coverage, []),
 						objectClosure: inactiveRootClosure(root),
 					}));
 					continue;
@@ -199,7 +208,11 @@ export class SnapshotStore {
 		const storeDirectory = dirname(dirname(manifestPath));
 		try {
 			for (const root of manifest.roots) {
-				if (root.ignorePolicy !== IGNORE_POLICY || root.objectClosure === undefined) {
+				if (
+					root.ignorePolicy !== IGNORE_POLICY ||
+					root.ignoreClosure !== ignoredPresentClosure(root) ||
+					root.objectClosure === undefined
+				) {
 					throw new SnapshotStoreError("object_missing", "manifest root 元数据不受支持");
 				}
 				if (root.state !== "active" || root.treeId === null) {
@@ -212,6 +225,12 @@ export class SnapshotStore {
 				await this.assertNoAlternates(gitDirectory);
 				await this.runPrivateGit(gitDirectory, ["cat-file", "-e", `${root.treeId}^{tree}`]);
 				const entries = await this.readTreeEntries(gitDirectory, root.treeId);
+				if (root.ignoredPresentPaths.some((ignoredPath) => entries.some(
+					(entry) => isPathAtOrBelow(ignoredPath, entry.relativePath) ||
+						isPathAtOrBelow(entry.relativePath, ignoredPath),
+				))) {
+					throw new SnapshotStoreError("object_missing", "ignored-present proof 与 root tree 冲突");
+				}
 				for (const entry of entries) {
 					await this.runPrivateGit(gitDirectory, ["cat-file", "-e", `${entry.objectId}^{blob}`]);
 				}
@@ -432,6 +451,14 @@ export class SnapshotStore {
 			.map((candidate) => rootRelativePath(root.relativeRoot, candidate.relativeRoot));
 		const inclusions = ownedRootInclusions(requestedInclusions, exclusions);
 		await this.stageWorktree(absoluteRoot, environment, root.gitBacked, inclusions, exclusions);
+		const coverage = rootCoverageFromInclusions(inclusions);
+		const ignoredPresentPaths = await this.captureIgnoredPresentPaths(
+			absoluteRoot,
+			environment,
+			root.gitBacked,
+			inclusions,
+			exclusions,
+		);
 		const treeId = (await this.runGit(["write-tree"], { cwd: absoluteRoot, env: environment })).trim();
 		if (!isObjectId(treeId)) {
 			throw new SnapshotStoreError("capture_failed", "git write-tree 未返回有效对象 ID");
@@ -443,10 +470,58 @@ export class SnapshotStore {
 		}
 		return {
 			treeId,
-			coverage: rootCoverageFromInclusions(inclusions),
-			ignorePolicy: IGNORE_POLICY,
+			coverage,
+			...ignoredPresentProof(coverage, ignoredPresentPaths),
 			objectClosure: treeObjectClosure(treeId, entries),
 		};
+	}
+
+	private async captureIgnoredPresentPaths(
+		cwd: string,
+		environment: Readonly<Record<string, string | undefined>>,
+		gitBacked: boolean,
+		inclusions: readonly string[] | null,
+		exclusions: readonly string[],
+	): Promise<string[]> {
+		if (inclusions === null) {
+			return [];
+		}
+		const pathspecs = inclusions.length === 0 ? ["."] : inclusions.map(literalPathspec);
+		for (const excluded of exclusions) {
+			pathspecs.push(excludeLiteralPathspec(excluded));
+		}
+		const output = await this.runGitBytes([
+			...(gitBacked ? ["-c", "core.fsmonitor=false"] : []),
+			"ls-files",
+			"--others",
+			"--ignored",
+			"--exclude-standard",
+			"-z",
+			"--",
+			...pathspecs,
+		], { cwd, env: gitBacked ? sourceGitEnvironment() : environment });
+		const result = new Set<string>();
+		for (const relativePath of parseNulPaths(output)) {
+			if (exclusions.some((excluded) => isPathAtOrBelow(excluded, relativePath))) {
+				continue;
+			}
+			await assertNoSymlinkEscape(cwd, relativePath);
+			const metadata = await lstat(join(cwd, ...relativePath.split("/"))).catch((error) => {
+				if (hasErrorCode(error, "ENOENT")) return null;
+				throw error;
+			});
+			if (metadata === null) {
+				continue;
+			}
+			if (!metadata.isFile() && !metadata.isSymbolicLink()) {
+				throw new SnapshotStoreError("capture_failed", `ignored-present proof 只接受叶子路径：${relativePath}`);
+			}
+			if (result.has(relativePath)) {
+				throw new SnapshotStoreError("capture_failed", `ignored-present proof 包含重复路径：${relativePath}`);
+			}
+			result.add(relativePath);
+		}
+		return [...result].sort(comparePaths);
 	}
 
 	private async stageWorktree(
@@ -781,6 +856,8 @@ function snapshotRoot(
 		readonly treeId: string | null;
 		readonly coverage: string;
 		readonly ignorePolicy: string;
+		readonly ignoredPresentPaths: readonly string[];
+		readonly ignoreClosure: string;
 		readonly objectClosure: string;
 	},
 ): SnapshotRoot {
@@ -793,8 +870,23 @@ function snapshotRoot(
 		treeId: capture.treeId,
 		coverage: capture.coverage,
 		ignorePolicy: capture.ignorePolicy,
+		ignoredPresentPaths: capture.ignoredPresentPaths,
+		ignoreClosure: capture.ignoreClosure,
 		objectClosure: capture.objectClosure,
 		...(root.gitlinkOid === undefined ? {} : { gitlinkOid: root.gitlinkOid }),
+	};
+}
+
+function ignoredPresentProof(coverage: string, ignoredPresentPaths: readonly string[]) {
+	const proof = {
+		coverage,
+		ignorePolicy: IGNORE_POLICY,
+		ignoredPresentPaths,
+	};
+	return {
+		ignorePolicy: proof.ignorePolicy,
+		ignoredPresentPaths,
+		ignoreClosure: ignoredPresentClosure(proof),
 	};
 }
 

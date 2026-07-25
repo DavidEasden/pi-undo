@@ -5,6 +5,7 @@ import type {
 	ManifestId,
 	RootTopologyIdentity,
 	SnapshotManifest,
+	SnapshotRoot,
 	TopologyFingerprint,
 } from "./model.ts";
 
@@ -35,6 +36,16 @@ export function canonicalJson(value: unknown): string {
 export function checksum(value: string | Uint8Array): string {
 	const input = typeof value === "string" ? value : Buffer.from(value);
 	return createHash("sha256").update(input).digest("hex");
+}
+
+export function ignoredPresentClosure(
+	root: Pick<SnapshotRoot, "coverage" | "ignorePolicy" | "ignoredPresentPaths">,
+): string {
+	return checksum(canonicalJson({
+		coverage: root.coverage,
+		ignorePolicy: root.ignorePolicy,
+		ignoredPresentPaths: root.ignoredPresentPaths,
+	}));
 }
 
 export function topologyFingerprint(
@@ -194,6 +205,7 @@ function assertRoots(value: unknown): asserts value is SnapshotManifest["roots"]
 	let previousRoot: string | undefined;
 	const roots = new Set<string>();
 	const rootParents: Array<{ relativeRoot: string; parentRoot: string | null }> = [];
+	const ignoredPathsByRoot: Array<{ relativeRoot: string; paths: readonly string[] }> = [];
 	for (const root of value) {
 		const record = assertRecord(root, "invalid_manifest", "root 必须是对象");
 		assertCanonicalRoot(record.relativeRoot);
@@ -222,11 +234,27 @@ function assertRoots(value: unknown): asserts value is SnapshotManifest["roots"]
 		if (record.treeId !== null) {
 			assertNonEmptyString(record.treeId, "invalid_manifest", "treeId 无效");
 		}
+		if (record.state === "active" ? record.treeId === null : record.treeId !== null) {
+			fail("invalid_manifest", "root state 与 treeId 不一致");
+		}
 		if (record.gitlinkOid !== undefined) {
 			assertNonEmptyString(record.gitlinkOid, "invalid_manifest", "gitlinkOid 无效");
 		}
 		assertCoverage(record.coverage, true, "root coverage 无效");
 		assertNonEmptyString(record.ignorePolicy, "invalid_manifest", "root ignorePolicy 缺失");
+		assertIgnoredPresentPaths(record.ignoredPresentPaths);
+		if ((record.coverage === "none" || record.state !== "active") && record.ignoredPresentPaths.length > 0) {
+			fail("invalid_manifest", "inactive 或 coverage 为 none 的 root 不能包含 ignored-present proof");
+		}
+		assertChecksum(record.ignoreClosure, "invalid_manifest", "root ignoreClosure 无效");
+		if (record.ignoreClosure !== ignoredPresentClosure({
+			coverage: record.coverage,
+			ignorePolicy: record.ignorePolicy,
+			ignoredPresentPaths: record.ignoredPresentPaths,
+		})) {
+			fail("invalid_manifest", "root ignored-present proof closure 不匹配");
+		}
+		ignoredPathsByRoot.push({ relativeRoot, paths: record.ignoredPresentPaths });
 		assertChecksum(record.objectClosure, "invalid_manifest", "root objectClosure 无效");
 	}
 
@@ -245,6 +273,19 @@ function assertRoots(value: unknown): asserts value is SnapshotManifest["roots"]
 			fail("invalid_manifest", "parentRoot 必须是已声明的最近祖先");
 		}
 	}
+	for (const { relativeRoot, paths } of ignoredPathsByRoot) {
+		const descendantRoots = rootPaths.filter((candidate) => isStrictRootAncestor(relativeRoot, candidate));
+		for (const path of paths) {
+			const workspacePath = relativeRoot === "." ? path : `${relativeRoot}/${path}`;
+			if (descendantRoots.some(
+				(descendantRoot) => workspacePath === descendantRoot ||
+					workspacePath.startsWith(`${descendantRoot}/`) ||
+					descendantRoot.startsWith(`${workspacePath}/`),
+			)) {
+				fail("invalid_manifest", "root ignoredPresentPaths 不能与 descendant root 冲突");
+			}
+		}
+	}
 }
 
 function assertCoverage(value: unknown, allowNone: boolean, message: string): asserts value is string {
@@ -256,6 +297,38 @@ function assertCoverage(value: unknown, allowNone: boolean, message: string): as
 		return;
 	}
 	fail("invalid_manifest", message);
+}
+
+function assertIgnoredPresentPaths(value: unknown): asserts value is string[] {
+	if (!Array.isArray(value)) {
+		fail("invalid_manifest", "root ignoredPresentPaths 必须是数组");
+	}
+	let previous: string | undefined;
+	const paths = new Set<string>();
+	for (let index = 0; index < value.length; index += 1) {
+		if (!Object.prototype.hasOwnProperty.call(value, index)) {
+			fail("invalid_manifest", "root ignoredPresentPaths 必须是稠密数组");
+		}
+		const path = value[index];
+		if (
+			typeof path !== "string" ||
+			path === "." ||
+			!isCanonicalRoot(path) ||
+			path.split("/").some((component) => component.toLowerCase() === ".git")
+		) {
+			fail("invalid_manifest", "root ignoredPresentPaths 包含不安全路径");
+		}
+		if (previous !== undefined && previous >= path) {
+			fail("invalid_manifest", "root ignoredPresentPaths 必须严格排序且不能重复");
+		}
+		if (path.split("/").slice(0, -1).some(
+			(_part, ancestorIndex, parts) => paths.has(parts.slice(0, ancestorIndex + 1).join("/")),
+		)) {
+			fail("invalid_manifest", "root ignoredPresentPaths 不能包含叶子前缀冲突");
+		}
+		paths.add(path);
+		previous = path;
+	}
 }
 
 function assertCursorFields(record: Record<string, unknown>): void {

@@ -1,10 +1,11 @@
 import { access, chmod, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
-import { canonicalJson, checksum } from "../src/encoding.ts";
+import { canonicalJson, checksum, ignoredPresentClosure } from "../src/encoding.ts";
 import { GitRunner, type GitRunOptions, type GitRunResult } from "../src/git-runner.ts";
+import type { ManifestId, SnapshotManifest } from "../src/model.ts";
 import { RootDiscovery, type RootTopology } from "../src/root-discovery.ts";
 import { SnapshotStore } from "../src/snapshot-store.ts";
 import { WorkspaceLock } from "../src/workspace-lock.ts";
@@ -142,6 +143,40 @@ async function expectNoPublishedManifest(storeRoot: string): Promise<void> {
 	expect(files.filter((file) => file.includes("/manifests/") && file.endsWith(".json"))).toEqual([]);
 }
 
+async function publishManifestWithIgnoredPath(
+	storeRoot: string,
+	manifest: SnapshotManifest,
+	ignoredPath: string,
+): Promise<SnapshotManifest> {
+	const roots = manifest.roots.map((root, index) => {
+		if (index !== 0) return root;
+		const ignoredPresentPaths = [ignoredPath];
+		return {
+			...root,
+			ignoredPresentPaths,
+			ignoreClosure: ignoredPresentClosure({ ...root, ignoredPresentPaths }),
+		};
+	});
+	const { manifestId: _manifestId, ...manifestFields } = manifest;
+	const semantic: Omit<SnapshotManifest, "manifestId"> = { ...manifestFields, roots };
+	const forged = {
+		...semantic,
+		manifestId: checksum(canonicalJson(semantic)) as ManifestId,
+	};
+	const sourcePath = (await filesBelow(storeRoot)).find(
+		(path) => path.endsWith(`/manifests/${manifest.manifestId}.json`),
+	);
+	if (sourcePath === undefined) {
+		throw new Error("测试 manifest 路径不存在");
+	}
+	await writeFixtureFile(
+		storeRoot,
+		`${dirname(sourcePath)}/${forged.manifestId}.json`,
+		canonicalJson(forged),
+	);
+	return forged;
+}
+
 describe("SnapshotStore", () => {
 	it("storeRoot 位于 workspace 内时拒绝且不留下目录", async () => {
 		const workspace = await temporaryRoot("pi-undo-snapshot-");
@@ -200,8 +235,11 @@ describe("SnapshotStore", () => {
 		expect(manifest.roots[0]).toEqual(expect.objectContaining({
 			coverage: "complete",
 			ignorePolicy: "git-check-ignore-v1",
+			ignoredPresentPaths: ["ignored.txt"],
+			ignoreClosure: expect.stringMatching(/^[0-9a-f]{64}$/),
 			objectClosure: expect.stringMatching(/^[0-9a-f]{64}$/),
 		}));
+		expect(manifest.roots[0]?.ignoreClosure).toBe(ignoredPresentClosure(manifest.roots[0]!));
 		expect(paths).toContain("tracked.txt");
 		expect(paths).toContain("binary.bin");
 		expect(paths).toContain("large.bin");
@@ -258,6 +296,21 @@ describe("SnapshotStore", () => {
 
 		expect((await store.listTree(manifest.manifestId, ".")).map((entry) => entry.relativePath))
 			.toEqual([specialPath]);
+	});
+
+	it("partial scope 的 ignored-present proof 只记录 scope 内现存叶子", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, ".gitignore", "scoped-ignored.txt\noutside-ignored.txt\n");
+		await writeFixtureFile(workspace, "scoped-ignored.txt", "scoped\n");
+		await writeFixtureFile(workspace, "outside-ignored.txt", "outside\n");
+		const topology = await new RootDiscovery().discover(workspace);
+		const store = new SnapshotStore({ storeRoot });
+
+		const manifest = await store.capture(topology, ["scoped-ignored.txt"]);
+
+		expect(manifest.roots[0]?.ignoredPresentPaths).toEqual(["scoped-ignored.txt"]);
+		expect(manifest.roots[0]?.ignoreClosure).toBe(ignoredPresentClosure(manifest.roots[0]!));
 	});
 
 	it("忽略 .gitattributes 的 clean/eol 转换，保存工作区原始字节", async () => {
@@ -494,6 +547,7 @@ describe("SnapshotStore", () => {
 		expect(paths).toContain("tracked-ignored.txt");
 		expect(paths).toContain("untracked-visible.txt");
 		expect(paths).not.toContain("untracked-ignored.txt");
+		expect(manifest.roots[0]?.ignoredPresentPaths).toEqual(["untracked-ignored.txt"]);
 	});
 
 	it("Git-backed root 不把已从 worktree 删除的 tracked 文件写入快照", async () => {
@@ -525,6 +579,7 @@ describe("SnapshotStore", () => {
 
 		expect(paths).toContain("info-visible.txt");
 		expect(paths).not.toContain("info-ignored.txt");
+		expect(manifest.roots[0]?.ignoredPresentPaths).toEqual(["info-ignored.txt"]);
 	});
 
 	it("Git-backed source 查询清除继承 repository/index/config 环境并禁用 fsmonitor", async () => {
@@ -586,6 +641,10 @@ describe("SnapshotStore", () => {
 		expect(outerPaths.some((path) => path === "modules/child" || path.startsWith("modules/child/"))).toBe(false);
 		expect(childPaths).toContain("child-untracked.txt");
 		expect(childPaths).not.toContain("child-ignored.txt");
+		expect(manifest.roots.find((root) => root.relativeRoot === ".")?.ignoredPresentPaths)
+			.not.toContain("modules/child/child-ignored.txt");
+		expect(manifest.roots.find((root) => root.relativeRoot === "modules/child")?.ignoredPresentPaths)
+			.toEqual(["child-ignored.txt"]);
 		expect(await readGitMetadata(outer.root)).toEqual(outerBefore);
 		expect(await readGitMetadata(child.root)).toEqual(childBefore);
 		expect(await runGit(outer.root, ["reflog", "show", "--format=%H%x00%gs"])).toBe(outerReflog);
@@ -667,6 +726,22 @@ describe("SnapshotStore", () => {
 		await expect(store.assertComplete(manifest.manifestId)).resolves.toBeUndefined();
 		expect((await store.listTree(manifest.manifestId, ".")).map((entry) => entry.relativePath)).toContain("dirty.txt");
 		expect((await filesBelow(storeRoot)).some((file) => file.endsWith("objects/info/alternates"))).toBe(false);
+	});
+
+	it.each([
+		["exact", "visible/file.txt"],
+		["ancestor", "visible"],
+		["descendant", "visible/file.txt/child.txt"],
+	] as const)("assertComplete 拒绝 ignored-present proof 与 visible tree %s 冲突", async (_kind, ignoredPath) => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		await writeFixtureFile(workspace, "visible/file.txt", "visible\n");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		const topology = await new RootDiscovery().discover(workspace);
+		const store = new SnapshotStore({ storeRoot });
+		const manifest = await store.capture(topology);
+		const forged = await publishManifestWithIgnoredPath(storeRoot, manifest, ignoredPath);
+
+		await expect(store.assertComplete(forged.manifestId)).rejects.toMatchObject({ code: "object_missing" });
 	});
 
 	it("私有 Git 命令显式清除继承的 repository、index 与 worktree 环境", async () => {
