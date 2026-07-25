@@ -178,6 +178,40 @@ describe("MutationJournal", () => {
 		await expect(journal.advance(1, "SOURCE_QUARANTINED")).rejects.toThrow("严格推进");
 	});
 
+	it("rollback 专用终结允许从任一 active 状态直接进入 CLEANED 并可重载", async () => {
+		const activeStates = [
+			"INTENT",
+			"SOURCE_QUARANTINED",
+			"SOURCE_VERIFIED",
+			"TARGET_INSTALLED",
+			"TARGET_VERIFIED",
+		] as const;
+		for (const targetState of activeStates) {
+			const { journal, file } = await journalFixture();
+			await journal.begin(intent());
+			for (const state of activeStates.slice(1)) {
+				if (stateOrderForTest(state) > stateOrderForTest(targetState)) break;
+				await journal.advance(1, state);
+			}
+
+			const cleaned = await journal.markRollbackCleaned(1);
+
+			expect(cleaned.state).toBe("CLEANED");
+			expect(await new MutationJournal(file, "operation-1").load()).toEqual([cleaned]);
+			await expect(journal.assertCleaned()).resolves.toBeUndefined();
+		}
+	});
+
+	it("rollback 终结拒绝缺失 ordinal、CLEANED 重复调用，普通 advance 仍拒绝跳到 CLEANED", async () => {
+		const { journal } = await journalFixture();
+		await expect(journal.markRollbackCleaned(1)).rejects.toThrow("rollback");
+		await journal.begin(intent());
+		await expect(journal.advance(1, "CLEANED")).rejects.toThrow("严格推进");
+		await journal.markRollbackCleaned(1);
+		await expect(journal.markRollbackCleaned(1)).rejects.toThrow("rollback");
+		await expect(journal.advance(1, "SOURCE_QUARANTINED")).rejects.toThrow("严格推进");
+	});
+
 	it("拒绝同一 ordinal 的不同 immutable payload", async () => {
 		const { journal, file } = await journalFixture();
 		const first = record("operation-1", 1, "INTENT", null);
@@ -286,3 +320,8 @@ describe("MutationJournal", () => {
 		expect(await readFile(file, "utf8")).toMatch(/\n$/);
 	});
 });
+
+function stateOrderForTest(state: MutationState): number {
+	return ["INTENT", "SOURCE_QUARANTINED", "SOURCE_VERIFIED", "TARGET_INSTALLED", "TARGET_VERIFIED"]
+		.indexOf(state);
+}

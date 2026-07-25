@@ -95,6 +95,18 @@ export async function fsyncDirectory(directory: string): Promise<void> {
 	}
 }
 
+export async function writeBytesExclusive(file: string, bytes: Uint8Array, mode: number): Promise<void> {
+	const handle = await open(file, "wx", mode);
+	try {
+		await handle.writeFile(Buffer.from(bytes));
+		await handle.chmod(mode);
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+	await fsyncDirectory(dirname(file));
+}
+
 async function targetMode(file: string, mode: number | undefined): Promise<number> {
 	if (mode !== undefined) {
 		if (!Number.isInteger(mode) || mode < 0 || mode > 0o7777) {

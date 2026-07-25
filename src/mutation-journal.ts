@@ -65,12 +65,33 @@ export class MutationJournal {
 		return this.enqueueMutation(() => this.advanceMutation(ordinal, state));
 	}
 
+	markRollbackCleaned(ordinal: number): Promise<MutationRecord> {
+		return this.enqueueMutation(() => this.markRollbackCleanedMutation(ordinal));
+	}
+
+	private async markRollbackCleanedMutation(ordinal: number): Promise<MutationRecord> {
+		const current = await this.readRecords();
+		const previous = current.latest[ordinal - 1];
+		if (previous === undefined || previous.state === "CLEANED") {
+			throw new Error(`mutation rollback 终结状态无效：${previous?.state ?? "missing"}`);
+		}
+		return this.appendState(current, previous, "CLEANED");
+	}
+
 	private async advanceMutation(ordinal: number, state: MutationState): Promise<MutationRecord> {
 		const current = await this.readRecords();
 		const previous = current.latest[ordinal - 1];
 		if (previous === undefined || stateOrder.indexOf(state) !== stateOrder.indexOf(previous.state) + 1) {
 			throw new Error(`mutation state 必须严格推进：${previous?.state ?? "missing"} -> ${state}`);
 		}
+		return this.appendState(current, previous, state);
+	}
+
+	private async appendState(
+		current: Awaited<ReturnType<MutationJournal["readRecords"]>>,
+		previous: MutationRecord,
+		state: MutationState,
+	): Promise<MutationRecord> {
 		const content = {
 			schemaVersion: previous.schemaVersion,
 			opId: previous.opId,
@@ -148,7 +169,7 @@ export class MutationJournal {
 				if (immutablePayload(previous) !== immutablePayload(record)) {
 					throw new Error("同一 mutation ordinal 的 immutable payload 冲突");
 				}
-				if (stateOrder.indexOf(record.state) !== stateOrder.indexOf(previous.state) + 1) {
+				if (!isValidDurableTransition(previous.state, record.state)) {
 					throw new Error("mutation state 未严格推进");
 				}
 			}
@@ -175,6 +196,11 @@ export class MutationJournal {
 		}
 		await fsyncDirectory(directory);
 	}
+}
+
+function isValidDurableTransition(previous: MutationState, next: MutationState): boolean {
+	return stateOrder.indexOf(next) === stateOrder.indexOf(previous) + 1 ||
+		(next === "CLEANED" && previous !== "CLEANED");
 }
 
 function immutablePayload(record: MutationRecord): string {
