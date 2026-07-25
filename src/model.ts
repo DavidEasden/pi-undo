@@ -20,14 +20,25 @@ export type ResultCode =
 	| "refill_skipped"
 	| "refill_failed";
 
-export interface SnapshotRoot {
+export interface RootTopologyIdentity {
 	readonly relativeRoot: string;
 	readonly parentRoot: string | null;
 	readonly state: RootState;
 	readonly sourceIdentity: string;
 	readonly privateRepositoryId: string;
-	readonly treeId: string | null;
 	readonly gitlinkOid?: string;
+}
+
+export interface DiscoveryRoot extends RootTopologyIdentity {
+	readonly treeId: string | null;
+	readonly gitBacked: boolean;
+}
+
+export interface SnapshotRoot extends RootTopologyIdentity {
+	readonly treeId: string | null;
+	readonly coverage: string;
+	readonly ignorePolicy: string;
+	readonly objectClosure: string;
 }
 
 export interface SnapshotManifest {

@@ -4,42 +4,81 @@ import {
 	assertManifest,
 	canonicalJson,
 	checksum,
+	topologyFingerprint,
 } from "../src/encoding.ts";
 import type {
 	CursorState,
+	DiscoveryRoot,
 	ManifestId,
 	SnapshotManifest,
+	SnapshotRoot,
 } from "../src/model.ts";
 
 const asManifestId = (value: string): ManifestId => value as ManifestId;
 
+const discoveryRoot = {
+	relativeRoot: ".",
+	parentRoot: null,
+	state: "active" as const,
+	sourceIdentity: "workspace-1",
+	privateRepositoryId: checksum("workspace-1"),
+	treeId: null,
+	gitBacked: false,
+} satisfies DiscoveryRoot;
+
+// @ts-expect-error 持久化 root 必须包含 capture 元数据。
+const incompleteSnapshotRoot: SnapshotRoot = {
+	relativeRoot: ".",
+	parentRoot: null,
+	state: "active",
+	sourceIdentity: "workspace-1",
+	privateRepositoryId: checksum("workspace-1"),
+	treeId: null,
+};
+
+void incompleteSnapshotRoot;
+
 function manifest(overrides: Partial<SnapshotManifest> = {}): SnapshotManifest {
+	const outerSourceIdentity = "source-outer";
+	const childSourceIdentity = "source-child";
 	const payload = {
 		schemaVersion: 1 as const,
 		workspaceIdentity: "workspace-1",
-		topologyFingerprint: "topology-1",
 		coverage: "complete",
 		roots: [
 			{
 				relativeRoot: ".",
 				parentRoot: null,
 				state: "active" as const,
-				sourceIdentity: "source-outer",
-				privateRepositoryId: "repo-outer",
+				sourceIdentity: outerSourceIdentity,
+				privateRepositoryId: checksum(outerSourceIdentity),
 				treeId: "tree-outer",
+				coverage: "complete",
+				ignorePolicy: "git-check-ignore-v1",
+				objectClosure: "a".repeat(64),
 			},
 			{
 				relativeRoot: "packages/child",
 				parentRoot: ".",
 				state: "active" as const,
-				sourceIdentity: "source-child",
-				privateRepositoryId: "repo-child",
+				sourceIdentity: childSourceIdentity,
+				privateRepositoryId: checksum(childSourceIdentity),
 				treeId: "tree-child",
+				coverage: "complete",
+				ignorePolicy: "git-check-ignore-v1",
+				objectClosure: "b".repeat(64),
 			},
 		],
 		createdAt: "2026-07-24T00:00:00.000Z",
 	};
-	const next = { ...payload, ...overrides };
+	const merged = { ...payload, ...overrides };
+	const next = {
+		...merged,
+		topologyFingerprint: overrides.topologyFingerprint ?? topologyFingerprint(
+			merged.workspaceIdentity,
+			merged.roots,
+		),
+	};
 	const { manifestId: _manifestId, ...content } = next as typeof next & {
 		manifestId?: ManifestId;
 	};
@@ -68,6 +107,10 @@ function cursor(overrides: Partial<CursorState> = {}): CursorState {
 }
 
 describe("canonicalJson", () => {
+	it("discovery root 不需要持久化阶段的 capture 元数据", () => {
+		expect(discoveryRoot.gitBacked).toBe(false);
+	});
+
 	it("递归排序对象 key，并保留数组的语义顺序", () => {
 		const a = canonicalJson({ z: 1, a: { y: 2, x: 3 }, items: [{ b: 2, a: 1 }, "二"] });
 		const b = canonicalJson({ items: [{ a: 1, b: 2 }, "二"], a: { x: 3, y: 2 }, z: 1 });
@@ -100,6 +143,35 @@ describe("canonicalJson", () => {
 
 		expect(() => canonicalJson(withProperty)).toThrow();
 		expect(() => canonicalJson(withSymbol)).toThrow();
+	});
+
+	it("topology fingerprint 只包含 workspace identity 与 root 拓扑身份字段", () => {
+		const sourceIdentity = "source-outer";
+		const roots = [{
+			relativeRoot: ".",
+			parentRoot: null,
+			state: "active" as const,
+			sourceIdentity,
+			privateRepositoryId: checksum(sourceIdentity),
+			gitlinkOid: undefined,
+			treeId: "a".repeat(40),
+			coverage: "complete",
+			ignorePolicy: "git-check-ignore-v1",
+			objectClosure: "b".repeat(64),
+		}];
+		const captureChanged = [{
+			...roots[0],
+			treeId: "c".repeat(40),
+			coverage: "paths:" + "d".repeat(64),
+			objectClosure: "e".repeat(64),
+		}];
+
+		expect(topologyFingerprint("workspace-1", roots))
+			.toBe(topologyFingerprint("workspace-1", captureChanged));
+		expect(topologyFingerprint("workspace-2", roots))
+			.not.toBe(topologyFingerprint("workspace-1", roots));
+		expect(topologyFingerprint("workspace-1", [{ ...roots[0], state: "broken" }]))
+			.not.toBe(topologyFingerprint("workspace-1", roots));
 	});
 
 });
@@ -142,6 +214,63 @@ describe("assertManifest", () => {
 		expect(() => assertManifest(value)).toThrowError(expect.objectContaining({ code: "checksum_mismatch" }));
 	});
 
+	it("拒绝内容 checksum 正确但 topology fingerprint 与 roots 不一致的 manifest", () => {
+		const value = manifest({ topologyFingerprint: "0".repeat(64) });
+
+		expect(() => assertManifest(value)).toThrowError(
+			expect.objectContaining({ code: "checksum_mismatch" }),
+		);
+	});
+
+	it("拒绝 privateRepositoryId 不是 sourceIdentity SHA-256 的 manifest", () => {
+		const base = manifest();
+		const roots = [{ ...base.roots[0], privateRepositoryId: "0".repeat(64) }, base.roots[1]];
+		const value = manifest({ roots });
+
+		expect(() => assertManifest(value)).toThrowError(
+			expect.objectContaining({ code: "invalid_manifest" }),
+		);
+	});
+
+	it.each(["invalid", "paths:not-a-checksum", "none"])("拒绝非法全局 coverage：%s", (coverage) => {
+		const value = manifest({ coverage });
+
+		expect(() => assertManifest(value)).toThrowError(
+			expect.objectContaining({ code: "invalid_manifest" }),
+		);
+	});
+
+	it("拒绝非法 root coverage", () => {
+		const base = manifest();
+		const value = manifest({ roots: [{ ...base.roots[0], coverage: "invalid" }, base.roots[1]] });
+
+		expect(() => assertManifest(value)).toThrowError(
+			expect.objectContaining({ code: "invalid_manifest" }),
+		);
+	});
+
+	it("拒绝全局 complete 但存在非 complete root coverage 的 manifest", () => {
+		const base = manifest();
+		const value = manifest({
+			roots: [{ ...base.roots[0], coverage: `paths:${"a".repeat(64)}` }, base.roots[1]],
+		});
+
+		expect(() => assertManifest(value)).toThrowError(
+			expect.objectContaining({ code: "invalid_manifest" }),
+		);
+	});
+
+	it("拒绝缺少 root coverage、ignore policy 或对象闭包校验值的 manifest", () => {
+		const [root] = manifest().roots;
+		const missingCoverage = { ...root } as Record<string, unknown>;
+		delete missingCoverage.coverage;
+		const value = manifest({ roots: [missingCoverage as unknown as SnapshotManifest["roots"][number]] });
+
+		expect(() => assertManifest(value)).toThrowError(
+			expect.objectContaining({ code: "invalid_manifest" }),
+		);
+	});
+
 	it("拒绝不存在的 parentRoot", () => {
 		const value = manifest({
 			roots: [
@@ -165,8 +294,11 @@ describe("assertManifest", () => {
 					parentRoot: ".",
 					state: "active",
 					sourceIdentity: "source-packages",
-					privateRepositoryId: "repo-packages",
+					privateRepositoryId: checksum("source-packages"),
 					treeId: "tree-packages",
+					coverage: "complete",
+					ignorePolicy: "git-check-ignore-v1",
+					objectClosure: "c".repeat(64),
 				},
 				{ ...base.roots[1], parentRoot: "." },
 			],

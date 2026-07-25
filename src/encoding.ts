@@ -1,6 +1,12 @@
 import { createHash } from "node:crypto";
 
-import type { CursorState, ManifestId, SnapshotManifest } from "./model.ts";
+import type {
+	CursorState,
+	ManifestId,
+	RootTopologyIdentity,
+	SnapshotManifest,
+	TopologyFingerprint,
+} from "./model.ts";
 
 export type ValidationCode =
 	| "unsupported_schema"
@@ -31,12 +37,35 @@ export function checksum(value: string | Uint8Array): string {
 	return createHash("sha256").update(input).digest("hex");
 }
 
+export function topologyFingerprint(
+	workspaceIdentity: string,
+	roots: readonly RootTopologyIdentity[],
+): TopologyFingerprint {
+	return checksum(canonicalJson({
+		workspaceIdentity,
+		roots: roots.map((root) => ({
+			relativeRoot: root.relativeRoot,
+			parentRoot: root.parentRoot,
+			state: root.state,
+			sourceIdentity: root.sourceIdentity,
+			privateRepositoryId: root.privateRepositoryId,
+			gitlinkOid: root.gitlinkOid ?? null,
+		})),
+	})) as TopologyFingerprint;
+}
+
 export function assertManifest(value: unknown): SnapshotManifest {
 	const record = assertRecord(value, "invalid_manifest", "manifest 必须是对象");
 	assertSchemaVersion(record, "manifest");
 	assertManifestFields(record);
 
 	assertRoots(record.roots);
+	if (record.topologyFingerprint !== topologyFingerprint(record.workspaceIdentity, record.roots)) {
+		fail("checksum_mismatch", "topology fingerprint 与 manifest roots 不匹配");
+	}
+	if (record.coverage === "complete" && record.roots.some((root) => root.coverage !== "complete")) {
+		fail("invalid_manifest", "全量 manifest 的所有 root coverage 必须是 complete");
+	}
 	const manifestId = assertManifestId(record.manifestId);
 
 	if (manifestId !== checksumWithout(record, "manifestId", "invalid_manifest")) {
@@ -145,14 +174,19 @@ function encodeJson(value: unknown, ancestors: Set<object>): string {
 	}
 }
 
-function assertManifestFields(record: Record<string, unknown>): void {
+function assertManifestFields(record: Record<string, unknown>): asserts record is Record<string, unknown> & {
+	workspaceIdentity: string;
+	topologyFingerprint: string;
+	coverage: string;
+	createdAt: string;
+} {
 	assertNonEmptyString(record.workspaceIdentity, "invalid_manifest", "workspaceIdentity 缺失");
-	assertNonEmptyString(record.topologyFingerprint, "invalid_manifest", "topologyFingerprint 缺失");
-	assertNonEmptyString(record.coverage, "invalid_manifest", "coverage 缺失");
+	assertChecksum(record.topologyFingerprint, "invalid_manifest", "topologyFingerprint 无效");
+	assertCoverage(record.coverage, false, "manifest coverage 无效");
 	assertNonEmptyString(record.createdAt, "invalid_manifest", "createdAt 缺失");
 }
 
-function assertRoots(value: unknown): void {
+function assertRoots(value: unknown): asserts value is SnapshotManifest["roots"] {
 	if (!Array.isArray(value) || value.length === 0) {
 		fail("invalid_manifest", "roots 必须是非空数组");
 	}
@@ -181,13 +215,19 @@ function assertRoots(value: unknown): void {
 			fail("invalid_manifest", "root state 无效");
 		}
 		assertNonEmptyString(record.sourceIdentity, "invalid_manifest", "sourceIdentity 缺失");
-		assertNonEmptyString(record.privateRepositoryId, "invalid_manifest", "privateRepositoryId 缺失");
+		assertChecksum(record.privateRepositoryId, "invalid_manifest", "privateRepositoryId 无效");
+		if (record.privateRepositoryId !== checksum(record.sourceIdentity)) {
+			fail("invalid_manifest", "privateRepositoryId 与 sourceIdentity 不匹配");
+		}
 		if (record.treeId !== null) {
 			assertNonEmptyString(record.treeId, "invalid_manifest", "treeId 无效");
 		}
 		if (record.gitlinkOid !== undefined) {
 			assertNonEmptyString(record.gitlinkOid, "invalid_manifest", "gitlinkOid 无效");
 		}
+		assertCoverage(record.coverage, true, "root coverage 无效");
+		assertNonEmptyString(record.ignorePolicy, "invalid_manifest", "root ignorePolicy 缺失");
+		assertChecksum(record.objectClosure, "invalid_manifest", "root objectClosure 无效");
 	}
 
 	if (roots.size !== value.length) {
@@ -205,6 +245,17 @@ function assertRoots(value: unknown): void {
 			fail("invalid_manifest", "parentRoot 必须是已声明的最近祖先");
 		}
 	}
+}
+
+function assertCoverage(value: unknown, allowNone: boolean, message: string): asserts value is string {
+	if (
+		value === "complete" ||
+		(allowNone && value === "none") ||
+		(typeof value === "string" && /^paths:[0-9a-f]{64}$/.test(value))
+	) {
+		return;
+	}
+	fail("invalid_manifest", message);
 }
 
 function assertCursorFields(record: Record<string, unknown>): void {
