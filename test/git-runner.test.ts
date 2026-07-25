@@ -32,6 +32,25 @@ describe("GitRunner", () => {
 		expect(result.stdout).toContain("git version");
 	});
 
+	it("同时保留 stdout 原始字节，避免二进制 blob 被 UTF-8 转码损坏", async () => {
+		const fake = await fakeGit("printf '\\000\\377'");
+
+		const result = await new GitRunner().run([], { env: fake.env });
+
+		expect(result.stdoutBytes).toEqual(new Uint8Array([0, 255]));
+	});
+
+	it("以原始字节写入 Git stdin", async () => {
+		const fake = await fakeGit("cat");
+
+		const result = await new GitRunner().run([], {
+			env: fake.env,
+			stdin: new Uint8Array([0, 1, 255]),
+		});
+
+		expect(result.stdoutBytes).toEqual(new Uint8Array([0, 1, 255]));
+	});
+
 	it("非零退出抛出稳定 git_failed 错误", async () => {
 		const runner = new GitRunner();
 

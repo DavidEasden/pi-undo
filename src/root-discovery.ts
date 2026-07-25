@@ -1,9 +1,9 @@
 import { lstat, readdir, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
-import { canonicalJson, checksum } from "./encoding.ts";
+import { checksum, topologyFingerprint } from "./encoding.ts";
 import { GitRunner } from "./git-runner.ts";
-import type { SnapshotRoot } from "./model.ts";
+import type { DiscoveryRoot } from "./model.ts";
 
 interface RepositoryInfo {
 	readonly absoluteRoot: string;
@@ -21,7 +21,7 @@ interface DiscoveredRoot {
 	readonly absoluteRoot: string;
 	readonly relativeRoot: string;
 	readonly gitBacked: boolean;
-	readonly state: SnapshotRoot["state"];
+	readonly state: DiscoveryRoot["state"];
 	readonly sourceIdentity: string;
 	readonly privateRepositoryId: string;
 	readonly treeId: string | null;
@@ -30,7 +30,7 @@ interface DiscoveredRoot {
 
 export interface RootTopology {
 	readonly workspaceIdentity: string;
-	readonly roots: readonly SnapshotRoot[];
+	readonly roots: readonly DiscoveryRoot[];
 	readonly fingerprint: string;
 }
 
@@ -226,7 +226,9 @@ export class RootDiscovery {
 
 	private async gitOutput(args: readonly string[]): Promise<string | null> {
 		try {
-			const result = await this.git.run(args, { env: cleanGitEnvironment() });
+			const result = await this.git.run(["-c", "core.fsmonitor=false", ...args], {
+				env: cleanGitEnvironment(),
+			});
 			return result.killed ? null : result.stdout;
 		} catch {
 			return null;
@@ -260,7 +262,7 @@ function brokenRoot(workspaceIdentity: string, absoluteRoot: string): Discovered
 	};
 }
 
-function buildRoots(discovered: readonly DiscoveredRoot[]): SnapshotRoot[] {
+function buildRoots(discovered: readonly DiscoveredRoot[]): DiscoveryRoot[] {
 	const unique = new Map<string, DiscoveredRoot>();
 	for (const root of discovered) {
 		unique.set(root.relativeRoot, root);
@@ -278,23 +280,10 @@ function buildRoots(discovered: readonly DiscoveredRoot[]): SnapshotRoot[] {
 			sourceIdentity: root.sourceIdentity,
 			privateRepositoryId: root.privateRepositoryId,
 			treeId: root.treeId,
+			gitBacked: root.gitBacked,
 			...(root.gitlinkOid === undefined ? {} : { gitlinkOid: root.gitlinkOid }),
 		};
 	});
-}
-
-function topologyFingerprint(workspaceIdentity: string, roots: readonly SnapshotRoot[]): string {
-	return checksum(canonicalJson({
-		workspaceIdentity,
-		roots: roots.map((root) => ({
-			relativeRoot: root.relativeRoot,
-			parentRoot: root.parentRoot,
-			state: root.state,
-			sourceIdentity: root.sourceIdentity,
-			privateRepositoryId: root.privateRepositoryId,
-			gitlinkOid: root.gitlinkOid ?? null,
-		})),
-	}));
 }
 
 async function canonicalWorkspaceRoot(workspaceRoot: string): Promise<string> {
@@ -329,7 +318,7 @@ async function isSafeDirectory(directory: string, workspaceIdentity: string): Pr
 	}
 }
 
-async function gitlinkState(absolutePath: string): Promise<SnapshotRoot["state"]> {
+async function gitlinkState(absolutePath: string): Promise<DiscoveryRoot["state"]> {
 	try {
 		await lstat(absolutePath);
 		return "broken";
@@ -348,6 +337,12 @@ function cleanGitEnvironment(): Readonly<Record<string, string | undefined>> {
 		GIT_ALTERNATE_OBJECT_DIRECTORIES: undefined,
 		GIT_NAMESPACE: undefined,
 		GIT_OPTIONAL_LOCKS: "0",
+		GIT_CONFIG_COUNT: undefined,
+		GIT_CONFIG_PARAMETERS: undefined,
+		GIT_CONFIG_SYSTEM: undefined,
+		GIT_CONFIG_GLOBAL: undefined,
+		GIT_CONFIG_NOSYSTEM: undefined,
+		GIT_ATTR_NOSYSTEM: undefined,
 	};
 }
 

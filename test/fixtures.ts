@@ -18,7 +18,10 @@ export interface LocalSubmodule {
 export interface GitMetadata {
 	readonly head: string;
 	readonly index: Uint8Array | null;
+	readonly config: Uint8Array | null;
 	readonly refs: string;
+	readonly stash: string | null;
+	readonly reflogs: string;
 }
 
 export async function createGitRepo(root?: string): Promise<TestGitRepository> {
@@ -60,13 +63,18 @@ export async function writeFile(root: string, relativePath: string, content: str
 
 export async function readGitMetadata(root: string): Promise<GitMetadata> {
 	const gitDir = (await runGit(root, ["rev-parse", "--git-dir"])).trim();
+	const commonGitDir = (await runGit(root, ["rev-parse", "--git-common-dir"])).trim();
 	const absoluteGitDir = resolve(root, gitDir);
-	const [head, refs, index] = await Promise.all([
+	const absoluteCommonGitDir = resolve(root, commonGitDir);
+	const [head, refs, index, config, stash, reflogs] = await Promise.all([
 		readFile(join(absoluteGitDir, "HEAD"), "utf8"),
 		runGit(root, ["show-ref", "--head"]),
 		readFile(join(absoluteGitDir, "index")).catch(() => null),
+		readFile(join(absoluteCommonGitDir, "config")).catch(() => null),
+		runGit(root, ["rev-parse", "--verify", "refs/stash"]).then((value) => value.trim()).catch(() => null),
+		runGit(root, ["reflog", "show", "--all", "--format=%gD%x00%H%x00%gs"]),
 	]);
-	return { head, refs, index };
+	return { head, refs, index, config, stash, reflogs };
 }
 
 export async function runGit(root: string, args: readonly string[]): Promise<string> {

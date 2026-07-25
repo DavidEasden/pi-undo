@@ -19,6 +19,7 @@ process.once("exit", () => {
 export interface GitRunOptions {
 	readonly cwd?: string;
 	readonly env?: Readonly<Record<string, string | undefined>>;
+	readonly stdin?: string | Uint8Array;
 	readonly signal?: AbortSignal;
 	readonly timeoutMs?: number;
 	readonly stderrLimit?: number;
@@ -26,6 +27,7 @@ export interface GitRunOptions {
 
 export interface GitRunResult {
 	readonly stdout: string;
+	readonly stdoutBytes: Uint8Array;
 	readonly stderr: string;
 	readonly code: number | null;
 	readonly killed: boolean;
@@ -63,6 +65,7 @@ export class GitRunner {
 		if (options.signal?.aborted) {
 			return {
 				stdout: "",
+				stdoutBytes: new Uint8Array(),
 				stderr: "",
 				code: null,
 				killed: true,
@@ -80,7 +83,7 @@ export class GitRunner {
 					detached: process.platform !== "win32",
 					env: environment,
 					shell: false,
-					stdio: ["ignore", "pipe", "pipe"],
+					stdio: [options.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
 				});
 			} catch (error) {
 				reject(new GitRunError("git_spawn_failed", errorMessage(error)));
@@ -101,10 +104,10 @@ export class GitRunner {
 			let terminationFinalized = false;
 			let terminationFailed = false;
 
-			child.stdout.on("data", (chunk: Buffer | string) => {
+			child.stdout?.on("data", (chunk: Buffer | string) => {
 				stdout.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
 			});
-			child.stderr.on("data", (chunk: Buffer | string) => {
+			child.stderr?.on("data", (chunk: Buffer | string) => {
 				if (stderrBytes >= stderrLimit) {
 					return;
 				}
@@ -114,6 +117,9 @@ export class GitRunner {
 				stderr.push(captured);
 				stderrBytes += captured.length;
 			});
+			if (options.stdin !== undefined) {
+				child.stdin?.end(typeof options.stdin === "string" ? options.stdin : Buffer.from(options.stdin));
+			}
 
 			const terminate = (reason: "timeout" | "abort"): void => {
 				if (settled || killed) {
@@ -155,8 +161,10 @@ export class GitRunner {
 					return;
 				}
 				cleanUp();
+				const stdoutBuffer = Buffer.concat(stdout);
 				const result: GitRunResult = {
-					stdout: Buffer.concat(stdout).toString("utf8"),
+					stdout: stdoutBuffer.toString("utf8"),
+					stdoutBytes: new Uint8Array(stdoutBuffer),
 					stderr: Buffer.concat(stderr).toString("utf8"),
 					code: closeResult.code,
 					killed: killed || closeResult.signal !== null,
