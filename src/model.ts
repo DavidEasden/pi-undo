@@ -57,6 +57,7 @@ export interface CheckpointRecord {
 	readonly schemaVersion: 1;
 	readonly checkpointId: string;
 	readonly runId: string;
+	readonly sessionIdentity: SessionFileIdentity;
 	readonly startEntryId: string;
 	readonly userEntryId: string;
 	readonly endLeafId: string;

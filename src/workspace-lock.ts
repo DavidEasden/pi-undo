@@ -52,6 +52,11 @@ export class WorkspaceLockError extends Error {
 
 export interface WorkspaceLock {
 	withLock<T>(workspaceIdentity: string, fn: () => Promise<T>): Promise<T>;
+	acquire(workspaceIdentity: string): Promise<WorkspaceLockLease>;
+}
+
+export interface WorkspaceLockLease {
+	release(): Promise<void>;
 }
 
 export class WorkspaceLock {
@@ -86,7 +91,10 @@ export class WorkspaceLock {
 		});
 	}
 
-	private async acquire(workspaceIdentity: string): Promise<{ release(): Promise<void> }> {
+	async acquire(workspaceIdentity: string): Promise<WorkspaceLockLease> {
+		if (workspaceIdentity.length === 0) {
+			throw new WorkspaceLockError("lock_compromised", "workspace identity 不能为空");
+		}
 		await mkdir(this.lockRoot, { recursive: true });
 		const lockDirectory = workspaceLockPath(this.lockRoot, workspaceIdentity);
 		const deadline = this.clock() + this.acquireTimeoutMs;

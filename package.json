@@ -11,10 +11,17 @@
 			"./extensions/pi-undo.ts"
 		]
 	},
+	"files": [
+		"extensions",
+		"src",
+		"README.md"
+	],
 	"scripts": {
 		"test": "vitest run",
 		"test:watch": "vitest",
-		"typecheck": "tsc --noEmit"
+		"test:integration": "vitest run test/extension.integration.test.ts test/pi-runtime.test.ts",
+		"typecheck": "tsc --noEmit",
+		"pack:dry-run": "npm pack --dry-run"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "^0.80.10"

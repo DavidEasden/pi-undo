@@ -7,6 +7,7 @@ import { canonicalJson, checksum } from "../src/encoding.ts";
 import {
 	JournalStore,
 	decideRecovery,
+	finalizeCursorMarker,
 	inspectCursorMarkers,
 } from "../src/journal.ts";
 import type { CursorState, ManifestId, OperationDescriptor, SessionFileIdentity } from "../src/model.ts";
@@ -99,6 +100,29 @@ describe("JournalStore", () => {
 		const [pending] = await store.loadPending();
 		expect(pending?.state).toMatchObject({ phase: "APPLYING", revision: 3, observedLogicalLeaf: "summary-leaf" });
 	});
+
+	it("已验证的启动恢复可以从中间 phase 原子收敛到终态", async () => {
+		const root = await temporaryRoot("pi-undo-journal-");
+		const operation = descriptor(join(root, "session.jsonl"));
+		const store = new JournalStore({ transactionsRoot: join(root, "transactions") });
+		await store.prepare(operation, { paths: [], planDigest: operation.planDigest });
+		await store.setPhase(operation.opId, "SESSION_MOVED", { observedLogicalLeaf: "before" });
+		await store.setPhase(operation.opId, "APPLYING");
+
+		await store.settleRecovery(operation.opId, "ABORTED");
+
+		expect(await store.loadPending()).toEqual([]);
+	});
+
+	it("没有 PREPARED state 的半成品 transaction 在启动时安全忽略", async () => {
+		const root = await temporaryRoot("pi-undo-journal-");
+		const transactions = join(root, "transactions", "operation-1");
+		await import("node:fs/promises").then(({ mkdir }) => mkdir(transactions, { recursive: true }));
+		await writeFile(join(transactions, "descriptor.json"), "{}");
+
+		const store = new JournalStore({ transactionsRoot: join(root, "transactions") });
+		expect(await store.loadPending()).toEqual([]);
+	});
 });
 
 describe("cursor marker", () => {
@@ -113,6 +137,11 @@ describe("cursor marker", () => {
 
 		expect(inspection).toMatchObject({ kind: "match", needsTrailingNewline: true });
 		expect(decideRecovery(inspection)).toEqual({ action: "roll_forward", reason: "durable_cursor" });
+
+		if (inspection.kind !== "match") throw new Error("测试前置条件不成立");
+		await finalizeCursorMarker(sessionFile, operation, inspection);
+		expect(await readFile(sessionFile, "utf8")).toMatch(/\n$/);
+		expect(await inspectCursorMarkers(sessionFile, operation)).toEqual({ kind: "match", needsTrailingNewline: false });
 	});
 
 	it("torn JSONL tail 不算 marker，recovery 必须 rollback", async () => {

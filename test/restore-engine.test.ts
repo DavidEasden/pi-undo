@@ -272,6 +272,28 @@ describe("RestoreEngine", () => {
 		expect(await readGitMetadata(repository.root)).toEqual(metadataBefore);
 	});
 
+	it("scoped restore 只修改 checkpoint changedPaths，保留 scope 外手动修改", async () => {
+		const workspace = await temporaryRoot("pi-undo-restore-workspace-");
+		await writeFile(workspace, "agent.txt", "before\n");
+		await writeFile(workspace, "manual.txt", "original\n");
+		const storeRoot = await temporaryRoot("pi-undo-restore-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot });
+		const target = await store.capture(await discovery.discover(workspace));
+
+		await writeFile(workspace, "agent.txt", "after\n");
+		await writeFile(workspace, "manual.txt", "user-edit\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+
+		const plan = await engine.plan(current, target, ["agent.txt"]);
+		expect(plan.deletePaths).toEqual([]);
+		expect(plan.writePaths).toEqual(["agent.txt"]);
+		expect((await engine.apply(plan, target)).code).toBe("ok");
+		expect(await readFile(join(workspace, "agent.txt"), "utf8")).toBe("before\n");
+		expect(await readFile(join(workspace, "manual.txt"), "utf8")).toBe("user-edit\n");
+	});
+
 	it("删除受控叶子时保留含 ignored 文件的目录", async () => {
 		const repository = await createGitRepo();
 		temporaryRoots.push(repository.root);
