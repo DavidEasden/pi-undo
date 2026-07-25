@@ -2,7 +2,9 @@ import { createHash } from "node:crypto";
 
 import type {
 	CursorState,
+	JournalState,
 	ManifestId,
+	OperationDescriptor,
 	RootTopologyIdentity,
 	SnapshotManifest,
 	SnapshotRoot,
@@ -13,6 +15,8 @@ export type ValidationCode =
 	| "unsupported_schema"
 	| "invalid_manifest"
 	| "invalid_cursor"
+	| "invalid_descriptor"
+	| "invalid_journal_state"
 	| "invalid_root_path"
 	| "noncanonical_roots"
 	| "invalid_manifest_id"
@@ -96,6 +100,50 @@ export function assertCursor(value: unknown): CursorState {
 	}
 
 	return value as CursorState;
+}
+
+export function assertOperationDescriptor(value: unknown): OperationDescriptor {
+	const record = assertRecord(value, "invalid_descriptor", "operation descriptor 必须是对象");
+	assertSchemaVersion(record, "operation descriptor");
+	assertOperationId(record.opId);
+	assertSessionFileIdentity(record.sessionIdentity, "invalid_descriptor");
+	assertNonEmptyString(record.workspaceIdentity, "invalid_descriptor", "workspaceIdentity 无效");
+	if (record.action !== "undo" && record.action !== "redo" && record.action !== "tree") {
+		fail("invalid_descriptor", "action 无效");
+	}
+	assertNullableString(record.fromLogicalLeaf, "invalid_descriptor", "fromLogicalLeaf 无效");
+	assertNullableString(record.toLogicalLeaf, "invalid_descriptor", "toLogicalLeaf 无效");
+	assertManifestId(record.targetManifestId);
+	assertManifestId(record.rollbackManifestId);
+	assertCoverage(record.coverage, false, "coverage 无效");
+	assertScopePaths(record.scopePaths, record.coverage);
+	assertChecksum(record.planDigest, "invalid_descriptor", "planDigest 无效");
+	assertChecksum(record.checksum, "checksum_mismatch", "checksum 无效");
+	if (record.checksum !== checksumWithout(record, "checksum", "invalid_descriptor")) {
+		fail("checksum_mismatch", "operation descriptor checksum 不匹配");
+	}
+	return value as OperationDescriptor;
+}
+
+export function assertJournalState(value: unknown): JournalState {
+	const record = assertRecord(value, "invalid_journal_state", "journal state 必须是对象");
+	assertSchemaVersion(record, "journal state");
+	assertOperationId(record.opId);
+	if (!isJournalPhase(record.phase)) {
+		fail("invalid_journal_state", "journal phase 无效");
+	}
+	if (typeof record.revision !== "number" || !Number.isInteger(record.revision) || record.revision < 1) {
+		fail("invalid_journal_state", "journal revision 无效");
+	}
+	assertChecksum(record.descriptorChecksum, "invalid_journal_state", "descriptor checksum 无效");
+	if (record.observedLogicalLeaf !== undefined) {
+		assertNullableString(record.observedLogicalLeaf, "invalid_journal_state", "observedLogicalLeaf 无效");
+	}
+	assertChecksum(record.checksum, "checksum_mismatch", "checksum 无效");
+	if (record.checksum !== checksumWithout(record, "checksum", "invalid_journal_state")) {
+		fail("checksum_mismatch", "journal state checksum 不匹配");
+	}
+	return value as JournalState;
 }
 
 export function assertOperationId(value: unknown): string {
@@ -336,6 +384,7 @@ function assertCursorFields(record: Record<string, unknown>): void {
 	if (record.action !== "undo" && record.action !== "redo" && record.action !== "tree") {
 		fail("invalid_cursor", "action 无效");
 	}
+	assertSessionFileIdentity(record.sessionIdentity, "invalid_cursor");
 	assertNullableString(record.fromLogicalLeaf, "invalid_cursor", "fromLogicalLeaf 无效");
 	assertNullableString(record.toLogicalLeaf, "invalid_cursor", "toLogicalLeaf 无效");
 	assertManifestId(record.targetManifestId);
@@ -346,6 +395,44 @@ function assertCursorFields(record: Record<string, unknown>): void {
 	}
 	assertChecksum(record.descriptorChecksum, "invalid_cursor", "descriptorChecksum 无效");
 	assertChecksum(record.checksum, "checksum_mismatch", "checksum 无效");
+}
+
+function assertSessionFileIdentity(value: unknown, code: ValidationCode): void {
+	const record = assertRecord(value, code, "sessionIdentity 无效");
+	if (typeof record.path !== "string" || record.path.length === 0 || record.path.includes("\0")) {
+		fail(code, "sessionIdentity path 无效");
+	}
+	assertChecksum(record.headerChecksum, code, "sessionIdentity headerChecksum 无效");
+}
+
+function assertScopePaths(value: unknown, coverage: unknown): void {
+	if (!Array.isArray(value)) {
+		fail("invalid_descriptor", "scopePaths 必须是数组");
+	}
+	let previous: string | undefined;
+	for (let index = 0; index < value.length; index += 1) {
+		const path = value[index];
+		if (!Object.prototype.hasOwnProperty.call(value, index) || typeof path !== "string" || !isCanonicalRoot(path)) {
+			fail("invalid_descriptor", "scopePaths 包含不安全路径");
+		}
+		if (previous !== undefined && previous >= path) {
+			fail("invalid_descriptor", "scopePaths 必须严格排序且不能重复");
+		}
+		previous = path;
+	}
+	if (typeof coverage === "string" && coverage.startsWith("paths:")) {
+		const expected = `paths:${checksum(canonicalJson(value))}`;
+		if (coverage !== expected) {
+			fail("invalid_descriptor", "scopePaths 与 coverage 不匹配");
+		}
+	}
+}
+
+function isJournalPhase(value: unknown): value is JournalState["phase"] {
+	return value === "PREPARING" || value === "PREPARED" || value === "SESSION_MOVED" ||
+		value === "APPLYING" || value === "FILES_VERIFIED" || value === "CURSOR_COMMITTED" ||
+		value === "COMMITTED" || value === "ABORTING" || value === "ABORTED" ||
+		value === "RECOVERY_REQUIRED";
 }
 
 function isDenseStringArray(value: unknown): value is string[] {

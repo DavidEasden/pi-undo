@@ -67,10 +67,16 @@ export interface CheckpointRecord {
 	readonly checksum: string;
 }
 
+export interface SessionFileIdentity {
+	readonly path: string;
+	readonly headerChecksum: string;
+}
+
 export interface CursorState {
 	readonly schemaVersion: 1;
 	readonly opId: string;
 	readonly action: "undo" | "redo" | "tree";
+	readonly sessionIdentity: SessionFileIdentity;
 	readonly fromLogicalLeaf: string | null;
 	readonly toLogicalLeaf: string | null;
 	readonly targetManifestId: ManifestId;
@@ -96,7 +102,7 @@ export type JournalPhase =
 export interface OperationDescriptor {
 	readonly schemaVersion: 1;
 	readonly opId: string;
-	readonly sessionId: string;
+	readonly sessionIdentity: SessionFileIdentity;
 	readonly workspaceIdentity: WorkspaceFingerprint;
 	readonly action: "undo" | "redo" | "tree";
 	readonly fromLogicalLeaf: string | null;
@@ -104,7 +110,18 @@ export interface OperationDescriptor {
 	readonly targetManifestId: ManifestId;
 	readonly rollbackManifestId: ManifestId;
 	readonly coverage: string;
+	readonly scopePaths: readonly string[];
 	readonly planDigest: string;
+	readonly checksum: string;
+}
+
+export interface JournalState {
+	readonly schemaVersion: 1;
+	readonly opId: string;
+	readonly phase: JournalPhase;
+	readonly revision: number;
+	readonly descriptorChecksum: string;
+	readonly observedLogicalLeaf?: string | null;
 	readonly checksum: string;
 }
 

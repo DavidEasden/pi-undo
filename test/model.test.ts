@@ -102,6 +102,10 @@ function cursor(overrides: Partial<CursorState> = {}): CursorState {
 		schemaVersion: 1 as const,
 		opId: "operation-1",
 		action: "undo" as const,
+		sessionIdentity: {
+			path: "/sessions/session-1.jsonl",
+			headerChecksum: "d".repeat(64),
+		},
 		fromLogicalLeaf: "leaf-after",
 		toLogicalLeaf: "leaf-before",
 		targetManifestId: asManifestId("a".repeat(64)),
