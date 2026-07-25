@@ -15,6 +15,7 @@ import type {
 	JournalState,
 	OperationDescriptor,
 } from "./model.ts";
+import { MutationJournal } from "./mutation-journal.ts";
 
 export interface PendingJournal {
 	readonly descriptor: OperationDescriptor;
@@ -45,6 +46,10 @@ export class JournalStore {
 
 	constructor(options: JournalStoreOptions) {
 		this.transactionsRoot = options.transactionsRoot;
+	}
+
+	mutationJournal(opId: string): MutationJournal {
+		return new MutationJournal(join(this.operationDirectory(opId), "mutations.jsonl"), opId);
 	}
 
 	async prepare(descriptor: OperationDescriptor, plan: unknown): Promise<void> {
