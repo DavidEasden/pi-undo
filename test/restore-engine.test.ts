@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 import { canonicalJson, checksum, topologyFingerprint } from "../src/encoding.ts";
-import { RestoreEngine } from "../src/restore-engine.ts";
+import { RestoreEngine, type RestoreMutation } from "../src/restore-engine.ts";
 import type { ManifestId, RestorePath, SnapshotManifest } from "../src/model.ts";
 import { RootDiscovery } from "../src/root-discovery.ts";
 import { SnapshotStore, SnapshotStoreError } from "../src/snapshot-store.ts";
@@ -108,6 +108,22 @@ function withBrokenRoot(manifest: SnapshotManifest): SnapshotManifest {
 	};
 }
 
+function withActiveNullTree(manifest: SnapshotManifest): SnapshotManifest {
+	const { manifestId: _manifestId, ...manifestFields } = manifest;
+	const roots: SnapshotManifest["roots"] = manifest.roots.map((root, index) =>
+		index === 0 ? { ...root, state: "active", treeId: null } : root
+	);
+	const semantic: Omit<SnapshotManifest, "manifestId"> = {
+		...manifestFields,
+		roots,
+		topologyFingerprint: topologyFingerprint(manifest.workspaceIdentity, roots),
+	};
+	return {
+		...semantic,
+		manifestId: checksum(canonicalJson(semantic)) as ManifestId,
+	};
+}
+
 describe("RestoreEngine", () => {
 	it("计划使用 root 并集并生成确定的深浅顺序与 digest", async () => {
 		const outer = await createGitRepo();
@@ -142,13 +158,64 @@ describe("RestoreEngine", () => {
 		expect(first.writePaths).toEqual([
 			"new",
 			"new/deep",
-			"new/deep/outer.txt",
 			"packages/child/new",
 			"packages/child/new/deep",
+			"new/deep/outer.txt",
 			"packages/child/new/deep/child.txt",
 		]);
 		expect(first.planDigest).toMatch(/^[0-9a-f]{64}$/);
 		expect(second).toEqual(first);
+	});
+
+	it("apply 与 rollback 均按 delete、mkdir、叶子写入三阶段执行", async () => {
+		const outer = await createGitRepo();
+		temporaryRoots.push(outer.root);
+		const child = await createNestedRepo(outer.root, "packages/child");
+		await writeFile(outer.root, "target/deep/outer.txt", "target-outer\n");
+		await writeFile(child.root, "target/deep/child.txt", "target-child\n");
+		const storeRoot = await temporaryRoot("pi-undo-restore-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot });
+		const target = await store.capture(await discovery.discover(outer.root));
+		await rm(join(outer.root, "target"), { recursive: true });
+		await rm(join(child.root, "target"), { recursive: true });
+		await writeFile(outer.root, "current/deep/outer.txt", "current-outer\n");
+		await writeFile(child.root, "current/deep/child.txt", "current-child\n");
+		const current = await store.capture(await discovery.discover(outer.root));
+		const mutations: RestoreMutation[] = [];
+		const engine = new RestoreEngine({
+			workspaceRoot: outer.root,
+			store,
+			discovery,
+			beforeMutation: (mutation) => {
+				mutations.push(mutation);
+				if (mutation.phase === "apply" && mutation.path === "packages/child/target/deep/child.txt") {
+					throw new Error("注入 apply 叶子写入失败");
+			}
+			},
+		});
+
+		const result = await engine.apply(await engine.plan(current, target), target);
+
+		expect(result.code).toBe("restore_failed_safe");
+		for (const phase of ["apply", "rollback"] as const) {
+			const phaseMutations = mutations.filter((mutation) => mutation.phase === phase);
+			const firstNonDelete = phaseMutations.findIndex((mutation) => mutation.kind !== "delete");
+			const firstLeaf = phaseMutations.findIndex(
+				(mutation) => mutation.kind === "write" || mutation.kind === "symlink",
+			);
+			expect(firstNonDelete).toBeGreaterThan(0);
+			expect(phaseMutations.slice(0, firstNonDelete).every((mutation) => mutation.kind === "delete")).toBe(true);
+			expect(firstLeaf).toBeGreaterThan(firstNonDelete);
+			expect(phaseMutations.slice(firstNonDelete, firstLeaf).every((mutation) => mutation.kind === "mkdir")).toBe(true);
+			expect(phaseMutations.slice(firstLeaf).every((mutation) => mutation.kind !== "mkdir")).toBe(true);
+			const leafPaths = phaseMutations
+				.filter((mutation) => mutation.kind === "write" || mutation.kind === "symlink")
+				.map((mutation) => mutation.path);
+			expect(leafPaths.findIndex((path) => !path.startsWith("packages/child/"))).toBeLessThan(
+				leafPaths.findIndex((path) => path.startsWith("packages/child/")),
+			);
+		}
 	});
 
 	it("set-state 恢复普通内容并保留 ignored 与真实 Git metadata", async () => {
@@ -228,6 +295,30 @@ describe("RestoreEngine", () => {
 		expect(await readFile(join(repository.root, "managed-dir/ignored.txt"), "utf8")).toBe("preserve-me\n");
 	});
 
+	it("target ignored-present proof 保留 current-only 叶子但不豁免真实删除", async () => {
+		const workspace = await temporaryRoot("pi-undo-restore-workspace-");
+		await writeFile(workspace, ".gitignore", "cache/volatile.txt\n");
+		await writeFile(workspace, "cache/volatile.txt", "target-ignored\n");
+		const storeRoot = await temporaryRoot("pi-undo-restore-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, ".gitignore", "");
+		await writeFile(workspace, "cache/volatile.txt", "preserve-current\n");
+		await writeFile(workspace, "removed.txt", "remove-current\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+
+		const plan = await engine.plan(current, target);
+
+		expect(plan.deletePaths).not.toContain("cache/volatile.txt");
+		expect(plan.deletePaths).not.toContain("cache");
+		expect(plan.deletePaths).toContain("removed.txt");
+		expect((await engine.apply(plan, target)).code).toBe("ok");
+		expect(await readFile(join(workspace, "cache/volatile.txt"), "utf8")).toBe("preserve-current\n");
+		await expect(access(join(workspace, "removed.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
 	it("相同 partial coverage 下 ownership 迁移仍以全局缺失为准", async () => {
 		const outer = await createGitRepo();
 		temporaryRoots.push(outer.root);
@@ -275,6 +366,96 @@ describe("RestoreEngine", () => {
 		expect(result.code).toBe("restore_failed_safe");
 		expect(await readFile(join(workspace, "changed.txt"), "utf8")).toBe("current\n");
 		expect(await readFile(join(workspace, "unchanged.txt"), "utf8")).toBe("external-drift\n");
+	});
+
+	it("complete coverage 在 mutation 前拒绝 manifest 并集外新增可见路径", async () => {
+		const workspace = await temporaryRoot("pi-undo-restore-workspace-");
+		await writeFile(workspace, "changed.txt", "target\n");
+		const storeRoot = await temporaryRoot("pi-undo-restore-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "changed.txt", "current\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		let mutations = 0;
+		const engine = new RestoreEngine({
+			workspaceRoot: workspace,
+			store,
+			discovery,
+			beforeMutation: () => {
+				mutations += 1;
+			},
+		});
+		const plan = await engine.plan(current, target);
+		await writeFile(workspace, "intruder.txt", "outside-union\n");
+
+		const result = await engine.apply(plan, target);
+
+		expect(result.code).toBe("restore_failed_safe");
+		expect(mutations).toBe(0);
+		expect(await readFile(join(workspace, "changed.txt"), "utf8")).toBe("current\n");
+		expect(await readFile(join(workspace, "intruder.txt"), "utf8")).toBe("outside-union\n");
+	});
+
+	it("complete coverage 在 apply 后发现并集外新增路径并 rollback", async () => {
+		const workspace = await temporaryRoot("pi-undo-restore-workspace-");
+		await writeFile(workspace, "changed.txt", "target\n");
+		const storeRoot = await temporaryRoot("pi-undo-restore-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "changed.txt", "current\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		let rollbackObserved = false;
+		const engine = new RestoreEngine({
+			workspaceRoot: workspace,
+			store,
+			discovery,
+			beforeMutation: async (mutation) => {
+				if (mutation.phase === "apply" && mutation.ordinal === 1) {
+					await writeFile(workspace, "intruder.txt", "outside-union\n");
+				}
+				if (mutation.phase === "rollback" && mutation.ordinal === 1) {
+					rollbackObserved = true;
+					await rm(join(workspace, "intruder.txt"));
+				}
+			},
+		});
+
+		const result = await engine.apply(await engine.plan(current, target), target);
+
+		expect(result.code).toBe("restore_failed_safe");
+		expect(rollbackObserved).toBe(true);
+		expect(await readFile(join(workspace, "changed.txt"), "utf8")).toBe("current\n");
+		await expect(access(join(workspace, "intruder.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("complete rollback 无法证明 current 集合时不返回 safe", async () => {
+		const workspace = await temporaryRoot("pi-undo-restore-workspace-");
+		await writeFile(workspace, "changed.txt", "target\n");
+		const storeRoot = await temporaryRoot("pi-undo-restore-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "changed.txt", "current\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		const engine = new RestoreEngine({
+			workspaceRoot: workspace,
+			store,
+			discovery,
+			beforeMutation: async (mutation) => {
+				if (mutation.phase === "apply" && mutation.ordinal === 1) {
+					await writeFile(workspace, "intruder.txt", "outside-union\n");
+				}
+			},
+		});
+
+		const result = await engine.apply(await engine.plan(current, target), target);
+
+		expect(["partial_restore", "recovery_required"]).toContain(result.code);
+		expect(result.code).not.toBe("restore_failed_safe");
+		expect(await readFile(join(workspace, "changed.txt"), "utf8")).toBe("current\n");
+		expect(await readFile(join(workspace, "intruder.txt"), "utf8")).toBe("outside-union\n");
 	});
 
 	it("target-only nested root 显式创建 boundary 骨架但不重建 Git metadata", async () => {
@@ -668,6 +849,9 @@ describe("RestoreEngine", () => {
 		);
 		await expect(engine.apply({ ...plan, planDigest: "invalid" }, target)).rejects.toThrow("digest 无效");
 		await expect(engine.apply(plan, { ...target, coverage: "invalid" })).rejects.toThrow("coverage 无效");
+		await expect(engine.apply(plan, withActiveNullTree(target))).rejects.toMatchObject({
+			code: "invalid_manifest",
+		});
 		expect(mutations).toBe(0);
 		expect(await readFile(join(workspace, "file.txt"), "utf8")).toBe("current\n");
 		expect((await filesBelow(storeRoot)).filter((path) => path.includes("/pins/"))).toEqual([]);
@@ -728,6 +912,63 @@ describe("RestoreEngine", () => {
 		expect(await readFile(join(workspace, "scoped.txt"), "utf8")).toBe("target\n");
 		expect(await readFile(join(workspace, "outside.txt"), "utf8")).toBe("outside-latest\n");
 		expect(await readFile(join(workspace, "ignored.txt"), "utf8")).toBe("ignored-latest\n");
+	});
+
+	it("current ignored 路径已等于 target visible 内容时不触碰该叶子", async () => {
+		const workspace = await temporaryRoot("pi-undo-restore-workspace-");
+		await writeFile(workspace, ".gitignore", "");
+		await writeFile(workspace, "promoted.txt", "target\n");
+		const storeRoot = await temporaryRoot("pi-undo-restore-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, ".gitignore", "promoted.txt\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		const mutatedPaths: string[] = [];
+		const engine = new RestoreEngine({
+			workspaceRoot: workspace,
+			store,
+			discovery,
+			beforeMutation: (mutation) => {
+				if (mutation.phase === "apply") {
+					mutatedPaths.push(mutation.path);
+				}
+			},
+		});
+
+		const result = await engine.apply(await engine.plan(current, target), target);
+
+		expect(result.code).toBe("ok");
+		expect(mutatedPaths).toEqual([".gitignore"]);
+		expect(await readFile(join(workspace, "promoted.txt"), "utf8")).toBe("target\n");
+	});
+
+	it.each(["delete", "write"] as const)("%s syscall 前拒绝 hook 注入的第三态", async (operation) => {
+		const workspace = await temporaryRoot("pi-undo-restore-workspace-");
+		if (operation === "write") {
+			await writeFile(workspace, "victim.txt", "target\n");
+		}
+		const storeRoot = await temporaryRoot("pi-undo-restore-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "victim.txt", "current\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		const engine = new RestoreEngine({
+			workspaceRoot: workspace,
+			store,
+			discovery,
+			beforeMutation: async (mutation) => {
+				if (mutation.phase === "apply" && mutation.ordinal === 1) {
+					await writeFile(workspace, "victim.txt", "third-state\n");
+				}
+			},
+		});
+
+		const result = await engine.apply(await engine.plan(current, target), target);
+
+		expect(["partial_restore", "recovery_required"]).toContain(result.code);
+		expect(await readFile(join(workspace, "victim.txt"), "utf8")).toBe("third-state\n");
 	});
 
 	it("mutation 前中间目录被换成 symlink 时不越界并安全 rollback", async () => {
@@ -891,6 +1132,26 @@ describe("RestoreEngine", () => {
 		expect(await readlink(join(workspace, "target-only-link"))).toBe("changed.txt");
 		expect(await readFile(join(workspace, "kind-node"), "utf8")).toBe("target-file\n");
 		await expect(access(join(workspace, "current-only.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("directory 恢复为 symlink 后同一 plan 可幂等 replay", async () => {
+		const workspace = await temporaryRoot("pi-undo-restore-workspace-");
+		await writeFile(workspace, "link-target/kept.txt", "target\n");
+		await symlink("link-target", join(workspace, "kind-node"), "dir");
+		const storeRoot = await temporaryRoot("pi-undo-restore-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot });
+		const target = await store.capture(await discovery.discover(workspace));
+		await rm(join(workspace, "kind-node"));
+		await writeFile(workspace, "kind-node/old.txt", "current\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+		const plan = await engine.plan(current, target);
+
+		expect((await engine.apply(plan, target)).code).toBe("ok");
+		expect((await engine.apply(plan, target)).code).toBe("ok");
+		expect(await readlink(join(workspace, "kind-node"))).toBe("link-target");
+		expect(await readFile(join(workspace, "link-target/kept.txt"), "utf8")).toBe("target\n");
 	});
 
 	it("current/target 混合前缀可 replay 并 roll-forward 到 target", async () => {

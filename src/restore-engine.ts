@@ -58,6 +58,12 @@ interface OwnedPath {
 
 interface MutationContext {
 	readonly phase: RestoreMutation["phase"];
+	readonly sourceManifestId: ManifestId;
+	readonly targetManifestId: ManifestId;
+	readonly sourcePaths: ReadonlyMap<string, OwnedPath>;
+	readonly targetPaths: ReadonlyMap<string, OwnedPath>;
+	readonly plannedDeletePaths: ReadonlySet<string>;
+	readonly sourceIgnoredPaths: ReadonlySet<string>;
 	ordinal: number;
 }
 
@@ -89,6 +95,7 @@ export class RestoreEngine {
 			this.readOwnedPaths(current),
 			this.readOwnedPaths(target),
 		]);
+		const targetIgnoredPaths = ignoredWorkspacePaths(target);
 		const deleteByRoot = new Map<string, string[]>();
 		const writeByRoot = new Map<string, string[]>();
 
@@ -101,6 +108,9 @@ export class RestoreEngine {
 				continue;
 			}
 			if (targetOwned === undefined) {
+				if (isProtectedByIgnoredProof(path, owned.entry.kind, targetIgnoredPaths)) {
+					continue;
+				}
 				appendPath(deleteByRoot, owned.root.relativeRoot, path);
 			}
 		}
@@ -117,7 +127,7 @@ export class RestoreEngine {
 			...target.roots.map((root) => root.relativeRoot),
 		])].sort(comparePaths);
 		const deletePaths = sortDeletePaths([...deleteByRoot.values()].flat());
-		const writePaths = orderedPaths(target.roots, writeByRoot, "write");
+		const writePaths = orderedWritePaths(target.roots, writeByRoot, targetPaths);
 		const semanticPlan = {
 			currentManifestId: current.manifestId,
 			targetManifestId: target.manifestId,
@@ -231,6 +241,11 @@ export class RestoreEngine {
 			this.readOwnedPaths(current),
 			this.readOwnedPaths(target),
 		]);
+		try {
+			await this.assertCompleteVisibleSubset(topologyBefore, [current, target]);
+		} catch {
+			return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
+		}
 		const preflight = await this.verifyKnownState(current, target, currentPaths, targetPaths);
 		if (!preflight.ok) {
 			return {
@@ -240,21 +255,28 @@ export class RestoreEngine {
 			};
 		}
 
-		const mutationContext: MutationContext = { phase: "apply", ordinal: 0 };
+		const mutationContext: MutationContext = {
+			phase: "apply",
+			ordinal: 0,
+			sourceManifestId: current.manifestId,
+			targetManifestId: target.manifestId,
+			sourcePaths: currentPaths,
+			targetPaths,
+			plannedDeletePaths: new Set(plan.deletePaths),
+			sourceIgnoredPaths: ignoredWorkspacePaths(current),
+		};
 		try {
 			for (const path of plan.deletePaths) {
+				if (await this.pathIsShadowedByTarget(target.manifestId, path, targetPaths)) {
+					continue;
+				}
 				await this.deletePath(path, mutationContext);
 			}
-			for (const path of plan.writePaths) {
-				const targetPath = targetPaths.get(path);
-				if (targetPath === undefined) {
-					throw new Error(`restore plan 引用了 target 外路径：${path}`);
-				}
-				await this.writePath(target.manifestId, targetPath, mutationContext);
-			}
+			await this.writePlannedPaths(target.manifestId, targetPaths, plan.writePaths, mutationContext);
 
 			const topologyAfter = await this.discovery.discover(this.workspaceRoot);
 			assertUnchangedTopology(topologyBefore, topologyAfter);
+			await this.assertCompleteVisibleSubset(topologyAfter, [target]);
 			const verification = await this.verifyTarget(target, currentPaths, targetPaths, plan.deletePaths);
 			return {
 				code: "ok",
@@ -340,6 +362,10 @@ export class RestoreEngine {
 		const paths = [...new Set([...currentPaths.keys(), ...targetPaths.keys()])].sort(comparePaths);
 		let verifiedPaths = 0;
 		for (const path of paths) {
+			if (await this.pathIsShadowedByTarget(target.manifestId, path, targetPaths)) {
+				verifiedPaths += 1;
+				continue;
+			}
 			const currentPath = currentPaths.get(path);
 			const targetPath = targetPaths.get(path);
 			const matchesCurrent = currentPath !== undefined &&
@@ -459,19 +485,26 @@ export class RestoreEngine {
 		let rollbackPlan: RestorePlan | undefined;
 		try {
 			rollbackPlan = await this.plan(target, current);
-			const context: MutationContext = { phase: "rollback", ordinal: 0 };
+			const context: MutationContext = {
+				phase: "rollback",
+				ordinal: 0,
+				sourceManifestId: target.manifestId,
+				targetManifestId: current.manifestId,
+				sourcePaths: targetPaths,
+				targetPaths: currentPaths,
+				plannedDeletePaths: new Set(rollbackPlan.deletePaths),
+				sourceIgnoredPaths: ignoredWorkspacePaths(target),
+			};
 			for (const path of rollbackPlan.deletePaths) {
+				if (await this.pathIsShadowedByTarget(current.manifestId, path, currentPaths)) {
+					continue;
+				}
 				await this.deletePath(path, context);
 			}
-			for (const path of rollbackPlan.writePaths) {
-				const currentPath = currentPaths.get(path);
-				if (currentPath === undefined) {
-					throw new Error(`rollback plan 引用了 current 外路径：${path}`);
-				}
-				await this.writePath(current.manifestId, currentPath, context);
-			}
+			await this.writePlannedPaths(current.manifestId, currentPaths, rollbackPlan.writePaths, context);
 			const topologyAfter = await this.discovery.discover(this.workspaceRoot);
 			assertUnchangedTopology(topologyBefore, topologyAfter);
+			await this.assertCompleteVisibleSubset(topologyAfter, [current]);
 			const verification = await this.verifyTarget(
 				current,
 				targetPaths,
@@ -493,6 +526,7 @@ export class RestoreEngine {
 				try {
 					const topologyAfter = await this.discovery.discover(this.workspaceRoot);
 					assertUnchangedTopology(topologyBefore, topologyAfter);
+					await this.assertCompleteVisibleSubset(topologyAfter, [current]);
 					const verification = await this.verifyTarget(
 						current,
 						targetPaths,
@@ -539,7 +573,91 @@ export class RestoreEngine {
 		context.ordinal += 1;
 		await this.beforeMutation?.({ phase: context.phase, ordinal: context.ordinal, kind, path });
 		await this.assertMutationPath(path);
+		await this.assertMutationState(context, kind, path);
 		await mutation();
+	}
+
+	private async writePlannedPaths(
+		manifestId: ManifestId,
+		targetPaths: ReadonlyMap<string, OwnedPath>,
+		writePaths: readonly string[],
+		context: MutationContext,
+	): Promise<void> {
+		for (const kind of ["directory", "leaf"] as const) {
+			for (const path of writePaths) {
+				const target = targetPaths.get(path);
+				if (target === undefined) {
+					throw new Error(`${context.phase} plan 引用了 manifest 外路径：${path}`);
+				}
+				if ((target.entry.kind === "directory") !== (kind === "directory")) {
+					continue;
+				}
+				if (context.sourceIgnoredPaths.has(path)) {
+					if (await this.entryMatches(manifestId, target)) {
+						continue;
+					}
+					throw new Error(`${context.phase} 的 ignored-present 路径与目标内容冲突：${path}`);
+				}
+				await this.writePath(manifestId, target, context);
+			}
+		}
+	}
+
+	private async assertMutationState(
+		context: MutationContext,
+		kind: RestoreMutation["kind"],
+		path: string,
+	): Promise<void> {
+		if (
+			kind === "delete" &&
+			(await this.pathIsShadowedByTarget(context.targetManifestId, path, context.targetPaths) ||
+				await this.pathIsShadowedByTarget(context.sourceManifestId, path, context.sourcePaths))
+		) {
+			return;
+		}
+		const source = context.sourcePaths.get(path);
+		if (source !== undefined && await this.entryMatches(context.sourceManifestId, source)) {
+			return;
+		}
+		const target = context.targetPaths.get(path);
+		if (target !== undefined && await this.entryMatches(context.targetManifestId, target)) {
+			return;
+		}
+		if (await this.pathIsAbsent(path)) {
+			if (kind === "delete" || source === undefined || context.plannedDeletePaths.has(path)) {
+				return;
+			}
+		}
+		throw new Error(`${context.phase} mutation 前路径不再处于已知状态：${path}`);
+	}
+
+	private async assertCompleteVisibleSubset(
+		topology: RootTopology,
+		allowedManifests: readonly SnapshotManifest[],
+	): Promise<void> {
+		if (allowedManifests.some((manifest) => manifest.coverage !== "complete")) {
+			return;
+		}
+		const allowedPaths = new Set<string>();
+		for (const manifest of allowedManifests) {
+			for (const path of ignoredWorkspacePaths(manifest)) {
+				allowedPaths.add(path);
+			}
+			const paths = await this.readOwnedPaths(manifest);
+			for (const [path, owned] of paths) {
+				if (owned.entry.kind !== "directory") {
+					allowedPaths.add(path);
+				}
+			}
+		}
+
+		const live = await this.store.capture(topology);
+		await this.store.assertComplete(live.manifestId);
+		for (const [path, owned] of await this.readOwnedPaths(live)) {
+			if (owned.entry.kind !== "directory" && !allowedPaths.has(path)) {
+				throw new Error(`complete coverage 发现 manifest 集合外路径：${path}`);
+			}
+		}
 	}
 
 	private async verifyTarget(
@@ -555,7 +673,11 @@ export class RestoreEngine {
 		let verifiedPaths = targetPaths.size;
 		let totalPaths = targetPaths.size;
 		for (const path of deletePaths) {
-			if (targetPaths.has(path) || currentPaths.get(path)?.entry.kind === "directory") {
+			if (
+				targetPaths.has(path) ||
+				currentPaths.get(path)?.entry.kind === "directory" ||
+				hasNonDirectoryAncestor(path, targetPaths)
+			) {
 				continue;
 			}
 			totalPaths += 1;
@@ -595,6 +717,20 @@ export class RestoreEngine {
 			}
 			throw error;
 		}
+	}
+
+	private async pathIsShadowedByTarget(
+		manifestId: ManifestId,
+		path: string,
+		targetPaths: ReadonlyMap<string, OwnedPath>,
+	): Promise<boolean> {
+		for (const ancestor of strictPathAncestors(path)) {
+			const target = targetPaths.get(ancestor);
+			if (target !== undefined && target.entry.kind !== "directory") {
+				return this.entryMatches(manifestId, target);
+			}
+		}
+		return false;
 	}
 
 	private async verifyEntry(manifestId: ManifestId, owned: OwnedPath): Promise<string> {
@@ -680,17 +816,22 @@ function assertCompatibleManifests(current: SnapshotManifest, target: SnapshotMa
 	}
 }
 
-function orderedPaths(
+function orderedWritePaths(
 	roots: readonly SnapshotRoot[],
 	paths: ReadonlyMap<string, readonly string[]>,
-	direction: "delete" | "write",
+	targetPaths: ReadonlyMap<string, OwnedPath>,
 ): string[] {
+	const directories = [...paths.values()].flat().filter(
+		(path) => targetPaths.get(path)?.entry.kind === "directory",
+	);
 	const result: string[] = [];
 	for (const root of roots) {
-		const owned = paths.get(root.relativeRoot) ?? [];
-		result.push(...(direction === "delete" ? sortDeletePaths(owned) : sortWritePaths(owned)));
+		const leaves = (paths.get(root.relativeRoot) ?? []).filter(
+			(path) => targetPaths.get(path)?.entry.kind !== "directory",
+		);
+		result.push(...sortWritePaths(leaves));
 	}
-	return result;
+	return [...sortWritePaths(directories), ...result];
 }
 
 function appendPath(paths: Map<string, string[]>, root: string, path: string): void {
@@ -706,12 +847,41 @@ function workspacePath(root: string, path: string): string {
 	return root === "." ? path : path === "." ? root : `${root}/${path}`;
 }
 
+function ignoredWorkspacePaths(manifest: SnapshotManifest): Set<string> {
+	return new Set(manifest.roots.flatMap((root) =>
+		root.ignoredPresentPaths.map((path) => workspacePath(root.relativeRoot, path))
+	));
+}
+
+function isProtectedByIgnoredProof(
+	path: string,
+	kind: RestorePath["kind"],
+	ignoredPaths: ReadonlySet<string>,
+): boolean {
+	if (kind !== "directory") {
+		return ignoredPaths.has(path);
+	}
+	return [...ignoredPaths].some((ignoredPath) => ignoredPath.startsWith(`${path}/`));
+}
+
 function rootBoundaryDirectories(root: string): string[] {
 	if (root === ".") {
 		return [];
 	}
 	const parts = root.split("/");
 	return parts.map((_part, index) => parts.slice(0, index + 1).join("/"));
+}
+
+function strictPathAncestors(path: string): string[] {
+	const parts = path.split("/");
+	return parts.slice(0, -1).map((_part, index) => parts.slice(0, index + 1).join("/")).reverse();
+}
+
+function hasNonDirectoryAncestor(path: string, paths: ReadonlyMap<string, OwnedPath>): boolean {
+	return strictPathAncestors(path).some((ancestor) => {
+		const owned = paths.get(ancestor);
+		return owned !== undefined && owned.entry.kind !== "directory";
+	});
 }
 
 function comparePaths(left: string, right: string): number {

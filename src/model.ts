@@ -38,6 +38,8 @@ export interface SnapshotRoot extends RootTopologyIdentity {
 	readonly treeId: string | null;
 	readonly coverage: string;
 	readonly ignorePolicy: string;
+	readonly ignoredPresentPaths: readonly string[];
+	readonly ignoreClosure: string;
 	readonly objectClosure: string;
 }
 
