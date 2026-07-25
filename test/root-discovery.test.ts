@@ -202,6 +202,24 @@ describe("RootDiscovery", () => {
 });
 
 describe("WorkspaceLock", () => {
+	it("显式 lease 在 release 前持续阻止同 workspace 的其他实例", async () => {
+		const root = await temporaryRoot();
+		const firstLock = new WorkspaceLock({ lockRoot: join(root, "locks"), retryMs: 5 });
+		const secondLock = new WorkspaceLock({ lockRoot: join(root, "locks"), retryMs: 5 });
+		const firstLease = await firstLock.acquire("workspace-lease");
+		let secondAcquired = false;
+		const second = secondLock.acquire("workspace-lease").then(async (lease) => {
+			secondAcquired = true;
+			await lease.release();
+		});
+
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(secondAcquired).toBe(false);
+		await firstLease.release();
+		await second;
+		expect(secondAcquired).toBe(true);
+	});
+
 	it("同一 workspace 在进程内严格串行", async () => {
 		const root = await temporaryRoot();
 		const firstLock = new WorkspaceLock({ lockRoot: join(root, "locks"), retryMs: 5 });

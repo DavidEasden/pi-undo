@@ -1,7 +1,7 @@
-import { lstat, readFile, readdir, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { appendFile, lstat, readFile, readdir, rm } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
-import { writeContentAddressed, writeJsonAtomic } from "./atomic-fs.ts";
+import { fsyncDirectory, fsyncFile, writeContentAddressed, writeJsonAtomic } from "./atomic-fs.ts";
 import {
 	assertCursor,
 	assertJournalState,
@@ -94,6 +94,13 @@ export class JournalStore {
 		const result: PendingJournal[] = [];
 		for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
 			if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+			try {
+				const state = await lstat(join(this.transactionsRoot, entry.name, "state.json"));
+				if (!state.isFile() || state.isSymbolicLink()) throw new Error("journal state 文件类型无效");
+			} catch (error) {
+				if (hasErrorCode(error, "ENOENT")) continue;
+				throw error;
+			}
 			const journal = await this.load(entry.name);
 			if (journal.state.phase !== "COMMITTED" && journal.state.phase !== "ABORTED") {
 				result.push(journal);
@@ -104,6 +111,24 @@ export class JournalStore {
 
 	async markCommitted(opId: string): Promise<void> {
 		await this.setPhase(opId, "COMMITTED");
+	}
+
+	/** 仅在恢复器已经重新验证 workspace 与 cursor 后，允许中间 phase 收敛到终态。 */
+	async settleRecovery(opId: string, phase: "COMMITTED" | "ABORTED"): Promise<void> {
+		const pending = await this.load(opId);
+		if (pending.state.phase === phase) return;
+		if (pending.state.phase === "COMMITTED" || pending.state.phase === "ABORTED") {
+			throw new Error("journal 已处于不同终态");
+		}
+		await writeJsonAtomic(
+			join(this.operationDirectory(opId), "state.json"),
+			makeState(
+				pending.descriptor,
+				phase,
+				pending.state.revision + 1,
+				pending.state.observedLogicalLeaf,
+			),
+		);
 	}
 
 	async removeIfSettled(opId: string): Promise<void> {
@@ -193,6 +218,22 @@ export function decideRecovery(inspection: CursorMarkerInspection): RecoveryDeci
 	if (inspection.kind === "match") return { action: "roll_forward", reason: "durable_cursor" };
 	if (inspection.kind === "absent") return { action: "rollback", reason: "cursor_absent" };
 	return { action: "lock", reason: "cursor_conflict" };
+}
+
+export async function finalizeCursorMarker(
+	sessionFile: string,
+	descriptor: OperationDescriptor,
+	inspection: Extract<CursorMarkerInspection, { kind: "match" }>,
+): Promise<void> {
+	if (inspection.needsTrailingNewline) {
+		await appendFile(sessionFile, "\n");
+	}
+	await fsyncFile(sessionFile);
+	await fsyncDirectory(dirname(sessionFile));
+	const verified = await inspectCursorMarkers(sessionFile, descriptor);
+	if (verified.kind !== "match" || verified.needsTrailingNewline) {
+		throw new Error("cursor marker 耐久化校验失败");
+	}
 }
 
 function makeState(

@@ -21,6 +21,7 @@ export interface RestorePlan {
 	boundaryRoots: string[];
 	deletePaths: string[];
 	writePaths: string[];
+	scopePaths?: string[];
 	planDigest: string;
 }
 
@@ -32,7 +33,7 @@ export interface RestoreResult {
 }
 
 export interface RestoreEngine {
-	plan(current: SnapshotManifest, target: SnapshotManifest): Promise<RestorePlan>;
+	plan(current: SnapshotManifest, target: SnapshotManifest, scopePaths?: readonly string[]): Promise<RestorePlan>;
 	apply(plan: RestorePlan, target: SnapshotManifest): Promise<RestoreResult>;
 }
 
@@ -82,10 +83,16 @@ export class RestoreEngine {
 		this.beforeMutation = options.beforeMutation;
 	}
 
-	async plan(current: SnapshotManifest, target: SnapshotManifest): Promise<RestorePlan> {
+	async plan(
+		current: SnapshotManifest,
+		target: SnapshotManifest,
+		scopePaths?: readonly string[],
+	): Promise<RestorePlan> {
 		assertManifest(current);
 		assertManifest(target);
 		assertCompatibleManifests(current, target);
+		const scope = scopePaths === undefined ? undefined : this.canonicalScope(scopePaths);
+		const isScopedPath = (path: string): boolean => scope === undefined || scope.has(path);
 		await Promise.all([
 			this.store.assertComplete(current.manifestId),
 			this.store.assertComplete(target.manifestId),
@@ -100,6 +107,7 @@ export class RestoreEngine {
 		const writeByRoot = new Map<string, string[]>();
 
 		for (const [path, owned] of currentPaths) {
+			if (!isScopedPath(path)) continue;
 			const targetOwned = targetPaths.get(path);
 			if (targetOwned !== undefined && !sameEntry(owned.entry, targetOwned.entry)) {
 				if (targetOwned.entry.kind !== owned.entry.kind || targetOwned.entry.kind === "symlink") {
@@ -116,6 +124,7 @@ export class RestoreEngine {
 		}
 
 		for (const [path, owned] of targetPaths) {
+			if (!isScopedPath(path)) continue;
 			const currentOwned = currentPaths.get(path);
 			if (currentOwned === undefined || !sameEntry(currentOwned.entry, owned.entry)) {
 				appendPath(writeByRoot, owned.root.relativeRoot, path);
@@ -134,6 +143,7 @@ export class RestoreEngine {
 			boundaryRoots,
 			deletePaths,
 			writePaths,
+			...(scope === undefined ? {} : { scopePaths: [...scope] }),
 		};
 		return {
 			...semanticPlan,
@@ -216,7 +226,7 @@ export class RestoreEngine {
 		assertCompatibleManifests(current, target);
 		let expectedPlan: RestorePlan;
 		try {
-			expectedPlan = await this.plan(current, target);
+			expectedPlan = await this.plan(current, target, plan.scopePaths);
 		} catch (error) {
 			if (error instanceof SnapshotStoreError && error.code === "object_missing") {
 				return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
@@ -246,7 +256,7 @@ export class RestoreEngine {
 		} catch {
 			return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
 		}
-		const preflight = await this.verifyKnownState(current, target, currentPaths, targetPaths);
+		const preflight = await this.verifyKnownState(current, target, currentPaths, targetPaths, plan.scopePaths);
 		if (!preflight.ok) {
 			return {
 				code: "restore_failed_safe",
@@ -277,7 +287,13 @@ export class RestoreEngine {
 			const topologyAfter = await this.discovery.discover(this.workspaceRoot);
 			assertUnchangedTopology(topologyBefore, topologyAfter);
 			await this.assertCompleteVisibleSubset(topologyAfter, [target]);
-			const verification = await this.verifyTarget(target, currentPaths, targetPaths, plan.deletePaths);
+			const verification = await this.verifyTarget(
+				target,
+				currentPaths,
+				targetPaths,
+				plan.deletePaths,
+				plan.scopePaths,
+			);
 			return {
 				code: "ok",
 				verifiedPaths: verification.verifiedPaths,
@@ -285,7 +301,7 @@ export class RestoreEngine {
 				postFingerprint: postFingerprint(target.manifestId, topologyAfter, verification.pathFingerprints),
 			};
 		} catch {
-			return this.rollback(current, target, topologyBefore, currentPaths, targetPaths);
+			return this.rollback(current, target, topologyBefore, currentPaths, targetPaths, plan.scopePaths);
 		}
 	}
 
@@ -358,8 +374,12 @@ export class RestoreEngine {
 		target: SnapshotManifest,
 		currentPaths: ReadonlyMap<string, OwnedPath>,
 		targetPaths: ReadonlyMap<string, OwnedPath>,
+		scopePaths?: readonly string[],
 	): Promise<{ ok: boolean; verifiedPaths: number; totalPaths: number }> {
-		const paths = [...new Set([...currentPaths.keys(), ...targetPaths.keys()])].sort(comparePaths);
+		const scope = scopePaths === undefined ? undefined : new Set(scopePaths);
+		const paths = [...new Set([...currentPaths.keys(), ...targetPaths.keys()])]
+			.filter((path) => scope === undefined || scope.has(path))
+			.sort(comparePaths);
 		let verifiedPaths = 0;
 		for (const path of paths) {
 			if (await this.pathIsShadowedByTarget(target.manifestId, path, targetPaths)) {
@@ -481,10 +501,11 @@ export class RestoreEngine {
 		topologyBefore: RootTopology,
 		currentPaths: ReadonlyMap<string, OwnedPath>,
 		targetPaths: ReadonlyMap<string, OwnedPath>,
+		scopePaths?: readonly string[],
 	): Promise<RestoreResult> {
 		let rollbackPlan: RestorePlan | undefined;
 		try {
-			rollbackPlan = await this.plan(target, current);
+			rollbackPlan = await this.plan(target, current, scopePaths);
 			const context: MutationContext = {
 				phase: "rollback",
 				ordinal: 0,
@@ -510,6 +531,7 @@ export class RestoreEngine {
 				targetPaths,
 				currentPaths,
 				rollbackPlan.deletePaths,
+				rollbackPlan.scopePaths,
 			);
 			return {
 				code: "restore_failed_safe",
@@ -532,6 +554,7 @@ export class RestoreEngine {
 						targetPaths,
 						currentPaths,
 						rollbackPlan.deletePaths,
+						rollbackPlan.scopePaths,
 					);
 					return {
 						code: "restore_failed_safe",
@@ -548,7 +571,9 @@ export class RestoreEngine {
 				}
 			}
 			let verifiedPaths = 0;
-			for (const owned of currentPaths.values()) {
+			const scope = scopePaths === undefined ? undefined : new Set(scopePaths);
+			for (const [path, owned] of currentPaths) {
+				if (scope !== undefined && !scope.has(path)) continue;
 				try {
 					await this.verifyEntry(current.manifestId, owned);
 					verifiedPaths += 1;
@@ -559,7 +584,7 @@ export class RestoreEngine {
 			return {
 				code: verifiedPaths > 0 ? "partial_restore" : "recovery_required",
 				verifiedPaths,
-				totalPaths: currentPaths.size,
+				totalPaths: scope === undefined ? currentPaths.size : scope.size,
 			};
 		}
 	}
@@ -665,13 +690,16 @@ export class RestoreEngine {
 		currentPaths: ReadonlyMap<string, OwnedPath>,
 		targetPaths: ReadonlyMap<string, OwnedPath>,
 		deletePaths: readonly string[],
+		scopePaths?: readonly string[],
 	): Promise<{ verifiedPaths: number; totalPaths: number; pathFingerprints: string[] }> {
 		const pathFingerprints: string[] = [];
-		for (const owned of targetPaths.values()) {
+		const scope = scopePaths === undefined ? undefined : new Set(scopePaths);
+		for (const [path, owned] of targetPaths) {
+			if (scope !== undefined && !scope.has(path)) continue;
 			pathFingerprints.push(await this.verifyEntry(target.manifestId, owned));
 		}
-		let verifiedPaths = targetPaths.size;
-		let totalPaths = targetPaths.size;
+		let verifiedPaths = pathFingerprints.length;
+		let totalPaths = pathFingerprints.length;
 		for (const path of deletePaths) {
 			if (
 				targetPaths.has(path) ||
@@ -793,6 +821,15 @@ export class RestoreEngine {
 
 	private absolutePath(path: string): string {
 		return join(this.workspaceRoot, ...path.split("/"));
+	}
+
+	private canonicalScope(paths: readonly string[]): ReadonlySet<string> {
+		const canonical = [...new Set(paths)].sort(comparePaths);
+		for (const path of canonical) {
+			assertNotGitMetadata(path);
+			relativeSafePath(this.workspaceRoot, path);
+		}
+		return new Set(canonical);
 	}
 }
 
@@ -924,14 +961,16 @@ function postFingerprint(
 
 function hasValidPlanDigest(plan: RestorePlan): boolean {
 	const keys = Object.keys(plan).sort();
-	if (canonicalJson(keys) !== canonicalJson([
+	const expectedKeys = [
 		"boundaryRoots",
 		"currentManifestId",
 		"deletePaths",
 		"planDigest",
+		...(plan.scopePaths === undefined ? [] : ["scopePaths"]),
 		"targetManifestId",
 		"writePaths",
-	])) {
+	].sort();
+	if (canonicalJson(keys) !== canonicalJson(expectedKeys)) {
 		return false;
 	}
 	try {
@@ -941,6 +980,7 @@ function hasValidPlanDigest(plan: RestorePlan): boolean {
 			boundaryRoots: plan.boundaryRoots,
 			deletePaths: plan.deletePaths,
 			writePaths: plan.writePaths,
+			...(plan.scopePaths === undefined ? {} : { scopePaths: plan.scopePaths }),
 		})) === plan.planDigest;
 	} catch {
 		return false;
