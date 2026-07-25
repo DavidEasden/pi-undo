@@ -126,6 +126,29 @@ export interface JournalState {
 	readonly checksum: string;
 }
 
+export type MutationState =
+	| "INTENT"
+	| "SOURCE_QUARANTINED"
+	| "SOURCE_VERIFIED"
+	| "TARGET_INSTALLED"
+	| "TARGET_VERIFIED"
+	| "CLEANED";
+
+export interface MutationRecord {
+	readonly schemaVersion: 1;
+	readonly opId: string;
+	readonly ordinal: number;
+	readonly state: MutationState;
+	readonly kind: "write" | "delete" | "symlink";
+	readonly path: string;
+	readonly sourceArtifact: string;
+	readonly targetArtifact: string | null;
+	readonly sourceFingerprint: string;
+	readonly targetFingerprint: string;
+	readonly previousChecksum: string | null;
+	readonly checksum: string;
+}
+
 export interface RestorePath {
 	readonly relativePath: string;
 	readonly kind: "file" | "directory" | "symlink";

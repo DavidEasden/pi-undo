@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
 	assertCursor,
 	assertManifest,
+	assertMutationRecord,
 	canonicalJson,
 	checksum,
 	topologyFingerprint,
@@ -10,6 +11,7 @@ import type {
 	CursorState,
 	DiscoveryRoot,
 	ManifestId,
+	MutationRecord,
 	SnapshotManifest,
 	SnapshotRoot,
 } from "../src/model.ts";
@@ -113,6 +115,25 @@ function cursor(overrides: Partial<CursorState> = {}): CursorState {
 		undoHead: "checkpoint-1",
 		redoStack: ["checkpoint-2", "checkpoint-3"],
 		descriptorChecksum: "c".repeat(64),
+	};
+	const next = { ...payload, ...overrides };
+	const { checksum: _checksum, ...content } = next as typeof next & { checksum?: string };
+	return { ...next, checksum: overrides.checksum ?? checksum(canonicalJson(content)) };
+}
+
+function mutation(overrides: Partial<MutationRecord> = {}): MutationRecord {
+	const payload = {
+		schemaVersion: 1 as const,
+		opId: "operation-1",
+		ordinal: 1,
+		state: "INTENT" as const,
+		kind: "write" as const,
+		path: "nested/file.txt",
+		sourceArtifact: "nested/.file.txt.pi-undo-source",
+		targetArtifact: "nested/.file.txt.pi-undo-target",
+		sourceFingerprint: "a".repeat(64),
+		targetFingerprint: "b".repeat(64),
+		previousChecksum: "c".repeat(64),
 	};
 	const next = { ...payload, ...overrides };
 	const { checksum: _checksum, ...content } = next as typeof next & { checksum?: string };
@@ -498,5 +519,79 @@ describe("assertCursor", () => {
 		expect(() => assertCursor({ ...cursor(), checksum: "0".repeat(64) })).toThrowError(
 			expect.objectContaining({ code: "checksum_mismatch" }),
 		);
+	});
+});
+
+describe("assertMutationRecord", () => {
+	it("接受 checksum 正确且路径安全的 mutation record", () => {
+		const value = mutation();
+
+		expect(assertMutationRecord(value)).toBe(value);
+	});
+
+	it("拒绝 checksum 不匹配", () => {
+		expect(() => assertMutationRecord({ ...mutation(), checksum: "0".repeat(64) })).toThrowError(
+			expect.objectContaining({ code: "checksum_mismatch" }),
+		);
+	});
+
+	it.each([
+		".git/config",
+		"nested/.GIT/config",
+		"/absolute",
+		"../escape",
+		"nested/../escape",
+		"nested\\file.txt",
+		"nested/fi\0le.txt",
+	])("拒绝不安全的 workspace 路径：%s", (path) => {
+		expect(() => assertMutationRecord(mutation({ path }))).toThrowError(
+			expect.objectContaining({ code: "invalid_mutation_record" }),
+		);
+	});
+
+	it.each([
+		["sourceArtifact", "/absolute"],
+		["sourceArtifact", "nested/.git/source"],
+		["targetArtifact", "../target"],
+		["targetArtifact", "nested\\target"],
+	] as const)("拒绝不安全的 %s 路径", (field, path) => {
+		expect(() => assertMutationRecord(mutation({ [field]: path }))).toThrowError(
+			expect.objectContaining({ code: "invalid_mutation_record" }),
+		);
+	});
+
+	it.each([
+		["sourceArtifact", "other/source"],
+		["targetArtifact", "other/target"],
+	] as const)("拒绝与 path 不同父目录的 %s", (field, path) => {
+		expect(() => assertMutationRecord(mutation({ [field]: path }))).toThrowError(
+			expect.objectContaining({ code: "invalid_mutation_record" }),
+		);
+	});
+
+	it.each([
+		["state", "UNKNOWN"],
+		["kind", "rename"],
+		["ordinal", 0],
+		["ordinal", 1.5],
+		["sourceFingerprint", "A".repeat(64)],
+		["targetFingerprint", "b".repeat(63)],
+		["previousChecksum", "not-a-checksum"],
+	] as const)("拒绝非法字段 %s", (field, invalid) => {
+		expect(() => assertMutationRecord(mutation({ [field]: invalid } as Partial<MutationRecord>))).toThrowError(
+			expect.objectContaining({ code: "invalid_mutation_record" }),
+		);
+	});
+
+	it("write 必须包含 targetArtifact", () => {
+		expect(() => assertMutationRecord(mutation({ kind: "write", targetArtifact: null }))).toThrowError(
+			expect.objectContaining({ code: "invalid_mutation_record" }),
+		);
+	});
+
+	it("delete 接受 null targetArtifact 与 previousChecksum", () => {
+		const value = mutation({ kind: "delete", targetArtifact: null, previousChecksum: null });
+
+		expect(assertMutationRecord(value)).toBe(value);
 	});
 });

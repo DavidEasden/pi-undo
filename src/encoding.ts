@@ -4,6 +4,7 @@ import type {
 	CursorState,
 	JournalState,
 	ManifestId,
+	MutationRecord,
 	OperationDescriptor,
 	RootTopologyIdentity,
 	SnapshotManifest,
@@ -17,6 +18,7 @@ export type ValidationCode =
 	| "invalid_cursor"
 	| "invalid_descriptor"
 	| "invalid_journal_state"
+	| "invalid_mutation_record"
 	| "invalid_root_path"
 	| "noncanonical_roots"
 	| "invalid_manifest_id"
@@ -144,6 +146,46 @@ export function assertJournalState(value: unknown): JournalState {
 		fail("checksum_mismatch", "journal state checksum 不匹配");
 	}
 	return value as JournalState;
+}
+
+export function assertMutationRecord(value: unknown): MutationRecord {
+	const record = assertRecord(value, "invalid_mutation_record", "mutation record 必须是对象");
+	assertSchemaVersion(record, "mutation record");
+	assertOperationId(record.opId);
+	if (typeof record.ordinal !== "number" || !Number.isInteger(record.ordinal) || record.ordinal < 1) {
+		fail("invalid_mutation_record", "mutation ordinal 无效");
+	}
+	if (!isMutationState(record.state)) {
+		fail("invalid_mutation_record", "mutation state 无效");
+	}
+	if (record.kind !== "write" && record.kind !== "delete" && record.kind !== "symlink") {
+		fail("invalid_mutation_record", "mutation kind 无效");
+	}
+	if (record.kind === "write" && record.targetArtifact === null) {
+		fail("invalid_mutation_record", "write mutation 必须包含 targetArtifact");
+	}
+	assertWorkspacePath(record.path, "path");
+	assertWorkspacePath(record.sourceArtifact, "sourceArtifact");
+	if (record.targetArtifact !== null) {
+		assertWorkspacePath(record.targetArtifact, "targetArtifact");
+	}
+	const parent = workspaceParent(record.path);
+	if (workspaceParent(record.sourceArtifact) !== parent) {
+		fail("invalid_mutation_record", "sourceArtifact 必须与 path 位于同一父目录");
+	}
+	if (record.targetArtifact !== null && workspaceParent(record.targetArtifact) !== parent) {
+		fail("invalid_mutation_record", "targetArtifact 必须与 path 位于同一父目录");
+	}
+	assertChecksum(record.sourceFingerprint, "invalid_mutation_record", "sourceFingerprint 无效");
+	assertChecksum(record.targetFingerprint, "invalid_mutation_record", "targetFingerprint 无效");
+	if (record.previousChecksum !== null) {
+		assertChecksum(record.previousChecksum, "invalid_mutation_record", "previousChecksum 无效");
+	}
+	assertChecksum(record.checksum, "checksum_mismatch", "mutation checksum 无效");
+	if (record.checksum !== checksumWithout(record, "checksum", "invalid_mutation_record")) {
+		fail("checksum_mismatch", "mutation checksum 与内容不匹配");
+	}
+	return value as MutationRecord;
 }
 
 export function assertOperationId(value: unknown): string {
@@ -433,6 +475,27 @@ function isJournalPhase(value: unknown): value is JournalState["phase"] {
 		value === "APPLYING" || value === "FILES_VERIFIED" || value === "CURSOR_COMMITTED" ||
 		value === "COMMITTED" || value === "ABORTING" || value === "ABORTED" ||
 		value === "RECOVERY_REQUIRED";
+}
+
+function isMutationState(value: unknown): value is MutationRecord["state"] {
+	return value === "INTENT" || value === "SOURCE_QUARANTINED" || value === "SOURCE_VERIFIED" ||
+		value === "TARGET_INSTALLED" || value === "TARGET_VERIFIED" || value === "CLEANED";
+}
+
+function assertWorkspacePath(value: unknown, name: string): asserts value is string {
+	if (
+		typeof value !== "string" ||
+		value === "." ||
+		!isCanonicalRoot(value) ||
+		value.split("/").some((component) => component.toLowerCase() === ".git")
+	) {
+		fail("invalid_mutation_record", `${name} 必须是安全的 workspace 相对路径`);
+	}
+}
+
+function workspaceParent(path: string): string {
+	const separator = path.lastIndexOf("/");
+	return separator === -1 ? "" : path.slice(0, separator);
 }
 
 function isDenseStringArray(value: unknown): value is string[] {
