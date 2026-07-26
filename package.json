@@ -1,11 +1,23 @@
 {
-	"name": "pi-undo",
+	"name": "@davideasden/pi-undo",
 	"version": "0.1.0",
 	"description": "Persistent workspace undo and redo for Pi",
 	"type": "module",
 	"keywords": [
 		"pi-package"
 	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/DavidEasden/pi-undo.git"
+	},
+	"homepage": "https://github.com/DavidEasden/pi-undo#readme",
+	"bugs": {
+		"url": "https://github.com/DavidEasden/pi-undo/issues"
+	},
+	"publishConfig": {
+		"access": "public",
+		"registry": "https://registry.npmjs.org/"
+	},
 	"pi": {
 		"extensions": [
 			"./extensions/pi-undo.ts"
