@@ -28,7 +28,14 @@ export class StatusReporter {
 		this.setStatus(sanitize(text));
 	}
 
-	setRecoveryRequired(reason: string): void {
+	setRecoveryRequired(
+		reason: string,
+		details?: { readonly files?: number; readonly opId?: string },
+	): void {
+		if (details?.files !== undefined && details.opId !== undefined) {
+			this.setStatus(`recovery_required files:${details.files} op:${sanitize(details.opId)}`);
+			return;
+		}
 		this.setStatus(`recovery required: ${sanitize(reason)}`);
 	}
 

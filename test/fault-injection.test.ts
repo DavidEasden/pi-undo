@@ -126,7 +126,12 @@ describe("JournalRecovery fault injection", () => {
 	it("mutation 现场冲突时在 capture 前锁定", async () => {
 		const { recovery, calls } = fixture("absent", "after", "conflict");
 
-		expect(await recovery.recover()).toMatchObject({ kind: "locked", reason: "mutation_conflict" });
+		expect(await recovery.recover()).toMatchObject({
+			kind: "locked",
+			reason: "mutation_conflict",
+			files: 1,
+			opId: "operation-1",
+		});
 		expect(calls).toEqual(["mutations:rollback"]);
 	});
 

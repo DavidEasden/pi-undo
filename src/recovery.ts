@@ -33,7 +33,13 @@ export interface JournalRecoveryDependencies {
 export type JournalRecoveryResult =
 	| { readonly kind: "clean"; readonly operations: 0 }
 	| { readonly kind: "recovered"; readonly operations: number }
-	| { readonly kind: "locked"; readonly reason: string; readonly operations: number };
+	| {
+		readonly kind: "locked";
+		readonly reason: string;
+		readonly operations: number;
+		readonly files?: number;
+		readonly opId?: string;
+	};
 
 /**
  * 根据 durable cursor marker 决定向前补完或回滚。
@@ -84,7 +90,13 @@ export class JournalRecovery {
 				return { kind: "locked", reason: "mutation_recovery_failed", operations: recovered };
 			}
 			if (mutationResult.kind === "conflict") {
-				return { kind: "locked", reason: "mutation_conflict", operations: recovered };
+				return {
+					kind: "locked",
+					reason: "mutation_conflict",
+					operations: recovered,
+					files: mutationResult.paths,
+					opId: journal.descriptor.opId,
+				};
 			}
 
 			try {

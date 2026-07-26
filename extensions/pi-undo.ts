@@ -14,6 +14,7 @@ import { StatusReporter } from "../src/status-reporter.ts";
 export interface PiUndoRuntime {
 	readonly controller: UndoController;
 	readonly reporter: StatusReporter;
+	readonly recovery?: { readonly files?: number; readonly opId?: string };
 	setCommandContext?(context: ExtensionCommandContext | undefined): void;
 	isInternalNavigation?(): boolean;
 }
@@ -36,7 +37,7 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 				runtime = next;
 				await next.controller.recover();
 				const history = next.controller.history();
-				if (history.locked) next.reporter.setRecoveryRequired("pending journal");
+				if (history.locked) next.reporter.setRecoveryRequired("pending journal", next.recovery);
 				else next.reporter.setReady(history.undoCount, history.redoCount);
 			} catch (error) {
 				if (currentGeneration !== generation) return;
