@@ -258,6 +258,130 @@ describe("SnapshotStore", () => {
 		await store.assertComplete(manifest.manifestId);
 	});
 
+	it("capture 只排除指定的 exact artifact，不按名称前缀扩大范围", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, ".pi-undo-q1-owned-source", "owned\n");
+		await writeFixtureFile(workspace, ".pi-undo-q1-user-source", "user\n");
+		const topology = await new RootDiscovery().discover(workspace);
+		const store = new SnapshotStore({ storeRoot });
+
+		const manifest = await store.capture(topology, undefined, {
+			excludePaths: [".pi-undo-q1-owned-source"],
+		});
+		const paths = (await store.listTree(manifest.manifestId, "."))
+			.map((entry) => entry.relativePath);
+
+		expect(paths).not.toContain(".pi-undo-q1-owned-source");
+		expect(paths).toContain(".pi-undo-q1-user-source");
+		expect(manifest.coverage).toBe("complete");
+	});
+
+	it("capture 的 exact exclusion 不递归排除同路径下的 descendant", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, "owned/child.txt", "child\n");
+		await writeFixtureFile(workspace, "owned-sibling.txt", "sibling\n");
+		const topology = await new RootDiscovery().discover(workspace);
+		const store = new SnapshotStore({ storeRoot });
+
+		const manifest = await store.capture(topology, undefined, { excludePaths: ["owned"] });
+		const paths = (await store.listTree(manifest.manifestId, "."))
+			.map((entry) => entry.relativePath);
+
+		expect(paths).toContain("owned/child.txt");
+		expect(paths).toContain("owned-sibling.txt");
+	});
+
+	it("真实 Git repo 的 tracked exact artifact 被排除且相似 tracked 路径保留", async () => {
+		const repository = await createGitRepo();
+		temporaryRoots.push(repository.root);
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(repository.root, "owned-source", "owned\n");
+		await writeFixtureFile(repository.root, "owned-source-user", "user\n");
+		await writeFixtureFile(repository.root, "owned-source-dir/child.txt", "child\n");
+		await runGit(repository.root, ["add", "owned-source", "owned-source-user", "owned-source-dir/child.txt"]);
+		const topology = await new RootDiscovery().discover(repository.root);
+		const store = new SnapshotStore({ storeRoot });
+
+		const manifest = await store.capture(topology, undefined, { excludePaths: ["owned-source"] });
+		const paths = (await store.listTree(manifest.manifestId, "."))
+			.map((entry) => entry.relativePath);
+
+		expect(paths).not.toContain("owned-source");
+		expect(paths).toContain("owned-source-user");
+		expect(paths).toContain("owned-source-dir/child.txt");
+		await expect(store.assertComplete(manifest.manifestId)).resolves.toBeUndefined();
+	});
+
+	it("ignored exact artifact 不进入 ignored-present proof 且相似 ignored 路径保留", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, ".gitignore", "ignored-owned\nignored-owned-user\n");
+		await writeFixtureFile(workspace, "ignored-owned", "owned\n");
+		await writeFixtureFile(workspace, "ignored-owned-user", "user\n");
+		const topology = await new RootDiscovery().discover(workspace);
+		const store = new SnapshotStore({ storeRoot });
+
+		const manifest = await store.capture(topology, undefined, { excludePaths: ["ignored-owned"] });
+		const root = manifest.roots[0]!;
+
+		expect(root.ignoredPresentPaths).toEqual(["ignored-owned-user"]);
+		expect(root.ignoreClosure).toBe(ignoredPresentClosure(root));
+		await expect(store.assertComplete(manifest.manifestId)).resolves.toBeUndefined();
+	});
+
+	it("partial scope 精确排除 symlink artifact 且不扩大 coverage", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, "target.txt", "target\n");
+		await symlink("target.txt", join(workspace, "owned-link"));
+		await symlink("target.txt", join(workspace, "user-link"));
+		await writeFixtureFile(workspace, "outside.txt", "outside\n");
+		const topology = await new RootDiscovery().discover(workspace);
+		const store = new SnapshotStore({ storeRoot });
+		const scope = ["owned-link", "user-link"];
+
+		const manifest = await store.capture(topology, scope, { excludePaths: ["owned-link"] });
+		const entries = await store.listTree(manifest.manifestId, ".");
+
+		expect(entries.map((entry) => entry.relativePath)).toEqual(["user-link"]);
+		expect(entries[0]).toEqual(expect.objectContaining({ kind: "symlink", linkText: "target.txt" }));
+		expect(manifest.coverage).toBe(`paths:${checksum(canonicalJson(scope))}`);
+		expect(manifest.roots[0]?.coverage).toBe(`paths:${checksum(canonicalJson(scope))}`);
+	});
+
+	it("capture 未传 options 时保持原有捕获行为", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, ".pi-undo-q1-owned-source", "owned\n");
+		const topology = await new RootDiscovery().discover(workspace);
+		const store = new SnapshotStore({ storeRoot });
+
+		const manifest = await store.capture(topology);
+
+		expect((await store.listTree(manifest.manifestId, ".")).map((entry) => entry.relativePath))
+			.toContain(".pi-undo-q1-owned-source");
+	});
+
+	it.each([
+		["绝对路径", "/tmp/artifact"],
+		["父目录组件", "dir/../artifact"],
+		["反斜杠", "dir\\artifact"],
+		["NUL", "artifact\0tail"],
+		["小写 .git", ".git/artifact"],
+		["混合大小写 .git", "nested/.GiT/artifact"],
+	] as const)("capture 拒绝非法 exclusion：%s", async (_label, exclusion) => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, "file.txt", "content\n");
+		const topology = await new RootDiscovery().discover(workspace);
+		const store = new SnapshotStore({ storeRoot });
+
+		await expect(store.capture(topology, undefined, { excludePaths: [exclusion] }))
+			.rejects.toMatchObject({ code: "capture_failed" });
+	});
+
 	it("多层 nested repository 各自捕获，并由每一层父 root 排除 descendant", async () => {
 		const outer = await createGitRepo();
 		temporaryRoots.push(outer.root);
@@ -281,6 +405,31 @@ describe("SnapshotStore", () => {
 		expect(childPaths).toContain("child-only.txt");
 		expect(childPaths.some((path) => path.startsWith("deeper"))).toBe(false);
 		expect(deeperPaths).toContain("deeper-only.txt");
+	});
+
+	it("artifact exclusion 只映射到 nested repository 的实际 owned root", async () => {
+		const outer = await createGitRepo();
+		temporaryRoots.push(outer.root);
+		const child = await createNestedRepo(outer.root, "packages/child");
+		await writeFixtureFile(outer.root, "outer-user.txt", "outer\n");
+		await writeFixtureFile(child.root, ".pi-undo-q1-owned-source", "owned\n");
+		await writeFixtureFile(child.root, ".pi-undo-q1-user-source", "user\n");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		const topology = await new RootDiscovery().discover(outer.root);
+		const store = new SnapshotStore({ storeRoot });
+
+		const manifest = await store.capture(topology, undefined, {
+			excludePaths: ["packages/child/.pi-undo-q1-owned-source"],
+		});
+		const outerPaths = (await store.listTree(manifest.manifestId, "."))
+			.map((entry) => entry.relativePath);
+		const childPaths = (await store.listTree(manifest.manifestId, "packages/child"))
+			.map((entry) => entry.relativePath);
+
+		expect(outerPaths).toContain("outer-user.txt");
+		expect(outerPaths.some((path) => path.startsWith("packages/child"))).toBe(false);
+		expect(childPaths).not.toContain(".pi-undo-q1-owned-source");
+		expect(childPaths).toContain(".pi-undo-q1-user-source");
 	});
 
 	it("partial scope 将特殊文件名作为 literal pathspec 处理", async () => {
@@ -649,6 +798,36 @@ describe("SnapshotStore", () => {
 		expect(await readGitMetadata(child.root)).toEqual(childBefore);
 		expect(await runGit(outer.root, ["reflog", "show", "--format=%H%x00%gs"])).toBe(outerReflog);
 		expect(await runGit(child.root, ["reflog", "show", "--format=%H%x00%gs"])).toBe(childReflog);
+	});
+
+	it("artifact exclusion 只映射到 initialized submodule 的实际 owned root", async () => {
+		const outer = await createGitRepo();
+		temporaryRoots.push(outer.root);
+		const child = await createLocalSubmodule(outer.root, "modules/child");
+		temporaryRoots.push(child.sourceRoot);
+		await writeFixtureFile(outer.root, "outer-user.txt", "outer\n");
+		await writeFixtureFile(child.root, ".pi-undo-q1-owned-source", "owned\n");
+		await writeFixtureFile(child.root, ".pi-undo-q1-user-source", "user\n");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		const topology = await new RootDiscovery().discover(outer.root);
+		const store = new SnapshotStore({ storeRoot });
+		const outerBefore = await readGitMetadata(outer.root);
+		const childBefore = await readGitMetadata(child.root);
+
+		const manifest = await store.capture(topology, undefined, {
+			excludePaths: ["modules/child/.pi-undo-q1-owned-source"],
+		});
+		const outerPaths = (await store.listTree(manifest.manifestId, "."))
+			.map((entry) => entry.relativePath);
+		const childPaths = (await store.listTree(manifest.manifestId, "modules/child"))
+			.map((entry) => entry.relativePath);
+
+		expect(outerPaths).toContain("outer-user.txt");
+		expect(outerPaths.some((path) => path.startsWith("modules/child"))).toBe(false);
+		expect(childPaths).not.toContain(".pi-undo-q1-owned-source");
+		expect(childPaths).toContain(".pi-undo-q1-user-source");
+		expect(await readGitMetadata(outer.root)).toEqual(outerBefore);
+		expect(await readGitMetadata(child.root)).toEqual(childBefore);
 	});
 
 	it("broken root 不发布 manifest", async () => {

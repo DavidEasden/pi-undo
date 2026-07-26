@@ -68,6 +68,10 @@ export interface SnapshotStoreOptions {
 	readonly clock?: () => number;
 }
 
+export interface CaptureOptions {
+	readonly excludePaths?: readonly string[];
+}
+
 export type SnapshotStoreErrorCode =
 	| "capture_failed"
 	| "invalid_manifest_id"
@@ -88,7 +92,7 @@ export class SnapshotStoreError extends Error {
 }
 
 export interface SnapshotStore {
-	capture(topology: RootTopology, scope?: readonly string[]): Promise<SnapshotManifest>;
+	capture(topology: RootTopology, scope?: readonly string[], options?: CaptureOptions): Promise<SnapshotManifest>;
 	loadManifest(id: ManifestId): Promise<SnapshotManifest>;
 	assertComplete(id: ManifestId): Promise<void>;
 	listTree(id: ManifestId, root: string): Promise<readonly RestorePath[]>;
@@ -116,19 +120,28 @@ export class SnapshotStore {
 		this.clock = options.clock ?? Date.now;
 	}
 
-	async capture(topology: RootTopology, scope?: readonly string[]): Promise<SnapshotManifest> {
+	async capture(
+		topology: RootTopology,
+		scope?: readonly string[],
+		options: CaptureOptions = {},
+	): Promise<SnapshotManifest> {
 		await this.assertPrivateStore(topology.workspaceIdentity);
 		const lockIdentity = `snapshot-store:${await prospectiveCanonicalPath(this.storesRoot)}`;
-		return this.lock.withLock(lockIdentity, () => this.captureLocked(topology, scope));
+		return this.lock.withLock(lockIdentity, () => this.captureLocked(topology, scope, options));
 	}
 
-	private async captureLocked(topology: RootTopology, scope?: readonly string[]): Promise<SnapshotManifest> {
+	private async captureLocked(
+		topology: RootTopology,
+		scope: readonly string[] | undefined,
+		options: CaptureOptions,
+	): Promise<SnapshotManifest> {
 		let transactionDirectory: string | undefined;
 		try {
 			if (topology.fingerprint !== topologyFingerprint(topology.workspaceIdentity, topology.roots)) {
 				throw new SnapshotStoreError("capture_failed", "topology fingerprint 与 roots 不匹配");
 			}
 			const coverage = captureCoverage(topology.workspaceIdentity, scope);
+			const artifactExclusions = captureExclusions(topology.workspaceIdentity, options.excludePaths);
 			await this.assertTopology(topology, "捕获前 topology 已变化");
 			if (topology.roots.some((root) => root.state === "broken")) {
 				throw new SnapshotStoreError("capture_failed", "broken root 不能静默进入快照");
@@ -151,7 +164,13 @@ export class SnapshotStore {
 					}));
 					continue;
 				}
-				const captured = await this.captureRoot(topology, root, transactionDirectory, scope);
+				const captured = await this.captureRoot(
+					topology,
+					root,
+					transactionDirectory,
+					scope,
+					artifactExclusions,
+				);
 				roots.push(snapshotRoot(root, captured));
 			}
 
@@ -433,6 +452,7 @@ export class SnapshotStore {
 		root: DiscoveryRoot,
 		transactionDirectory: string,
 		scope: readonly string[] | undefined,
+		artifactExclusions: readonly string[],
 	): Promise<CapturedRootResult> {
 		const storeDirectory = this.storeDirectory(topology);
 		const gitDirectory = this.rootGitDirectory(storeDirectory, root);
@@ -449,8 +469,16 @@ export class SnapshotStore {
 		const exclusions = topology.roots
 			.filter((candidate) => isStrictRootAncestor(root.relativeRoot, candidate.relativeRoot))
 			.map((candidate) => rootRelativePath(root.relativeRoot, candidate.relativeRoot));
+		const exactExclusions = ownedArtifactExclusions(topology.roots, root.relativeRoot, artifactExclusions);
 		const inclusions = ownedRootInclusions(requestedInclusions, exclusions);
-		await this.stageWorktree(absoluteRoot, environment, root.gitBacked, inclusions, exclusions);
+		await this.stageWorktree(
+			absoluteRoot,
+			environment,
+			root.gitBacked,
+			inclusions,
+			exclusions,
+			exactExclusions,
+		);
 		const coverage = rootCoverageFromInclusions(inclusions);
 		const ignoredPresentPaths = await this.captureIgnoredPresentPaths(
 			absoluteRoot,
@@ -458,6 +486,7 @@ export class SnapshotStore {
 			root.gitBacked,
 			inclusions,
 			exclusions,
+			exactExclusions,
 		);
 		const treeId = (await this.runGit(["write-tree"], { cwd: absoluteRoot, env: environment })).trim();
 		if (!isObjectId(treeId)) {
@@ -482,6 +511,7 @@ export class SnapshotStore {
 		gitBacked: boolean,
 		inclusions: readonly string[] | null,
 		exclusions: readonly string[],
+		exactExclusions: readonly string[],
 	): Promise<string[]> {
 		if (inclusions === null) {
 			return [];
@@ -502,7 +532,10 @@ export class SnapshotStore {
 		], { cwd, env: gitBacked ? sourceGitEnvironment() : environment });
 		const result = new Set<string>();
 		for (const relativePath of parseNulPaths(output)) {
-			if (exclusions.some((excluded) => isPathAtOrBelow(excluded, relativePath))) {
+			if (
+				exclusions.some((excluded) => isPathAtOrBelow(excluded, relativePath)) ||
+				exactExclusions.includes(relativePath)
+			) {
 				continue;
 			}
 			await assertNoSymlinkEscape(cwd, relativePath);
@@ -530,6 +563,7 @@ export class SnapshotStore {
 		gitBacked: boolean,
 		inclusions: readonly string[] | null,
 		exclusions: readonly string[],
+		exactExclusions: readonly string[],
 	): Promise<void> {
 		if (inclusions === null) {
 			return;
@@ -550,7 +584,10 @@ export class SnapshotStore {
 			...pathspecs,
 		], { cwd, env: queryEnvironment });
 		for (const relativePath of parseNulPaths(output)) {
-			if (exclusions.some((excluded) => isPathAtOrBelow(excluded, relativePath))) {
+			if (
+				exclusions.some((excluded) => isPathAtOrBelow(excluded, relativePath)) ||
+				exactExclusions.includes(relativePath)
+			) {
 				continue;
 			}
 			relativeSafePath(cwd, relativePath);
@@ -793,6 +830,46 @@ function captureCoverage(workspaceIdentity: string, scope: readonly string[] | u
 		return COMPLETE_COVERAGE;
 	}
 	return `paths:${checksum(canonicalJson(paths))}`;
+}
+
+function captureExclusions(
+	workspaceIdentity: string,
+	excludePaths: readonly string[] | undefined,
+): string[] {
+	if (excludePaths === undefined) {
+		return [];
+	}
+	const result = new Set<string>();
+	for (const path of excludePaths) {
+		const safe = relativeSafePath(workspaceIdentity, path);
+		if (safe === "." || safe.split("/").some((part) => part.toLowerCase() === ".git")) {
+			throw new SnapshotStoreError("capture_failed", `artifact exclusion 路径无效：${path}`);
+		}
+		result.add(safe);
+	}
+	return [...result].sort(comparePaths);
+}
+
+function ownedArtifactExclusions(
+	roots: readonly DiscoveryRoot[],
+	rootPath: string,
+	exclusions: readonly string[],
+): string[] {
+	const result: string[] = [];
+	for (const exclusion of exclusions) {
+		const owner = roots
+			.filter((candidate) => (
+				candidate.relativeRoot === "." ||
+				exclusion === candidate.relativeRoot ||
+				isStrictRootAncestor(candidate.relativeRoot, exclusion)
+			))
+			.sort((left, right) => right.relativeRoot.length - left.relativeRoot.length)[0];
+		if (owner?.relativeRoot !== rootPath || exclusion === rootPath) {
+			continue;
+		}
+		result.push(rootRelativePath(rootPath, exclusion));
+	}
+	return result;
 }
 
 function rootScopePathspecs(rootPath: string, scope: readonly string[] | undefined): string[] | null {
