@@ -1,10 +1,16 @@
 {
 	"name": "@davideasden/pi-undo",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Persistent workspace undo and redo for Pi",
 	"type": "module",
 	"keywords": [
-		"pi-package"
+		"pi-package",
+		"pi-agent",
+		"pi-extension",
+		"undo",
+		"redo",
+		"workspace-history",
+		"coding-agent"
 	],
 	"repository": {
 		"type": "git",
