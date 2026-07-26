@@ -154,6 +154,8 @@ durable cursor 仍是整个 undo/redo/tree transaction 的提交判据：有可�
 - `restore_failed_safe`：外部内容已恢复到原路径，workspace 可证明未被 pi-undo 覆盖；
 - `recovery_required`：原路径和 artifact 无法无损自动合并，所有内容均保留，等待重启恢复或人工处理。
 
+如果 workspace alias、canonical root 或 artifact 上层目录在 mutation 后换向，恢复器不能再通过原相对路径证明 artifact 归属并无损恢复。此时必须保留 WAL、artifact 和外部内容并返回 `recovery_required`，不得为了返回 `restore_failed_safe` 而跨越已变化的身份边界清理现场。
+
 状态报告应包含冲突路径数量和 transaction opId，但不在 TUI 中输出文件内容。
 
 ## 测试策略
@@ -195,6 +197,8 @@ durable cursor 仍是整个 undo/redo/tree transaction 的提交判据：有可�
 ## 实施边界
 
 第一版只对普通文件和 symlink 启用 quarantine。目录保持现有安全语义。所有新格式均带 schema version，不兼容或损坏的 mutation log fail closed。现有无 mutation log 的旧 journal 继续由原 recovery 协议处理，确保升级后可恢复已有 transaction。
+
+在 Controller 于 Task 6 强制传入 operation identity 前，旧两参数 `apply` 只是迁移兼容路径。它每次调用都使用 `mkdtemp` 创建独立、不可预测的临时 journal，不在并发调用间共享 WAL。journal 已 clean 时只删除本次创建的精确临时目录；存在 active mutation 时保留现场。该临时 WAL 不具备 startup recovery 承诺，Task 6 必须删除此兼容路径并改用 transaction 目录中的 journal。
 
 ## 验收标准
 
