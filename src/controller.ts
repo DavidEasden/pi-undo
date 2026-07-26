@@ -108,6 +108,8 @@ export interface HistoryState {
 }
 
 export interface UndoController {
+	/** 只读的 undo 栈视图（栈底在前）；仅供 /diff 等展示使用。 */
+	listCheckpoints(): readonly CheckpointRecord[];
 	prepareInput(text: string, context: InputContext): Promise<InputEventResult>;
 	beforeAgentStart(): Promise<void>;
 	agentSettled(): Promise<void>;
@@ -173,6 +175,10 @@ export class UndoControllerImpl implements UndoController {
 
 	history(): HistoryState {
 		return { undoCount: this.undoStack.length, redoCount: this.redoStack.length, locked: this.locked };
+	}
+
+	listCheckpoints(): readonly CheckpointRecord[] {
+		return [...this.undoStack];
 	}
 
 	async prepareInput(text: string, context: InputContext): Promise<InputEventResult> {

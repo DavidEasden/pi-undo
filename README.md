@@ -49,6 +49,22 @@ pi -e /absolute/path/to/pi-undo/extensions/pi-undo.ts
 
 Work with Pi normally. `pi-undo` records a boundary after each completed agent run.
 
+### Diff
+
+```text
+/diff
+```
+
+`/diff` reviews the files changed by the most recent completed agent run. In TUI mode, select a file to open a colored, scrollable before-and-after comparison. Binary files are listed but do not receive a line-by-line diff.
+
+Use a one-based history position to inspect an earlier applied run, where `1` is the most recent:
+
+```text
+/diff 2
+```
+
+Print, JSON, and RPC modes report a one-line file and line-count summary instead of opening the interactive viewer.
+
 ### Undo
 
 ```text

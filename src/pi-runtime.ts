@@ -154,6 +154,7 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 	return {
 		controller,
 		reporter: new StatusReporter(context),
+		diffSource: store,
 		recovery: startupRecovery.kind === "locked"
 			? { files: startupRecovery.files, opId: startupRecovery.opId }
 			: undefined,

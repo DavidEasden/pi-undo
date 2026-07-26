@@ -4,7 +4,7 @@ import extension, { createPiUndoExtension } from "../extensions/pi-undo.ts";
 import { StatusReporter } from "../src/status-reporter.ts";
 
 describe("pi-undo extension", () => {
-	it("注册 undo 和 redo 命令", () => {
+	it("注册 undo、redo 和 diff 命令", () => {
 		const commandDescriptions = new Map<string, string | undefined>();
 		const pi = {
 			registerCommand(name: string, options: { description?: string }): void {
@@ -15,8 +15,9 @@ describe("pi-undo extension", () => {
 
 		extension(pi);
 
-		expect([...commandDescriptions.keys()].sort()).toEqual(["redo", "undo"]);
+		expect([...commandDescriptions.keys()].sort()).toEqual(["diff", "redo", "undo"]);
 		expect(commandDescriptions.get("undo")).toContain("last completed Agent run");
+		expect(commandDescriptions.get("diff")).toContain("Review files changed");
 	});
 
 	it("绑定完整 lifecycle，并在 session replacement 后丢弃 stale command 结果", async () => {
@@ -36,6 +37,7 @@ describe("pi-undo extension", () => {
 			return {
 				controller: {
 					history: () => ({ undoCount: 1, redoCount: 0, locked: false }),
+					listCheckpoints: () => [],
 					recover: async () => {},
 					prepareInput: async () => ({ action: "continue" as const }),
 					beforeAgentStart: async () => {},
@@ -93,6 +95,7 @@ describe("pi-undo extension", () => {
 		createPiUndoExtension(async () => ({
 			controller: {
 				history: () => ({ undoCount: 0, redoCount: 0, locked: false }),
+				listCheckpoints: () => [],
 				recover: async () => {},
 				prepareInput: async () => ({ action: "continue" as const }),
 				beforeAgentStart: async () => {},
@@ -139,6 +142,7 @@ describe("pi-undo extension", () => {
 		createPiUndoExtension(async () => ({
 			controller: {
 				history: () => ({ undoCount: 0, redoCount: 1, locked: false }),
+				listCheckpoints: () => [],
 				recover: async () => {},
 				prepareInput: async () => ({ action: "continue" as const }),
 				beforeAgentStart: async () => {},
@@ -155,6 +159,100 @@ describe("pi-undo extension", () => {
 		await commands.get("undo")!("", context);
 
 		expect(editor).toBe("原始 prompt");
+	});
+
+	it("/diff 在非 TUI 模式输出最近 run 的文件与行数摘要", async () => {
+		const handlers = new Map<string, (event: any, context: any) => any>();
+		const commands = new Map<string, (args: string, context: any) => Promise<void>>();
+		const notifications: string[] = [];
+		const beforeId = "a".repeat(64);
+		const afterId = "b".repeat(64);
+		const checkpoint = {
+			beforeManifestId: beforeId,
+			afterManifestId: afterId,
+			changedPaths: ["src/value.ts"],
+			rawPrompt: "更新 value",
+		};
+		const manifest = (manifestId: string) => ({
+			schemaVersion: 1 as const,
+			manifestId,
+			workspaceIdentity: "/workspace",
+			topologyFingerprint: "c".repeat(64),
+			coverage: "complete",
+			roots: [{
+				relativeRoot: ".", parentRoot: null, state: "active" as const,
+				sourceIdentity: "source", privateRepositoryId: "private", treeId: "d".repeat(40),
+				coverage: "complete", ignorePolicy: "git-check-ignore-v1", ignoredPresentPaths: [],
+				ignoreClosure: "e".repeat(64), objectClosure: "f".repeat(64),
+			}],
+			createdAt: "2026-07-26T00:00:00.000Z",
+		});
+		const context = {
+			mode: "print" as const,
+			ui: {
+				setStatus: () => {},
+				notify: (message: string) => { notifications.push(message); },
+				getEditorText: () => "",
+				setEditorText: () => {},
+			},
+		};
+		const pi = {
+			registerCommand(name: string, options: { handler: (args: string, context: any) => Promise<void> }) {
+				commands.set(name, options.handler);
+			},
+			on(name: string, handler: (event: any, context: any) => any) { handlers.set(name, handler); },
+		} as unknown as ExtensionAPI;
+		createPiUndoExtension(async () => ({
+			controller: {
+				history: () => ({ undoCount: 1, redoCount: 0, locked: false }),
+				listCheckpoints: () => [checkpoint as any],
+				recover: async () => {}, prepareInput: async () => ({ action: "continue" as const }),
+				beforeAgentStart: async () => {}, agentSettled: async () => {},
+				undo: async () => ({ code: "noop" as const, changedFiles: 0 }),
+				redo: async () => ({ code: "noop" as const, changedFiles: 0 }),
+				beforeTree: async () => undefined, afterTree: async () => {},
+			},
+			reporter: new StatusReporter(context),
+			diffSource: {
+				loadManifest: async (id: any) => manifest(id) as any,
+				listTree: async (id: any) => [{
+					relativePath: "src/value.ts", kind: "file" as const, mode: 0o100644,
+					blobId: id === beforeId ? "old" : "new", size: 4, rootHash: "tree",
+				}],
+				readBlob: async (_id: any, _root: string, blobId: string) => Buffer.from(blobId === "old" ? "old\n" : "new\n"),
+			},
+		}))(pi);
+		await handlers.get("session_start")!({}, context);
+
+		await commands.get("diff")!("", context);
+		expect(notifications).toEqual(["Run #1: 更新 value — 1 file(s), +1 -1: src/value.ts"]);
+	});
+
+	it("/diff 在没有历史时给出提示", async () => {
+		const handlers = new Map<string, (event: any, context: any) => any>();
+		const commands = new Map<string, (args: string, context: any) => Promise<void>>();
+		const notifications: string[] = [];
+		const context = {
+			mode: "print" as const,
+			ui: { setStatus: () => {}, notify: (message: string) => { notifications.push(message); }, getEditorText: () => "", setEditorText: () => {} },
+		};
+		const pi = {
+			registerCommand(name: string, options: { handler: (args: string, context: any) => Promise<void> }) { commands.set(name, options.handler); },
+			on(name: string, handler: (event: any, context: any) => any) { handlers.set(name, handler); },
+		} as unknown as ExtensionAPI;
+		createPiUndoExtension(async () => ({
+			controller: {
+				history: () => ({ undoCount: 0, redoCount: 0, locked: false }), listCheckpoints: () => [], recover: async () => {},
+				prepareInput: async () => ({ action: "continue" as const }), beforeAgentStart: async () => {}, agentSettled: async () => {},
+				undo: async () => ({ code: "noop" as const, changedFiles: 0 }), redo: async () => ({ code: "noop" as const, changedFiles: 0 }),
+				beforeTree: async () => undefined, afterTree: async () => {},
+			},
+			reporter: new StatusReporter(context), diffSource: {} as any,
+		}))(pi);
+		await handlers.get("session_start")!({}, context);
+
+		await commands.get("diff")!("", context);
+		expect(notifications).toEqual(["No recorded Agent runs to diff"]);
 	});
 });
 

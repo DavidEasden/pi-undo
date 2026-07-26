@@ -8,12 +8,15 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 
 import type { UndoController } from "../src/controller.ts";
+import { browseDiff } from "../src/diff-ui.ts";
+import { computeCheckpointDiff, type DiffSource, formatDiffSummary, sanitizeDisplayText } from "../src/diff-view.ts";
 import { createPiUndoRuntime } from "../src/pi-runtime.ts";
 import { StatusReporter } from "../src/status-reporter.ts";
 
 export interface PiUndoRuntime {
 	readonly controller: UndoController;
 	readonly reporter: StatusReporter;
+	readonly diffSource?: DiffSource;
 	readonly recovery?: { readonly files?: number; readonly opId?: string };
 	setCommandContext?(context: ExtensionCommandContext | undefined): void;
 	isInternalNavigation?(): boolean;
@@ -76,6 +79,45 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 			else active.reporter.setReady(history.undoCount, history.redoCount);
 		};
 
+		const runDiff = async (args: string, context: ExtensionCommandContext): Promise<void> => {
+			const active = runtime;
+			if (active === undefined || active.diffSource === undefined) {
+				context.ui.notify("pi-undo session unavailable", "warning");
+				return;
+			}
+			const checkpoints = active.controller.listCheckpoints();
+			if (checkpoints.length === 0) {
+				context.ui.notify("No recorded Agent runs to diff", "info");
+				return;
+			}
+			const trimmed = args.trim();
+			const position = trimmed === "" ? 1 : Number(trimmed);
+			if (!Number.isInteger(position) || position < 1 || position > checkpoints.length) {
+				context.ui.notify(`Invalid run number; recorded runs: ${checkpoints.length}`, "warning");
+				return;
+			}
+			// 1 = 最近一次 run（栈顶）。
+			const checkpoint = checkpoints[checkpoints.length - position]!;
+			let diffs;
+			try {
+				diffs = await computeCheckpointDiff(active.diffSource, checkpoint);
+			} catch (error) {
+				context.ui.notify(`Unable to load diff: ${sanitizeDisplayText(errorMessage(error), 120)}`, "error");
+				return;
+			}
+			if (runtime !== active) return;
+			if (diffs.length === 0) {
+				context.ui.notify("This run changed no files", "info");
+				return;
+			}
+			const label = runLabel(checkpoint.rawPrompt, position);
+			if (context.mode !== "tui") {
+				context.ui.notify(`${label} — ${formatDiffSummary(diffs)}`, "info");
+				return;
+			}
+			await browseDiff(context, label, diffs);
+		};
+
 		pi.registerCommand("undo", {
 			description: "Undo the last completed Agent run",
 			handler: async (_args: string, context: ExtensionCommandContext) => runCommand("undo", context),
@@ -83,6 +125,10 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 		pi.registerCommand("redo", {
 			description: "Redo the last undone Agent run",
 			handler: async (_args: string, context: ExtensionCommandContext) => runCommand("redo", context),
+		});
+		pi.registerCommand("diff", {
+			description: "Review files changed by an Agent run (latest, or /diff N)",
+			handler: async (args: string, context: ExtensionCommandContext) => runDiff(args, context),
 		});
 
 		pi.on("session_start", async (_event: unknown, context: ExtensionContext) => initialize(context));
@@ -128,6 +174,12 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+function runLabel(rawPrompt: string, position: number): string {
+	const singleLine = sanitizeDisplayText(rawPrompt, 1_000);
+	const preview = singleLine.length > 48 ? `${singleLine.slice(0, 47)}…` : singleLine;
+	return preview === "" ? `Run #${position}` : `Run #${position}: ${preview}`;
 }
 
 export default createPiUndoExtension(createPiUndoRuntime);
