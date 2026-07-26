@@ -1470,4 +1470,53 @@ describe("RestoreEngine", () => {
 		expect((await readdir(heldWorkspace)).filter((name) => name.startsWith(".pi-undo-q1-"))).not.toEqual([]);
 		expect((await journal.activeArtifacts()).size).toBeGreaterThan(0);
 	});
+
+	it("outer、nested repo 与 initialized submodule 冲突时保留外部内容和全部 Git metadata", async () => {
+		const outer = await createGitRepo();
+		temporaryRoots.push(outer.root);
+		const nested = await createNestedRepo(outer.root, "packages/nested");
+		const submodule = await createLocalSubmodule(outer.root, "modules/child");
+		temporaryRoots.push(submodule.sourceRoot);
+		await writeFile(outer.root, "outer.txt", "target-outer\n");
+		await writeFile(nested.root, "nested.txt", "target-nested\n");
+		await writeFile(submodule.root, "child.txt", "target-child\n");
+		const storeRoot = await temporaryRoot("pi-undo-nested-conflict-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot });
+		const target = await store.capture(await discovery.discover(outer.root));
+		await writeFile(outer.root, "outer.txt", "current-outer\n");
+		await writeFile(nested.root, "nested.txt", "current-nested\n");
+		await writeFile(submodule.root, "child.txt", "current-child\n");
+		const current = await store.capture(await discovery.discover(outer.root));
+		const metadataBefore = await Promise.all([
+			readGitMetadata(outer.root),
+			readGitMetadata(nested.root),
+			readGitMetadata(submodule.root),
+		]);
+		const journal = new MutationJournal(join(storeRoot, "mutations.jsonl"), "op-nested-conflict");
+		const engine = new RestoreEngine({
+			workspaceRoot: outer.root,
+			store,
+			discovery,
+			beforeMutation: async (mutation) => {
+				if (mutation.phase === "apply" && mutation.path === "modules/child/child.txt") {
+					await writeFile(submodule.root, "child.txt", "external\n");
+				}
+			},
+		});
+
+		const result = await engine.apply(await engine.plan(current, target), target, {
+			opId: "op-nested-conflict",
+			mutationJournal: journal,
+		});
+
+		expect(result.code).toBe("recovery_required");
+		expect(await readFile(join(submodule.root, "child.txt"), "utf8")).toBe("external\n");
+		expect(await Promise.all([
+			readGitMetadata(outer.root),
+			readGitMetadata(nested.root),
+			readGitMetadata(submodule.root),
+		])).toEqual(metadataBefore);
+		expect((await journal.activeArtifacts()).size).toBeGreaterThan(0);
+	});
 });

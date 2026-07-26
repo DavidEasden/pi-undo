@@ -1,9 +1,25 @@
-import { describe, expect, it } from "vitest";
+import { link, lstat, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
 
 import { canonicalJson, checksum } from "../src/encoding.ts";
 import type { PendingJournal } from "../src/journal.ts";
+import { MutationJournal } from "../src/mutation-journal.ts";
 import type { JournalState, ManifestId, OperationDescriptor, SessionFileIdentity, SnapshotManifest } from "../src/model.ts";
+import {
+	QuarantineManager,
+	fingerprintBytes,
+	fingerprintFile,
+} from "../src/quarantine.ts";
 import { JournalRecovery } from "../src/recovery.ts";
+
+const temporaryRoots: string[] = [];
+
+afterEach(async () => {
+	await Promise.all(temporaryRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
 
 const identity: SessionFileIdentity = {
 	path: "/sessions/session.jsonl",
@@ -147,5 +163,83 @@ describe("JournalRecovery fault injection", () => {
 
 		expect(await recovery.recover()).toMatchObject({ kind: "locked", reason: "session_leaf_mismatch" });
 		expect(calls).toEqual([]);
+	});
+});
+
+describe("Quarantine mutation 真实现场恢复", () => {
+	async function crashFixture(state: "INTENT" | "SOURCE_QUARANTINED" | "SOURCE_VERIFIED" | "TARGET_INSTALLED" | "TARGET_VERIFIED") {
+		const root = await mkdtemp(join(tmpdir(), "pi-undo-recovery-"));
+		temporaryRoots.push(root);
+		const path = "file.txt";
+		const original = join(root, path);
+		const sourceBytes = Buffer.from("source\n");
+		const targetBytes = Buffer.from("target\n");
+		await writeFile(original, sourceBytes, { mode: 0o644 });
+		const journal = new MutationJournal(join(root, "mutations.jsonl"), "operation-1");
+		const sourceArtifact = ".pi-undo-q1-11111111111111111111111111111111-source";
+		const targetArtifact = ".pi-undo-q1-11111111111111111111111111111111-target";
+		const record = await journal.begin({
+			kind: "write",
+			path,
+			sourceArtifact,
+			targetArtifact,
+			sourceFingerprint: await fingerprintFile(original, path),
+			targetFingerprint: fingerprintBytes(path, targetBytes, 0o644),
+		});
+		if (state !== "INTENT") {
+			await writeFile(join(root, targetArtifact), targetBytes, { mode: 0o644 });
+			await link(original, join(root, sourceArtifact));
+			await unlink(original);
+			await journal.advance(record.ordinal, "SOURCE_QUARANTINED");
+		}
+		if (state === "SOURCE_VERIFIED" || state === "TARGET_INSTALLED" || state === "TARGET_VERIFIED") {
+			await journal.advance(record.ordinal, "SOURCE_VERIFIED");
+		}
+		if (state === "TARGET_INSTALLED" || state === "TARGET_VERIFIED") {
+			await link(join(root, targetArtifact), original);
+			await journal.advance(record.ordinal, "TARGET_INSTALLED");
+		}
+		if (state === "TARGET_VERIFIED") {
+			await unlink(join(root, targetArtifact));
+			await journal.advance(record.ordinal, "TARGET_VERIFIED");
+		}
+		return { root, path, original, journal, manager: new QuarantineManager({ workspaceRoot: root, journal }) };
+	}
+
+	it.each([
+		["INTENT", "rollback"],
+		["SOURCE_QUARANTINED", "rollback"],
+		["SOURCE_VERIFIED", "rollback"],
+		["TARGET_INSTALLED", "roll_forward"],
+		["TARGET_VERIFIED", "roll_forward"],
+	] as const)("%s 状态按 %s 收敛并可重复启动", async (state, decision) => {
+		const fixture = await crashFixture(state);
+		for (let attempt = 0; attempt < 2; attempt += 1) {
+			const active = (await fixture.journal.load()).filter((record) => record.state !== "CLEANED");
+			for (const record of decision === "rollback" ? active.reverse() : active) {
+				if (decision === "rollback") await fixture.manager.restoreMutation(record);
+				else {
+					await fixture.manager.rollForwardMutation(record);
+					const [latest] = await fixture.journal.load();
+					await fixture.manager.cleanupMutation(latest!);
+				}
+			}
+		}
+
+		expect(await readFile(fixture.original, "utf8")).toBe(decision === "rollback" ? "source\n" : "target\n");
+		expect(await fixture.manager.inspectArtifacts()).toEqual([]);
+		await expect(fixture.journal.assertCleaned()).resolves.toBeUndefined();
+	});
+
+	it("original 出现未知外部内容时保留所有版本并拒绝恢复", async () => {
+		const fixture = await crashFixture("SOURCE_QUARANTINED");
+		await writeFile(fixture.original, "external\n");
+		const [record] = await fixture.journal.load();
+
+		await expect(fixture.manager.restoreMutation(record!)).rejects.toThrow("外部并发");
+
+		expect(await readFile(fixture.original, "utf8")).toBe("external\n");
+		expect((await fixture.manager.inspectArtifacts()).map((artifact) => artifact.role).sort()).toEqual(["source", "target"]);
+		await expect(lstat(join(fixture.root, record!.sourceArtifact))).resolves.toBeDefined();
 	});
 });

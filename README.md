@@ -40,6 +40,10 @@ undo 成功后，TUI 编辑器为空时会尝试回填原始 prompt；编辑器�
 
 snapshot 使用独立 Git object database 和临时 index，但不会写入用户仓库的 `HEAD`、index、refs、reflog、stash、config 或其他真实 Git metadata。
 
+restore 对普通文件和 symlink 使用原路径同目录、同文件系统的 quarantine。目标安装采用 no-clobber 语义：外部进程在 restore 期间重建路径时，`pi-undo` 不会覆盖该路径，并会保留 transaction mutation WAL 与仍可验证的 source/target artifact，供重启恢复或人工诊断。
+
+普通文件的 source capture 先创建 hard link，再在删除原路径前重新检查路径 fingerprint 和 inode identity。这是纯 Node.js 能提供的 CAS-before-unlink best-effort；它显著缩小并发窗口，但不能原子合并最后一次检查与 `unlink`。
+
 普通目录、outer repository、nested repository 和已初始化 submodule 都按 root forest 独立捕获和恢复。nested repository/submodule 只恢复内部工作区文件：
 
 - 不切换真实 HEAD；
@@ -63,6 +67,7 @@ snapshot 使用独立 Git object database 和临时 index，但不会写入用�
 - 空目录不属于 snapshot。
 - package 不恢复真实 `.git` metadata。
 - package 锁只能协调其他 `pi-undo` 实例，不能阻止外部编辑器、watcher 或其他进程同时写文件；无法证明安全时会 fail closed。
+- quarantine 不能消除任意外部进程带来的最终 `check -> unlink` TOCTOU 窗口。无法证明 original、target 或 artifact 的内容与归属时，package 会保留现场并进入 `recovery required`，不会猜测、强制删除或覆盖未知内容。
 - `--no-session` 模式没有可耐久验证的 session cursor，只提供进程内能力，不能承诺进程崩溃后的 undo/redo 持久化。
 - uninitialized gitlink 不会被自动初始化；broken nested root 会使 capture 失败，而不是静默遗漏。
 - package 不对工作区文件与 Pi JSONL 提供操作系统级 ACID 事务；它通过 snapshot、WAL、cursor marker 和幂等 set-state recovery 收敛到旧状态或新状态。

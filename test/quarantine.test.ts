@@ -625,6 +625,37 @@ describe("QuarantineManager", () => {
 		expect(await readlink(join(root, path))).toBe("old-target");
 		await expect(journal.assertCleaned()).resolves.toBeUndefined();
 	});
+
+	it("固定 seed 的 200 轮外部抢占均不覆盖 external bytes", async () => {
+		let seed = 0x5eed1234;
+		for (let round = 0; round < 200; round += 1) {
+			seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+			const root = await mkdtemp(join(tmpdir(), `pi-undo-stress-${seed}-`));
+			temporaryRoots.push(root);
+			const path = `file-${seed % 17}.txt`;
+			const original = join(root, path);
+			await writeFile(original, `source-${round}\n`);
+			const journal = new MutationJournal(join(root, "mutations.jsonl"), `stress-${round}`);
+			const manager = new QuarantineManager({ workspaceRoot: root, journal });
+			const target = Buffer.from(`target-${round}\n`);
+			const external = `external-${seed}-${round}\n`;
+
+			await expect(manager.replaceFile({
+				path,
+				targetBytes: target,
+				targetMode: 0o644,
+				sourceFingerprint: await fingerprintFile(original, path),
+				targetFingerprint: fingerprintBytes(path, target, 0o644),
+				beforeInstall: () => writeFile(original, external),
+			})).rejects.toThrow("外部并发");
+
+			expect(await readFile(original, "utf8"), `seed=${seed} round=${round}`).toBe(external);
+			expect((await manager.inspectArtifacts()).map((artifact) => artifact.role).sort()).toEqual([
+				"source",
+				"target",
+			]);
+		}
+	}, 30_000);
 });
 
 function rollbackStateOrder(state: string): number {
