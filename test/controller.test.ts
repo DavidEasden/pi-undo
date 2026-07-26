@@ -525,6 +525,28 @@ describe("UndoController", () => {
 		expect(new Set(opIds).size).toBe(2);
 	});
 
+	it("restore 始终接收当前 transaction operation identity", async () => {
+		const restoreOpIds: string[] = [];
+		const cursorOpIds: string[] = [];
+		const deps = dependencies({
+			applyRestore: async (_plan, _target, operation) => {
+				restoreOpIds.push(operation.opId);
+				return { code: "ok", verifiedPaths: 1, totalPaths: 1 };
+			},
+			appendCursor: async (state) => {
+				cursorOpIds.push(state.opId);
+				return { kind: "durable", logicalLeafId: state.toLogicalLeaf };
+			},
+		});
+		const controller = new UndoControllerImpl(deps);
+		await controller.prepareInput("修复文件", { streaming: false });
+		await controller.beforeAgentStart();
+		await controller.agentSettled();
+
+		expect((await controller.undo()).code).toBe("ok");
+		expect(restoreOpIds).toEqual(cursorOpIds);
+	});
+
 	it("恢复失败时尝试回滚；回滚失败进入 recovery lock 并拒绝新 prompt", async () => {
 		let restores = 0;
 		const deps = dependencies({

@@ -58,7 +58,10 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 		capture,
 		loadManifest: (manifestId) => store.loadManifest(manifestId),
 		planRestore: (current, target, scopePaths) => restore.plan(current, target, scopePaths),
-		applyRestore: (plan, target) => restore.apply(plan, target),
+		applyRestore: (plan, target, operation) => restore.apply(plan, target, {
+			opId: operation.opId,
+			mutationJournal: journal.mutationJournal(operation.opId),
+		}),
 		settle: (opId, phase) => journal.settleRecovery(opId, phase),
 	});
 
@@ -105,7 +108,10 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 		},
 		loadManifest: (manifestId) => store.loadManifest(manifestId),
 		planRestore: (current, target, scopePaths) => restore.plan(current, target, scopePaths),
-		applyRestore: (plan, target) => restore.apply(plan, target),
+		applyRestore: (plan, target, operation) => restore.apply(plan, target, {
+			opId: operation.opId,
+			mutationJournal: journal.mutationJournal(operation.opId),
+		}),
 		recoverPending: () => workspaceLock.withLock(initialTopology.workspaceIdentity, () => recovery.recover()),
 		journal,
 		clock: Date.now,

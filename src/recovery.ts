@@ -18,7 +18,11 @@ export interface JournalRecoveryDependencies {
 		target: SnapshotManifest,
 		scopePaths?: readonly string[],
 	) => Promise<RestorePlan>;
-	readonly applyRestore: (plan: RestorePlan, target: SnapshotManifest) => Promise<RestoreResult>;
+	readonly applyRestore: (
+		plan: RestorePlan,
+		target: SnapshotManifest,
+		operation: { readonly opId: string },
+	) => Promise<RestoreResult>;
 	readonly settle: (opId: string, phase: Extract<JournalPhase, "COMMITTED" | "ABORTED">) => Promise<void>;
 }
 
@@ -76,7 +80,11 @@ export class JournalRecovery {
 					: journal.descriptor.rollbackManifestId;
 				const target = await this.dependencies.loadManifest(targetId);
 				const plan = await this.dependencies.planRestore(current, target, journal.descriptor.scopePaths);
-				const applied = await this.dependencies.applyRestore(plan, target);
+				const applied = await this.dependencies.applyRestore(
+					plan,
+					target,
+					{ opId: journal.descriptor.opId },
+				);
 				if (applied.code !== "ok") {
 					return { kind: "locked", reason: "restore_failed", operations: recovered };
 				}

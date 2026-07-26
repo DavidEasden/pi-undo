@@ -43,7 +43,11 @@ export interface ControllerDependencies {
 		target: SnapshotManifest,
 		scopePaths?: readonly string[],
 	) => Promise<RestorePlan>;
-	readonly applyRestore: (plan: RestorePlan, target: SnapshotManifest) => Promise<RestoreResult>;
+	readonly applyRestore: (
+		plan: RestorePlan,
+		target: SnapshotManifest,
+		operation: { readonly opId: string },
+	) => Promise<RestoreResult>;
 	readonly recoverPending: () => Promise<{
 		readonly kind: "clean" | "recovered" | "locked";
 		readonly operations: number;
@@ -310,7 +314,11 @@ export class UndoControllerImpl implements UndoController {
 				observedLogicalLeaf: event.newLeafId,
 			});
 			await this.dependencies.journal.setPhase(pending.descriptor.opId, "APPLYING");
-			const applied = await this.dependencies.applyRestore(pending.plan, pending.target);
+			const applied = await this.dependencies.applyRestore(
+				pending.plan,
+				pending.target,
+				{ opId: pending.descriptor.opId },
+			);
 			if (applied.code !== "ok") {
 				this.locked = true;
 				await this.dependencies.journal.setPhase(pending.descriptor.opId, "RECOVERY_REQUIRED");
@@ -412,7 +420,7 @@ export class UndoControllerImpl implements UndoController {
 				observedLogicalLeaf: navigation.logicalLeafId,
 			});
 			await this.dependencies.journal.setPhase(descriptor.opId, "APPLYING");
-			const applied = await this.dependencies.applyRestore(plan, target);
+			const applied = await this.dependencies.applyRestore(plan, target, { opId: descriptor.opId });
 			if (applied.code !== "ok") return this.compensate(descriptor, rollback, target, applied);
 			await this.dependencies.journal.setPhase(descriptor.opId, "FILES_VERIFIED");
 			const cursor = this.createCursor(descriptor, action, checkpoint);
@@ -475,7 +483,11 @@ export class UndoControllerImpl implements UndoController {
 				throw new Error("session rollback failed");
 			}
 			const rollbackPlan = await this.dependencies.planRestore(target, rollback, descriptor.scopePaths);
-			const reverted = await this.dependencies.applyRestore(rollbackPlan, rollback);
+			const reverted = await this.dependencies.applyRestore(
+				rollbackPlan,
+				rollback,
+				{ opId: descriptor.opId },
+			);
 			if (reverted.code === "ok") {
 				await this.dependencies.journal.setPhase(descriptor.opId, "ABORTED");
 				return { code: "restore_failed_safe", changedFiles: failure.verifiedPaths };

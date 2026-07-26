@@ -114,6 +114,28 @@ describe("JournalStore", () => {
 		expect(await store.loadPending()).toEqual([]);
 	});
 
+	it("mutation 未清理时拒绝 transaction 终态", async () => {
+		const root = await temporaryRoot("pi-undo-journal-");
+		const operation = descriptor(join(root, "session.jsonl"));
+		const store = new JournalStore({ transactionsRoot: join(root, "transactions") });
+		await store.prepare(operation, { paths: [], planDigest: operation.planDigest });
+		await store.mutationJournal(operation.opId).begin({
+			kind: "delete",
+			path: "a.txt",
+			sourceArtifact: ".pi-undo-q1-source",
+			targetArtifact: null,
+			sourceFingerprint: "a".repeat(64),
+			targetFingerprint: "b".repeat(64),
+		});
+
+		await expect(store.settleRecovery(operation.opId, "ABORTED")).rejects.toThrow("未清理");
+		await store.setPhase(operation.opId, "SESSION_MOVED");
+		await store.setPhase(operation.opId, "APPLYING");
+		await store.setPhase(operation.opId, "FILES_VERIFIED");
+		await store.setPhase(operation.opId, "CURSOR_COMMITTED");
+		await expect(store.markCommitted(operation.opId)).rejects.toThrow("未清理");
+	});
+
 	it("没有 PREPARED state 的半成品 transaction 在启动时安全忽略", async () => {
 		const root = await temporaryRoot("pi-undo-journal-");
 		const transactions = join(root, "transactions", "operation-1");

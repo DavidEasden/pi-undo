@@ -115,11 +115,13 @@ export class JournalStore {
 	}
 
 	async markCommitted(opId: string): Promise<void> {
+		await this.mutationJournal(opId).assertCleaned();
 		await this.setPhase(opId, "COMMITTED");
 	}
 
 	/** 仅在恢复器已经重新验证 workspace 与 cursor 后，允许中间 phase 收敛到终态。 */
 	async settleRecovery(opId: string, phase: "COMMITTED" | "ABORTED"): Promise<void> {
+		await this.mutationJournal(opId).assertCleaned();
 		const pending = await this.load(opId);
 		if (pending.state.phase === phase) return;
 		if (pending.state.phase === "COMMITTED" || pending.state.phase === "ABORTED") {
