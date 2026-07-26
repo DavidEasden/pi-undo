@@ -11,6 +11,10 @@ export interface JournalRecoveryDependencies {
 	readonly loadPending: () => Promise<readonly PendingJournal[]>;
 	readonly inspectCursor: (journal: PendingJournal) => Promise<CursorMarkerInspection>;
 	readonly finalizeCursor: (journal: PendingJournal, inspection: Extract<CursorMarkerInspection, { kind: "match" }>) => Promise<void>;
+	readonly recoverMutations: (
+		journal: PendingJournal,
+		decision: "rollback" | "roll_forward",
+	) => Promise<{ readonly kind: "clean" } | { readonly kind: "conflict"; readonly paths: number }>;
 	readonly capture: () => Promise<SnapshotManifest>;
 	readonly loadManifest: (id: ManifestId) => Promise<SnapshotManifest>;
 	readonly planRestore: (
@@ -71,6 +75,16 @@ export class JournalRecovery {
 				: journal.descriptor.fromLogicalLeaf;
 			if (this.dependencies.getLogicalLeafId() !== expectedLeaf) {
 				return { kind: "locked", reason: "session_leaf_mismatch", operations: recovered };
+			}
+			const mutationDecision = inspection.kind === "match" ? "roll_forward" : "rollback";
+			let mutationResult: Awaited<ReturnType<JournalRecoveryDependencies["recoverMutations"]>>;
+			try {
+				mutationResult = await this.dependencies.recoverMutations(journal, mutationDecision);
+			} catch {
+				return { kind: "locked", reason: "mutation_recovery_failed", operations: recovered };
+			}
+			if (mutationResult.kind === "conflict") {
+				return { kind: "locked", reason: "mutation_conflict", operations: recovered };
 			}
 
 			try {

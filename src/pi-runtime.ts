@@ -16,6 +16,7 @@ import { assertCursor, canonicalJson, checksum } from "./encoding.ts";
 import { JournalStore, finalizeCursorMarker, inspectCursorMarkers } from "./journal.ts";
 import type { CheckpointRecord, ManifestId, SessionFileIdentity } from "./model.ts";
 import { JournalRecovery } from "./recovery.ts";
+import { QuarantineManager } from "./quarantine.ts";
 import { RestoreEngine } from "./restore-engine.ts";
 import { RootDiscovery } from "./root-discovery.ts";
 import { DurableCursorWriter, SessionState, type SessionEntrySource } from "./session-state.ts";
@@ -55,6 +56,32 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 			pending.descriptor,
 			inspection,
 		),
+		recoverMutations: async (pending, decision) => {
+			const mutationJournal = journal.mutationJournal(pending.descriptor.opId);
+			const quarantine = new QuarantineManager({ workspaceRoot: context.cwd, journal: mutationJournal });
+			try {
+				const records = (await mutationJournal.load()).filter((record) => record.state !== "CLEANED");
+				if (decision === "rollback") records.reverse();
+				for (const record of records) {
+					if (decision === "rollback") {
+						await quarantine.restoreMutation(record);
+						continue;
+					}
+					await quarantine.rollForwardMutation(record);
+					const latest = (await mutationJournal.load()).find((candidate) => candidate.ordinal === record.ordinal);
+					if (latest === undefined) throw new Error("mutation ordinal 在恢复期间丢失");
+					await quarantine.cleanupMutation(latest);
+				}
+				await mutationJournal.assertCleaned();
+				return { kind: "clean" } as const;
+			} catch {
+				const active = await mutationJournal.load().catch(() => []);
+				return {
+					kind: "conflict" as const,
+					paths: Math.max(1, active.filter((record) => record.state !== "CLEANED").length),
+				};
+			}
+		},
 		capture,
 		loadManifest: (manifestId) => store.loadManifest(manifestId),
 		planRestore: (current, target, scopePaths) => restore.plan(current, target, scopePaths),

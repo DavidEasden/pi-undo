@@ -57,7 +57,11 @@ function pending(): PendingJournal {
 	};
 }
 
-function fixture(marker: "absent" | "match" | "conflict", leaf: string | null) {
+function fixture(
+	marker: "absent" | "match" | "conflict",
+	leaf: string | null,
+	mutationResult: "clean" | "conflict" = "clean",
+) {
 	let journals: PendingJournal[] = [pending()];
 	const calls: string[] = [];
 	const recovery = new JournalRecovery({
@@ -69,6 +73,10 @@ function fixture(marker: "absent" | "match" | "conflict", leaf: string | null) {
 			? { kind: "match", needsTrailingNewline: true }
 			: { kind: marker },
 		finalizeCursor: async () => { calls.push("cursor-finalized"); },
+		recoverMutations: async (_journal, decision) => {
+			calls.push(`mutations:${decision}`);
+			return mutationResult === "clean" ? { kind: "clean" } : { kind: "conflict", paths: 1 };
+		},
 		capture: async () => { calls.push("capture"); return manifest("c"); },
 		loadManifest: async (id) => {
 			calls.push(`load:${id[0]}`);
@@ -102,7 +110,7 @@ describe("JournalRecovery fault injection", () => {
 		const { recovery, calls } = fixture("absent", "after");
 
 		expect(await recovery.recover()).toEqual({ kind: "recovered", operations: 1 });
-		expect(calls).toEqual(["capture", "load:b", "plan:b", "restore:b", "settle:ABORTED"]);
+		expect(calls).toEqual(["mutations:rollback", "capture", "load:b", "plan:b", "restore:b", "settle:ABORTED"]);
 		expect(await recovery.recover()).toEqual({ kind: "clean", operations: 0 });
 	});
 
@@ -111,8 +119,15 @@ describe("JournalRecovery fault injection", () => {
 
 		expect(await recovery.recover()).toEqual({ kind: "recovered", operations: 1 });
 		expect(calls).toEqual([
-			"capture", "load:a", "plan:a", "restore:a", "cursor-finalized", "settle:COMMITTED",
+			"mutations:roll_forward", "capture", "load:a", "plan:a", "restore:a", "cursor-finalized", "settle:COMMITTED",
 		]);
+	});
+
+	it("mutation 现场冲突时在 capture 前锁定", async () => {
+		const { recovery, calls } = fixture("absent", "after", "conflict");
+
+		expect(await recovery.recover()).toMatchObject({ kind: "locked", reason: "mutation_conflict" });
+		expect(calls).toEqual(["mutations:rollback"]);
 	});
 
 	it("cursor 冲突时 fail closed，不触碰工作区", async () => {
