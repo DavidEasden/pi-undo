@@ -30,6 +30,7 @@ const GC_METADATA_FILE = "gc.json";
 const GC_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 const IGNORE_POLICY = "git-check-ignore-v1";
 const NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
+const TREE_CACHE_LIMIT = 256;
 
 interface PinRecord {
 	readonly schemaVersion: 1;
@@ -58,6 +59,12 @@ interface CapturedRootResult {
 	readonly ignoredPresentPaths: readonly string[];
 	readonly ignoreClosure: string;
 	readonly objectClosure: string;
+}
+
+interface VisibleLeaf {
+	readonly relativePath: string;
+	readonly kind: "file" | "symlink";
+	readonly mode: number;
 }
 
 export interface SnapshotStoreOptions {
@@ -93,6 +100,7 @@ export class SnapshotStoreError extends Error {
 
 export interface SnapshotStore {
 	capture(topology: RootTopology, scope?: readonly string[], options?: CaptureOptions): Promise<SnapshotManifest>;
+	listVisibleLeafPaths(topology: RootTopology, options?: CaptureOptions): Promise<readonly string[]>;
 	loadManifest(id: ManifestId): Promise<SnapshotManifest>;
 	assertComplete(id: ManifestId): Promise<void>;
 	listTree(id: ManifestId, root: string): Promise<readonly RestorePath[]>;
@@ -110,6 +118,8 @@ export class SnapshotStore {
 	private readonly lock: WorkspaceLock;
 	private readonly clock: () => number;
 	private readonly manifestLocations = new Map<string, string>();
+	// Tree ID 是内容寻址且不可变；这里只缓存解析元数据，blob bytes 与完整性仍逐次读取/校验。
+	private readonly treeEntriesCache = new Map<string, Promise<CapturedTreeEntry[]>>();
 
 	constructor(options: SnapshotStoreOptions = {}) {
 		this.storeRoot = resolve(options.storeRoot ?? join(tmpdir(), "pi-undo-snapshot-store"));
@@ -204,6 +214,72 @@ export class SnapshotStore {
 		}
 	}
 
+	async listVisibleLeafPaths(
+		topology: RootTopology,
+		options: CaptureOptions = {},
+	): Promise<readonly string[]> {
+		await this.assertPrivateStore(topology.workspaceIdentity);
+		const lockIdentity = `snapshot-store:${await prospectiveCanonicalPath(this.storesRoot)}`;
+		return this.lock.withLock(lockIdentity, () => this.listVisibleLeafPathsLocked(topology, options));
+	}
+
+	private async listVisibleLeafPathsLocked(
+		topology: RootTopology,
+		options: CaptureOptions,
+	): Promise<readonly string[]> {
+		let transactionDirectory: string | undefined;
+		try {
+			if (topology.fingerprint !== topologyFingerprint(topology.workspaceIdentity, topology.roots)) {
+				throw new SnapshotStoreError("capture_failed", "topology fingerprint 与 roots 不匹配");
+			}
+			const artifactExclusions = captureExclusions(topology.workspaceIdentity, options.excludePaths);
+			await this.assertTopology(topology, "可见路径枚举前 topology 已变化");
+			if (topology.roots.some((root) => root.state === "broken")) {
+				throw new SnapshotStoreError("capture_failed", "broken root 不能静默进入可见路径枚举");
+			}
+
+			const storeDirectory = this.storeDirectory(topology);
+			const transactionsRoot = join(storeDirectory, "transactions");
+			await mkdir(transactionsRoot, { recursive: true });
+			transactionDirectory = await mkdtemp(join(transactionsRoot, "visible-"));
+			const result = new Set<string>();
+			for (const root of topology.roots) {
+				if (root.state !== "active") continue;
+				const gitDirectory = this.rootGitDirectory(storeDirectory, root);
+				await this.ensurePrivateRepository(gitDirectory);
+				await this.assertNoAlternates(gitDirectory);
+				const absoluteRoot = workspaceRootPath(topology.workspaceIdentity, root.relativeRoot);
+				const indexPath = join(transactionDirectory, `${rootStoreId(root)}.index`);
+				const environment = privateGitEnvironment(gitDirectory, absoluteRoot, indexPath);
+				await this.runGit(["read-tree", "--empty"], { cwd: absoluteRoot, env: environment });
+				await this.validateIgnoreQuery(absoluteRoot, environment, root.gitBacked);
+				const exclusions = topology.roots
+					.filter((candidate) => isStrictRootAncestor(root.relativeRoot, candidate.relativeRoot))
+					.map((candidate) => rootRelativePath(root.relativeRoot, candidate.relativeRoot));
+				const exactExclusions = ownedArtifactExclusions(topology.roots, root.relativeRoot, artifactExclusions);
+				for (const leaf of await this.collectVisibleLeaves(
+					absoluteRoot,
+					environment,
+					root.gitBacked,
+					[],
+					exclusions,
+					exactExclusions,
+				)) {
+					result.add(workspaceRelativePath(root.relativeRoot, leaf.relativePath));
+				}
+			}
+			await this.assertTopology(topology, "可见路径枚举期间 topology 已变化");
+			return [...result].sort(comparePaths);
+		} catch (error) {
+			if (error instanceof SnapshotStoreError) throw error;
+			throw new SnapshotStoreError("capture_failed", errorMessage(error), { cause: error });
+		} finally {
+			if (transactionDirectory !== undefined) {
+				await rm(transactionDirectory, { recursive: true, force: true }).catch(() => {});
+			}
+		}
+	}
+
 	async loadManifest(id: ManifestId): Promise<SnapshotManifest> {
 		const manifestPath = await this.findManifestPath(id);
 		try {
@@ -242,7 +318,6 @@ export class SnapshotStore {
 				}
 				const gitDirectory = this.rootGitDirectory(storeDirectory, root);
 				await this.assertNoAlternates(gitDirectory);
-				await this.runPrivateGit(gitDirectory, ["cat-file", "-e", `${root.treeId}^{tree}`]);
 				const entries = await this.readTreeEntries(gitDirectory, root.treeId);
 				if (root.ignoredPresentPaths.some((ignoredPath) => entries.some(
 					(entry) => isPathAtOrBelow(ignoredPath, entry.relativePath) ||
@@ -250,9 +325,7 @@ export class SnapshotStore {
 				))) {
 					throw new SnapshotStoreError("object_missing", "ignored-present proof 与 root tree 冲突");
 				}
-				for (const entry of entries) {
-					await this.runPrivateGit(gitDirectory, ["cat-file", "-e", `${entry.objectId}^{blob}`]);
-				}
+				await this.assertObjectsComplete(gitDirectory, root.treeId, entries);
 				if (root.objectClosure !== treeObjectClosure(root.treeId, entries)) {
 					throw new SnapshotStoreError("object_missing", "root tree 对象闭包校验失败");
 				}
@@ -493,10 +566,7 @@ export class SnapshotStore {
 			throw new SnapshotStoreError("capture_failed", "git write-tree 未返回有效对象 ID");
 		}
 		const entries = await this.readTreeEntries(gitDirectory, treeId);
-		await this.runPrivateGit(gitDirectory, ["cat-file", "-e", `${treeId}^{tree}`]);
-		for (const entry of entries) {
-			await this.runPrivateGit(gitDirectory, ["cat-file", "-e", `${entry.objectId}^{blob}`]);
-		}
+		await this.assertObjectsComplete(gitDirectory, treeId, entries);
 		return {
 			treeId,
 			coverage,
@@ -565,13 +635,55 @@ export class SnapshotStore {
 		exclusions: readonly string[],
 		exactExclusions: readonly string[],
 	): Promise<void> {
-		if (inclusions === null) {
-			return;
+		for (const leaf of await this.collectVisibleLeaves(
+			cwd,
+			environment,
+			gitBacked,
+			inclusions,
+			exclusions,
+			exactExclusions,
+		)) {
+			const absolutePath = join(cwd, ...leaf.relativePath.split("/"));
+			let objectId: string;
+			if (leaf.kind === "symlink") {
+				const linkText = await readlink(absolutePath, { encoding: "buffer" });
+				decodeUtf8(linkText, "symlink target 不是可无损表示的 UTF-8");
+				objectId = (await this.runGit(["hash-object", "-w", "--stdin"], {
+					cwd,
+					env: environment,
+					stdin: linkText,
+				})).trim();
+			} else {
+				objectId = (await this.runGit(["hash-object", "-w", "--no-filters", "--", leaf.relativePath], {
+					cwd,
+					env: environment,
+				})).trim();
+			}
+			if (!isObjectId(objectId)) {
+				throw new SnapshotStoreError("capture_failed", `文件对象 materialize 失败：${leaf.relativePath}`);
+			}
+			await this.runGit([
+				"update-index",
+				"--add",
+				"--cacheinfo",
+				leaf.mode.toString(8),
+				objectId,
+				leaf.relativePath,
+			], { cwd, env: environment });
 		}
+	}
+
+	private async collectVisibleLeaves(
+		cwd: string,
+		environment: Readonly<Record<string, string | undefined>>,
+		gitBacked: boolean,
+		inclusions: readonly string[] | null,
+		exclusions: readonly string[],
+		exactExclusions: readonly string[],
+	): Promise<VisibleLeaf[]> {
+		if (inclusions === null) return [];
 		const pathspecs = inclusions.length === 0 ? ["."] : inclusions.map(literalPathspec);
-		for (const excluded of exclusions) {
-			pathspecs.push(excludeLiteralPathspec(excluded));
-		}
+		for (const excluded of exclusions) pathspecs.push(excludeLiteralPathspec(excluded));
 		const queryEnvironment = gitBacked ? sourceGitEnvironment() : environment;
 		const output = await this.runGitBytes([
 			...(gitBacked ? ["-c", "core.fsmonitor=false"] : []),
@@ -583,53 +695,32 @@ export class SnapshotStore {
 			"--",
 			...pathspecs,
 		], { cwd, env: queryEnvironment });
+		const result: VisibleLeaf[] = [];
 		for (const relativePath of parseNulPaths(output)) {
 			if (
 				exclusions.some((excluded) => isPathAtOrBelow(excluded, relativePath)) ||
 				exactExclusions.includes(relativePath)
-			) {
-				continue;
-			}
+			) continue;
 			relativeSafePath(cwd, relativePath);
 			await assertNoSymlinkEscape(cwd, relativePath);
-			const absolutePath = join(cwd, ...relativePath.split("/"));
-			const metadata = await lstat(absolutePath).catch((error) => {
-				if (hasErrorCode(error, "ENOENT")) {
-					return null;
-				}
+			const metadata = await lstat(join(cwd, ...relativePath.split("/"))).catch((error) => {
+				if (hasErrorCode(error, "ENOENT")) return null;
 				throw error;
 			});
-			if (metadata === null) {
-				continue;
-			}
-			let mode: string;
-			let objectId: string;
+			if (metadata === null) continue;
 			if (metadata.isSymbolicLink()) {
-				mode = "120000";
-				const linkText = await readlink(absolutePath, { encoding: "buffer" });
-				decodeUtf8(linkText, "symlink target 不是可无损表示的 UTF-8");
-				objectId = (await this.runGit(["hash-object", "-w", "--stdin"], {
-					cwd,
-					env: environment,
-					stdin: linkText,
-				})).trim();
+				result.push({ relativePath, kind: "symlink", mode: 0o120000 });
 			} else if (metadata.isFile()) {
-				mode = (metadata.mode & 0o111) === 0 ? "100644" : "100755";
-				objectId = (await this.runGit(["hash-object", "-w", "--no-filters", "--", relativePath], {
-					cwd,
-					env: environment,
-				})).trim();
+				result.push({
+					relativePath,
+					kind: "file",
+					mode: (metadata.mode & 0o111) === 0 ? 0o100644 : 0o100755,
+				});
 			} else {
 				throw new SnapshotStoreError("capture_failed", `不支持的工作区文件类型：${relativePath}`);
 			}
-			if (!isObjectId(objectId)) {
-				throw new SnapshotStoreError("capture_failed", `文件对象 materialize 失败：${relativePath}`);
-			}
-			await this.runGit(["update-index", "--add", "--cacheinfo", mode, objectId, relativePath], {
-				cwd,
-				env: environment,
-			});
 		}
+		return result;
 	}
 
 	private async validateIgnoreQuery(
@@ -688,8 +779,52 @@ export class SnapshotStore {
 	}
 
 	private async readTreeEntries(gitDirectory: string, treeId: string): Promise<CapturedTreeEntry[]> {
-		const output = await this.runPrivateGitBytes(gitDirectory, ["ls-tree", "-r", "-l", "-z", treeId]);
-		return parseTreeEntries(output);
+		const key = `${gitDirectory}\0${treeId}`;
+		const cached = this.treeEntriesCache.get(key);
+		if (cached !== undefined) return cached;
+		const pending = this.runPrivateGitBytes(gitDirectory, ["ls-tree", "-r", "-l", "-z", treeId])
+			.then(parseTreeEntries);
+		this.treeEntriesCache.set(key, pending);
+		while (this.treeEntriesCache.size > TREE_CACHE_LIMIT) {
+			const oldest = this.treeEntriesCache.keys().next().value as string | undefined;
+			if (oldest === undefined || oldest === key) break;
+			this.treeEntriesCache.delete(oldest);
+		}
+		try {
+			return await pending;
+		} catch (error) {
+			if (this.treeEntriesCache.get(key) === pending) this.treeEntriesCache.delete(key);
+			throw error;
+		}
+	}
+
+	private async assertObjectsComplete(
+		gitDirectory: string,
+		treeId: string,
+		entries: readonly CapturedTreeEntry[],
+	): Promise<void> {
+		const expected = [
+			{ objectId: treeId, type: "tree" },
+			...[...new Set(entries.map((entry) => entry.objectId))].map((objectId) => ({ objectId, type: "blob" })),
+		];
+		const output = await this.runGit(["cat-file", "--batch-check"], {
+			env: privateObjectEnvironment(gitDirectory),
+			stdin: `${expected.map((object) => object.objectId).join("\n")}\n`,
+		});
+		const lines = output.endsWith("\n") ? output.slice(0, -1).split("\n") : output.split("\n");
+		if (lines.length !== expected.length) throw new Error("Git object batch-check 输出数量不匹配");
+		for (let index = 0; index < expected.length; index += 1) {
+			const object = expected[index]!;
+			const match = lines[index]!.match(/^([0-9a-f]{40,64}) (blob|tree) ([0-9]+)$/);
+			if (
+				match === null ||
+				match[1] !== object.objectId ||
+				match[2] !== object.type ||
+				!Number.isSafeInteger(Number(match[3]))
+			) {
+				throw new Error(`Git object batch-check 校验失败：${object.objectId}`);
+			}
+		}
 	}
 
 	private async readBlobText(gitDirectory: string, objectId: string): Promise<string> {
@@ -978,6 +1113,10 @@ function inactiveRootClosure(root: Pick<RootTopologyIdentity, "relativeRoot" | "
 function workspaceRootPath(workspaceIdentity: string, rootPath: string): string {
 	const safe = relativeSafePath(workspaceIdentity, rootPath);
 	return safe === "." ? workspaceIdentity : join(workspaceIdentity, ...safe.split("/"));
+}
+
+function workspaceRelativePath(rootPath: string, relativePath: string): string {
+	return rootPath === "." ? relativePath : `${rootPath}/${relativePath}`;
 }
 
 function rootStoreId(root: RootTopologyIdentity): string {

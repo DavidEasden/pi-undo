@@ -62,6 +62,20 @@ class RecordingGitRunner extends GitRunner {
 	}
 }
 
+class ToggleMissingBatchGitRunner extends GitRunner {
+	missing = false;
+
+	override run(args: readonly string[], options?: GitRunOptions): Promise<GitRunResult> {
+		if (this.missing && args[0] === "cat-file" && args[1] === "--batch-check") {
+			const objectIds = String(options?.stdin).trim().split("\n");
+			return Promise.resolve(successfulGitResult(Buffer.from(
+				`${objectIds.map((objectId) => `${objectId} missing`).join("\n")}\n`,
+			)));
+		}
+		return super.run(args, options);
+	}
+}
+
 class RecordingWorkspaceLock extends WorkspaceLock {
 	readonly identities: string[] = [];
 
@@ -256,6 +270,65 @@ describe("SnapshotStore", () => {
 		expect(await store.readBlob(manifest.manifestId, ".", binary?.blobId as string))
 			.toEqual(new Uint8Array([0, 1, 2, 255]));
 		await store.assertComplete(manifest.manifestId);
+	});
+
+	it("轻量可见路径枚举与 complete capture 的受控叶子集合一致", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, ".gitignore", "ignored.txt\n");
+		await writeFixtureFile(workspace, "visible.txt", "visible\n");
+		await writeFixtureFile(workspace, "nested/child.txt", "child\n");
+		await writeFixtureFile(workspace, "ignored.txt", "ignored\n");
+		await writeFixtureFile(workspace, "owned-artifact", "owned\n");
+		await symlink("visible.txt", join(workspace, "link.txt"));
+		const topology = await new RootDiscovery().discover(workspace);
+		const store = new SnapshotStore({ storeRoot });
+		const options = { excludePaths: ["owned-artifact"] };
+
+		const visible = await store.listVisibleLeafPaths(topology, options);
+		const manifest = await store.capture(topology, undefined, options);
+		const captured = (await store.listTree(manifest.manifestId, "."))
+			.filter((entry) => entry.kind !== "directory")
+			.map((entry) => entry.relativePath)
+			.sort();
+
+		expect(visible).toEqual(captured);
+		expect(visible).toContain("link.txt");
+		expect(visible).not.toContain("ignored.txt");
+		expect(visible).not.toContain("owned-artifact");
+	});
+
+	it("assertComplete 对每个 root 使用一次 batch-check", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, "first.txt", "first\n");
+		await writeFixtureFile(workspace, "second.txt", "second\n");
+		const topology = await new RootDiscovery().discover(workspace);
+		const git = new RecordingGitRunner();
+		const store = new SnapshotStore({ storeRoot, git, discovery: new RootDiscovery(git) });
+		const manifest = await store.capture(topology);
+		git.calls.length = 0;
+
+		await store.assertComplete(manifest.manifestId);
+
+		const objectChecks = git.calls.filter((call) => call.args[0] === "cat-file");
+		expect(objectChecks).toHaveLength(1);
+		expect(objectChecks[0]?.args).toEqual(["cat-file", "--batch-check"]);
+		expect(String(objectChecks[0]?.options?.stdin).trim().split("\n")).toHaveLength(3);
+	});
+
+	it("batch-check 报告对象缺失时 assertComplete fail closed", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, "file.txt", "content\n");
+		const git = new ToggleMissingBatchGitRunner();
+		const discovery = new RootDiscovery(git);
+		const topology = await discovery.discover(workspace);
+		const store = new SnapshotStore({ storeRoot, git, discovery });
+		const manifest = await store.capture(topology);
+		git.missing = true;
+
+		await expect(store.assertComplete(manifest.manifestId)).rejects.toMatchObject({ code: "object_missing" });
 	});
 
 	it("capture 只排除指定的 exact artifact，不按名称前缀扩大范围", async () => {

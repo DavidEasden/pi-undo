@@ -817,12 +817,11 @@ export class RestoreEngine {
 			}
 		}
 
-		const live = await this.store.capture(topology, undefined, {
+		const livePaths = await this.store.listVisibleLeafPaths(topology, {
 			excludePaths: mutationJournal === undefined ? undefined : [...await mutationJournal.activeArtifacts()],
 		});
-		await this.store.assertComplete(live.manifestId);
-		for (const [path, owned] of await this.readOwnedPaths(live)) {
-			if (owned.entry.kind !== "directory" && !allowedPaths.has(path)) {
+		for (const path of livePaths) {
+			if (!allowedPaths.has(path)) {
 				throw new Error(`complete coverage 发现 manifest 集合外路径：${path}`);
 			}
 		}
