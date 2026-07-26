@@ -33,6 +33,14 @@ export class MutationJournal {
 		this.opId = assertOperationId(opId);
 	}
 
+	get operationId(): string {
+		return this.opId;
+	}
+
+	get storagePath(): string {
+		return this.path;
+	}
+
 	async load(): Promise<readonly MutationRecord[]> {
 		return (await this.readRecords()).latest;
 	}

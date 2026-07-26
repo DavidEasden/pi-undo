@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { lstat, mkdir, readFile, readlink, realpath, rmdir, symlink, unlink } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, rmdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { writeBytesAtomic } from "./atomic-fs.ts";
-import { assertManifest, canonicalJson, checksum } from "./encoding.ts";
+import { assertManifest, assertOperationId, canonicalJson, checksum } from "./encoding.ts";
+import { MutationJournal } from "./mutation-journal.ts";
 import type { ManifestId, RestorePath, SnapshotManifest, SnapshotRoot } from "./model.ts";
 import {
 	assertNoSymlinkEscape,
@@ -13,6 +14,12 @@ import {
 	sortWritePaths,
 } from "./path-safety.ts";
 import { RootDiscovery, type RootTopology } from "./root-discovery.ts";
+import {
+	QuarantineManager,
+	fingerprintAbsent,
+	fingerprintBytes,
+	fingerprintSymlink,
+} from "./quarantine.ts";
 import { SnapshotStoreError, type SnapshotStore } from "./snapshot-store.ts";
 
 export interface RestorePlan {
@@ -34,7 +41,12 @@ export interface RestoreResult {
 
 export interface RestoreEngine {
 	plan(current: SnapshotManifest, target: SnapshotManifest, scopePaths?: readonly string[]): Promise<RestorePlan>;
-	apply(plan: RestorePlan, target: SnapshotManifest): Promise<RestoreResult>;
+	apply(plan: RestorePlan, target: SnapshotManifest, options?: RestoreApplyOptions): Promise<RestoreResult>;
+}
+
+export interface RestoreApplyOptions {
+	readonly opId: string;
+	readonly mutationJournal: MutationJournal;
 }
 
 export interface RestoreEngineOptions {
@@ -65,6 +77,8 @@ interface MutationContext {
 	readonly targetPaths: ReadonlyMap<string, OwnedPath>;
 	readonly plannedDeletePaths: ReadonlySet<string>;
 	readonly sourceIgnoredPaths: ReadonlySet<string>;
+	readonly mutationJournal: MutationJournal;
+	readonly quarantine: QuarantineManager;
 	ordinal: number;
 }
 
@@ -81,6 +95,21 @@ export class RestoreEngine {
 		this.store = options.store;
 		this.discovery = options.discovery ?? new RootDiscovery();
 		this.beforeMutation = options.beforeMutation;
+	}
+
+	private async compatibleApplyOptions(): Promise<{
+		readonly directory: string;
+		readonly options: RestoreApplyOptions;
+	}> {
+		const directory = await mkdtemp(join(tmpdir(), "pi-undo-restore-compat-"));
+		const opId = `compat-${randomUUID()}`;
+		return {
+			directory,
+			options: {
+				opId,
+				mutationJournal: new MutationJournal(join(directory, "mutations.jsonl"), opId),
+			},
+		};
 	}
 
 	async plan(
@@ -151,8 +180,34 @@ export class RestoreEngine {
 		};
 	}
 
-	async apply(plan: RestorePlan, target: SnapshotManifest): Promise<RestoreResult> {
+	async apply(
+		plan: RestorePlan,
+		target: SnapshotManifest,
+		options?: RestoreApplyOptions,
+	): Promise<RestoreResult> {
+		const compatibility = options === undefined ? await this.compatibleApplyOptions() : undefined;
+		const effectiveOptions = options ?? compatibility!.options;
+		try {
+			return await this.applyWithOptions(plan, target, effectiveOptions, compatibility !== undefined);
+		} finally {
+			if (compatibility !== undefined && await this.mutationsAreClean(effectiveOptions.mutationJournal)) {
+				await rm(compatibility.directory, { recursive: true });
+			}
+		}
+	}
+
+	private async applyWithOptions(
+		plan: RestorePlan,
+		target: SnapshotManifest,
+		effectiveOptions: RestoreApplyOptions,
+		compatibilityMode: boolean,
+	): Promise<RestoreResult> {
 		assertManifest(target);
+		// Task 6 会由 controller 强制传入 operation identity；此兼容分支仅保持现有调用方可运行。
+		assertOperationId(effectiveOptions.opId);
+		if (effectiveOptions.opId !== effectiveOptions.mutationJournal.operationId) {
+			throw new Error("restore opId 与 mutation journal identity 不匹配");
+		}
 		if (plan.targetManifestId !== target.manifestId) {
 			throw new Error("restore plan target manifest ID 不匹配");
 		}
@@ -179,7 +234,7 @@ export class RestoreEngine {
 		}
 
 		try {
-			const result = await this.applyPinned(plan, target);
+			const result = await this.applyPinned(plan, target, effectiveOptions, compatibilityMode);
 			if (result.code === "partial_restore" || result.code === "recovery_required") {
 				let recoveryPinned = true;
 				for (const manifestId of pinned) {
@@ -215,7 +270,12 @@ export class RestoreEngine {
 		}
 	}
 
-	private async applyPinned(plan: RestorePlan, target: SnapshotManifest): Promise<RestoreResult> {
+	private async applyPinned(
+		plan: RestorePlan,
+		target: SnapshotManifest,
+		options: RestoreApplyOptions,
+		compatibilityMode: boolean,
+	): Promise<RestoreResult> {
 		const [current, storedTarget] = await Promise.all([
 			this.store.loadManifest(plan.currentManifestId),
 			this.store.loadManifest(target.manifestId),
@@ -251,8 +311,19 @@ export class RestoreEngine {
 			this.readOwnedPaths(current),
 			this.readOwnedPaths(target),
 		]);
+		const quarantine = new QuarantineManager({
+			workspaceRoot: this.requestedWorkspaceRoot,
+			journal: options.mutationJournal,
+		});
+		if (
+			compatibilityMode
+				? !await this.restorePendingMutations(quarantine, options.mutationJournal)
+				: (await options.mutationJournal.activeArtifacts()).size > 0
+		) {
+			return { code: "recovery_required", verifiedPaths: 0, totalPaths: currentPaths.size };
+		}
 		try {
-			await this.assertCompleteVisibleSubset(topologyBefore, [current, target]);
+			await this.assertCompleteVisibleSubset(topologyBefore, [current, target], options.mutationJournal);
 		} catch {
 			return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
 		}
@@ -274,6 +345,8 @@ export class RestoreEngine {
 			targetPaths,
 			plannedDeletePaths: new Set(plan.deletePaths),
 			sourceIgnoredPaths: ignoredWorkspacePaths(current),
+			mutationJournal: options.mutationJournal,
+			quarantine,
 		};
 		try {
 			for (const path of plan.deletePaths) {
@@ -286,7 +359,7 @@ export class RestoreEngine {
 
 			const topologyAfter = await this.discovery.discover(this.workspaceRoot);
 			assertUnchangedTopology(topologyBefore, topologyAfter);
-			await this.assertCompleteVisibleSubset(topologyAfter, [target]);
+			await this.assertCompleteVisibleSubset(topologyAfter, [target], options.mutationJournal);
 			const verification = await this.verifyTarget(
 				target,
 				currentPaths,
@@ -294,14 +367,28 @@ export class RestoreEngine {
 				plan.deletePaths,
 				plan.scopePaths,
 			);
-			return {
+			const result: RestoreResult = {
 				code: "ok",
 				verifiedPaths: verification.verifiedPaths,
 				totalPaths: verification.totalPaths,
 				postFingerprint: postFingerprint(target.manifestId, topologyAfter, verification.pathFingerprints),
 			};
+			return await this.mutationsAreClean(options.mutationJournal)
+				? result
+				: { code: "recovery_required", verifiedPaths: 0, totalPaths: verification.totalPaths };
 		} catch {
-			return this.rollback(current, target, topologyBefore, currentPaths, targetPaths, plan.scopePaths);
+			if (!await this.restorePendingMutations(mutationContext.quarantine, options.mutationJournal)) {
+				return { code: "recovery_required", verifiedPaths: 0, totalPaths: currentPaths.size };
+			}
+			return this.rollback(
+				current,
+				target,
+				topologyBefore,
+				currentPaths,
+				targetPaths,
+				options,
+				plan.scopePaths,
+			);
 		}
 	}
 
@@ -436,7 +523,14 @@ export class RestoreEngine {
 			});
 			return;
 		}
-		await this.mutate(context, "delete", path, () => unlink(absolutePath));
+		await this.mutate(context, "delete", path, async () => {
+			await context.quarantine.deleteLeaf({
+				path,
+				sourceFingerprint: await this.expectedMutationFingerprint(context, path),
+				targetFingerprint: fingerprintAbsent(path),
+			});
+			await this.cleanupLatestMutation(context);
+		});
 	}
 
 	private async writePath(
@@ -476,7 +570,16 @@ export class RestoreEngine {
 				}
 				throw new Error(`symlink 存在类型或内容冲突：${path}`);
 			}
-			await this.mutate(context, "symlink", path, () => symlink(linkText, absolutePath));
+			await this.mutate(context, "symlink", path, async (beforeInstall) => {
+				await context.quarantine.replaceSymlink({
+					path,
+					targetLinkText: linkText,
+					sourceFingerprint: await this.expectedMutationFingerprint(context, path),
+					targetFingerprint: fingerprintSymlink(path, linkText),
+					beforeInstall,
+				});
+				await this.cleanupLatestMutation(context);
+			}, true);
 			return;
 		}
 
@@ -491,7 +594,18 @@ export class RestoreEngine {
 			context,
 			"write",
 			path,
-			() => writeBytesAtomic(this.absolutePath(path), bytes, target.entry.mode & 0o777),
+			async (beforeInstall) => {
+				await context.quarantine.replaceFile({
+					path,
+					targetBytes: bytes,
+					targetMode: target.entry.mode & 0o777,
+					sourceFingerprint: await this.expectedMutationFingerprint(context, path),
+					targetFingerprint: fingerprintBytes(path, bytes, target.entry.mode),
+					beforeInstall,
+				});
+				await this.cleanupLatestMutation(context);
+			},
+			true,
 		);
 	}
 
@@ -501,6 +615,7 @@ export class RestoreEngine {
 		topologyBefore: RootTopology,
 		currentPaths: ReadonlyMap<string, OwnedPath>,
 		targetPaths: ReadonlyMap<string, OwnedPath>,
+		options: RestoreApplyOptions,
 		scopePaths?: readonly string[],
 	): Promise<RestoreResult> {
 		let rollbackPlan: RestorePlan | undefined;
@@ -515,6 +630,11 @@ export class RestoreEngine {
 				targetPaths: currentPaths,
 				plannedDeletePaths: new Set(rollbackPlan.deletePaths),
 				sourceIgnoredPaths: ignoredWorkspacePaths(target),
+				mutationJournal: options.mutationJournal,
+				quarantine: new QuarantineManager({
+					workspaceRoot: this.requestedWorkspaceRoot,
+					journal: options.mutationJournal,
+				}),
 			};
 			for (const path of rollbackPlan.deletePaths) {
 				if (await this.pathIsShadowedByTarget(current.manifestId, path, currentPaths)) {
@@ -525,7 +645,7 @@ export class RestoreEngine {
 			await this.writePlannedPaths(current.manifestId, currentPaths, rollbackPlan.writePaths, context);
 			const topologyAfter = await this.discovery.discover(this.workspaceRoot);
 			assertUnchangedTopology(topologyBefore, topologyAfter);
-			await this.assertCompleteVisibleSubset(topologyAfter, [current]);
+			await this.assertCompleteVisibleSubset(topologyAfter, [current], options.mutationJournal);
 			const verification = await this.verifyTarget(
 				current,
 				targetPaths,
@@ -533,7 +653,7 @@ export class RestoreEngine {
 				rollbackPlan.deletePaths,
 				rollbackPlan.scopePaths,
 			);
-			return {
+			const result: RestoreResult = {
 				code: "restore_failed_safe",
 				verifiedPaths: verification.verifiedPaths,
 				totalPaths: verification.totalPaths,
@@ -543,12 +663,25 @@ export class RestoreEngine {
 					verification.pathFingerprints,
 				),
 			};
+			return await this.mutationsAreClean(options.mutationJournal)
+				? result
+				: { code: "recovery_required", verifiedPaths: 0, totalPaths: verification.totalPaths };
 		} catch {
+			const pendingRestored = await this.restorePendingMutations(
+				new QuarantineManager({
+					workspaceRoot: this.requestedWorkspaceRoot,
+					journal: options.mutationJournal,
+				}),
+				options.mutationJournal,
+			);
+			if (!pendingRestored) {
+				return { code: "recovery_required", verifiedPaths: 0, totalPaths: currentPaths.size };
+			}
 			if (rollbackPlan !== undefined) {
 				try {
 					const topologyAfter = await this.discovery.discover(this.workspaceRoot);
 					assertUnchangedTopology(topologyBefore, topologyAfter);
-					await this.assertCompleteVisibleSubset(topologyAfter, [current]);
+					await this.assertCompleteVisibleSubset(topologyAfter, [current], options.mutationJournal);
 					const verification = await this.verifyTarget(
 						current,
 						targetPaths,
@@ -556,7 +689,7 @@ export class RestoreEngine {
 						rollbackPlan.deletePaths,
 						rollbackPlan.scopePaths,
 					);
-					return {
+					const result: RestoreResult = {
 						code: "restore_failed_safe",
 						verifiedPaths: verification.verifiedPaths,
 						totalPaths: verification.totalPaths,
@@ -566,6 +699,9 @@ export class RestoreEngine {
 							verification.pathFingerprints,
 						),
 					};
+					return await this.mutationsAreClean(options.mutationJournal)
+						? result
+						: { code: "recovery_required", verifiedPaths: 0, totalPaths: verification.totalPaths };
 				} catch {
 					// 完整 current 状态仍不可证明，继续返回保守的 partial/recovery 结果。
 				}
@@ -593,13 +729,17 @@ export class RestoreEngine {
 		context: MutationContext,
 		kind: RestoreMutation["kind"],
 		path: string,
-		mutation: () => Promise<void>,
+		mutation: (beforeInstall: () => Promise<void>) => Promise<void>,
+		deferHook = false,
 	): Promise<void> {
 		context.ordinal += 1;
-		await this.beforeMutation?.({ phase: context.phase, ordinal: context.ordinal, kind, path });
+		const beforeInstall = async (): Promise<void> => {
+			await this.beforeMutation?.({ phase: context.phase, ordinal: context.ordinal, kind, path });
+		};
+		if (!deferHook) await beforeInstall();
 		await this.assertMutationPath(path);
 		await this.assertMutationState(context, kind, path);
-		await mutation();
+		await mutation(deferHook ? beforeInstall : async () => {});
 	}
 
 	private async writePlannedPaths(
@@ -659,6 +799,7 @@ export class RestoreEngine {
 	private async assertCompleteVisibleSubset(
 		topology: RootTopology,
 		allowedManifests: readonly SnapshotManifest[],
+		mutationJournal?: MutationJournal,
 	): Promise<void> {
 		if (allowedManifests.some((manifest) => manifest.coverage !== "complete")) {
 			return;
@@ -676,7 +817,9 @@ export class RestoreEngine {
 			}
 		}
 
-		const live = await this.store.capture(topology);
+		const live = await this.store.capture(topology, undefined, {
+			excludePaths: mutationJournal === undefined ? undefined : [...await mutationJournal.activeArtifacts()],
+		});
 		await this.store.assertComplete(live.manifestId);
 		for (const [path, owned] of await this.readOwnedPaths(live)) {
 			if (owned.entry.kind !== "directory" && !allowedPaths.has(path)) {
@@ -744,6 +887,55 @@ export class RestoreEngine {
 				return true;
 			}
 			throw error;
+		}
+	}
+
+	private async expectedMutationFingerprint(context: MutationContext, path: string): Promise<string> {
+		for (const [manifestId, owned] of [
+			[context.sourceManifestId, context.sourcePaths.get(path)],
+			[context.targetManifestId, context.targetPaths.get(path)],
+		] as const) {
+			if (owned === undefined || owned.entry.kind === "directory") continue;
+			if (!await this.entryMatches(manifestId, owned)) continue;
+			if (owned.entry.kind === "symlink") {
+				return fingerprintSymlink(path, owned.entry.linkText!);
+			}
+			if (owned.entry.blobId === null) throw new Error(`普通文件缺少 blob：${path}`);
+			const bytes = await this.store.readBlob(manifestId, owned.root.relativeRoot, owned.entry.blobId);
+			return fingerprintBytes(path, bytes, owned.entry.mode);
+		}
+		if (await this.pathIsAbsent(path)) return fingerprintAbsent(path);
+		throw new Error(`mutation 前路径不再处于已知叶子状态：${path}`);
+	}
+
+	private async mutationsAreClean(journal: MutationJournal): Promise<boolean> {
+		try {
+			await journal.assertCleaned();
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	private async cleanupLatestMutation(context: MutationContext): Promise<void> {
+		const records = await context.mutationJournal.load();
+		const record = records.at(-1);
+		if (record === undefined) throw new Error("quarantine mutation 记录缺失");
+		await context.quarantine.cleanupMutation(record);
+	}
+
+	private async restorePendingMutations(
+		quarantine: QuarantineManager,
+		journal: MutationJournal,
+	): Promise<boolean> {
+		try {
+			for (const record of [...await journal.load()].reverse()) {
+				if (record.state !== "CLEANED") await quarantine.restoreMutation(record);
+			}
+			await journal.assertCleaned();
+			return true;
+		} catch {
+			return false;
 		}
 	}
 

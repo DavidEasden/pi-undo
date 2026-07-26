@@ -102,6 +102,89 @@ describe("QuarantineManager", () => {
 		expect(await readlink(path)).toBe("../new-target");
 	});
 
+	it("absent source 可以 no-clobber 安装普通文件且不伪造 source artifact", async () => {
+		const { root, journal, manager } = await fixture();
+		const target = Buffer.from("new\n");
+
+		await manager.replaceFile({
+			path: "new.txt",
+			targetBytes: target,
+			targetMode: 0o644,
+			sourceFingerprint: fingerprintAbsent("new.txt"),
+			targetFingerprint: fingerprintBytes("new.txt", target, 0o644),
+		});
+
+		expect(await readFile(join(root, "new.txt"), "utf8")).toBe("new\n");
+		const [record] = await journal.load();
+		expect(record).toMatchObject({ state: "TARGET_VERIFIED", sourceFingerprint: fingerprintAbsent("new.txt") });
+		await expect(lstat(join(root, record.sourceArtifact))).rejects.toMatchObject({ code: "ENOENT" });
+		await manager.cleanupMutation(record);
+		await expect(journal.assertCleaned()).resolves.toBeUndefined();
+	});
+
+	it("absent source 可以 no-clobber 安装 symlink", async () => {
+		const { root, journal, manager } = await fixture();
+
+		await manager.replaceSymlink({
+			path: "new-link",
+			targetLinkText: "target.txt",
+			sourceFingerprint: fingerprintAbsent("new-link"),
+			targetFingerprint: fingerprintSymlink("new-link", "target.txt"),
+		});
+
+		expect(await readlink(join(root, "new-link"))).toBe("target.txt");
+		expect(await journal.load()).toMatchObject([{ state: "TARGET_VERIFIED" }]);
+	});
+
+	it("absent source symlink 安装时外部抢占原路径会 fail closed", async () => {
+		const { root, manager } = await fixture();
+
+		await expect(manager.replaceSymlink({
+			path: "new-link",
+			targetLinkText: "target.txt",
+			sourceFingerprint: fingerprintAbsent("new-link"),
+			targetFingerprint: fingerprintSymlink("new-link", "target.txt"),
+			beforeInstall: () => writeFile(join(root, "new-link"), "external\n"),
+		})).rejects.toThrow("外部并发");
+
+		expect(await readFile(join(root, "new-link"), "utf8")).toBe("external\n");
+	});
+
+	it("absent source rollback 删除已验证 target 并幂等清理，未知外部内容则保留", async () => {
+		const clean = await fixture();
+		const target = Buffer.from("new\n");
+		await clean.manager.replaceFile({
+			path: "new.txt",
+			targetBytes: target,
+			targetMode: 0o644,
+			sourceFingerprint: fingerprintAbsent("new.txt"),
+			targetFingerprint: fingerprintBytes("new.txt", target, 0o644),
+		});
+		const [record] = await clean.journal.load();
+
+		await clean.manager.restoreMutation(record);
+		await clean.manager.restoreMutation(record);
+
+		await expect(lstat(join(clean.root, "new.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(clean.journal.assertCleaned()).resolves.toBeUndefined();
+		expect(await clean.manager.inspectArtifacts()).toEqual([]);
+
+		const conflict = await fixture();
+		await conflict.manager.replaceFile({
+			path: "new.txt",
+			targetBytes: target,
+			targetMode: 0o644,
+			sourceFingerprint: fingerprintAbsent("new.txt"),
+			targetFingerprint: fingerprintBytes("new.txt", target, 0o644),
+		});
+		const [conflictRecord] = await conflict.journal.load();
+		await rm(join(conflict.root, "new.txt"));
+		await writeFile(join(conflict.root, "new.txt"), "external\n");
+
+		await expect(conflict.manager.restoreMutation(conflictRecord)).rejects.toThrow("外部并发");
+		expect(await readFile(join(conflict.root, "new.txt"), "utf8")).toBe("external\n");
+	});
+
 	it("artifact 名碰撞时生成新 nonce 且不认领同名前缀用户文件", async () => {
 		const { root, journal } = await fixture();
 		const colliding = `.pi-undo-q1-${"0".repeat(32)}-source`;

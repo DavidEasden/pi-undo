@@ -90,6 +90,13 @@ afterEach(async () => {
 });
 
 describe("MutationJournal", () => {
+	it("暴露不可变的 operation identity", async () => {
+		const { journal } = await journalFixture();
+
+		expect(journal.operationId).toBe("operation-1");
+		expect(journal.storagePath).toMatch(/mutations\.jsonl$/);
+	});
+
 	it("begin 与 advance 追加记录，重载后返回 ordinal 最新状态", async () => {
 		const { journal, file } = await journalFixture();
 		const begun = await journal.begin(intent());

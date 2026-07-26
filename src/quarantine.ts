@@ -191,11 +191,27 @@ export class QuarantineManager {
 		await this.assertMutationPaths(owned.path, owned.sourceArtifact);
 		const originalFingerprint = await fingerprintLeaf(original, owned.path);
 		const sourceExists = await exists(source);
+		const sourceWasAbsent = owned.sourceFingerprint === fingerprintAbsent(owned.path);
 		if (owned.state === "CLEANED") {
 			if (originalFingerprint !== owned.sourceFingerprint || sourceExists) {
 				throw new QuarantineError("external_concurrency", `已 CLEANED rollback 现场不一致：${owned.path}`);
 			}
 			await this.assertTargetArtifactAbsent(owned);
+			return;
+		}
+		if (sourceWasAbsent) {
+			if (sourceExists) {
+				throw new QuarantineError("unsafe_artifact", `absent source 不应存在 artifact：${owned.path}`);
+			}
+			if (originalFingerprint === owned.targetFingerprint) {
+				await this.assertFingerprint(original, owned.path, owned.targetFingerprint);
+				await unlink(original);
+				await fsyncDirectory(dirname(original));
+			} else if (originalFingerprint !== owned.sourceFingerprint) {
+				throw new QuarantineError("external_concurrency", `检测到外部并发，恢复路径存在未知内容：${owned.path}`);
+			}
+			await this.cleanupRollbackTarget(owned);
+			await this.journal.markRollbackCleaned(owned.ordinal);
 			return;
 		}
 		if (originalFingerprint === owned.sourceFingerprint) {
@@ -257,7 +273,13 @@ export class QuarantineManager {
 	async rollForwardMutation(record: MutationRecord): Promise<void> {
 		let owned = await this.assertOwnedRecord(record);
 		if (owned.state === "SOURCE_QUARANTINED") {
-			await this.assertFingerprint(this.absolute(owned.sourceArtifact), owned.path, owned.sourceFingerprint);
+			if (owned.sourceFingerprint === fingerprintAbsent(owned.path)) {
+				if (await exists(this.absolute(owned.sourceArtifact))) {
+					throw new QuarantineError("unsafe_artifact", `absent source 不应存在 artifact：${owned.path}`);
+				}
+			} else {
+				await this.assertFingerprint(this.absolute(owned.sourceArtifact), owned.path, owned.sourceFingerprint);
+			}
 			owned = await this.journal.advance(owned.ordinal, "SOURCE_VERIFIED");
 		}
 		if (owned.state === "SOURCE_VERIFIED") {
@@ -347,6 +369,15 @@ export class QuarantineManager {
 		const original = this.absolute(record.path);
 		const source = this.absolute(record.sourceArtifact);
 		await this.assertFingerprint(original, record.path, record.sourceFingerprint);
+		if (record.sourceFingerprint === fingerprintAbsent(record.path)) {
+			if (await exists(source)) {
+				throw new QuarantineError("unsafe_artifact", `absent source 不应存在 artifact：${record.path}`);
+			}
+			await this.journal.advance(record.ordinal, "SOURCE_QUARANTINED");
+			await this.assertFingerprint(original, record.path, record.sourceFingerprint);
+			await this.journal.advance(record.ordinal, "SOURCE_VERIFIED");
+			return;
+		}
 		const metadata = await lstat(original);
 		const linkText = metadata.isSymbolicLink() ? await readlink(original) : undefined;
 		if (!metadata.isFile() && !metadata.isSymbolicLink()) {

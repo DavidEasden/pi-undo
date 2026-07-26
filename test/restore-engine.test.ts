@@ -1,9 +1,10 @@
 import { access, chmod, lstat, mkdtemp, readFile, readdir, readlink, rename, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { canonicalJson, checksum, topologyFingerprint } from "../src/encoding.ts";
+import { MutationJournal } from "../src/mutation-journal.ts";
 import { RestoreEngine, type RestoreMutation } from "../src/restore-engine.ts";
 import type { ManifestId, RestorePath, SnapshotManifest } from "../src/model.ts";
 import { RootDiscovery } from "../src/root-discovery.ts";
@@ -66,6 +67,18 @@ class GitMetadataTreeSnapshotStore extends SnapshotStore {
 	}
 }
 
+class FailingSecondRollbackCleanJournal extends MutationJournal {
+	private rollbackCleanCalls = 0;
+
+	override markRollbackCleaned(ordinal: number) {
+		this.rollbackCleanCalls += 1;
+		if (this.rollbackCleanCalls === 2) {
+			return Promise.reject(new Error("注入 pending rollback 终结失败"));
+		}
+		return super.markRollbackCleaned(ordinal);
+	}
+}
+
 afterEach(async () => {
 	await Promise.all(temporaryRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
@@ -125,6 +138,38 @@ function withActiveNullTree(manifest: SnapshotManifest): SnapshotManifest {
 }
 
 describe("RestoreEngine", () => {
+	it("source quarantine 后外部重建路径时不覆盖外部内容并保留 WAL", async () => {
+		const workspace = await temporaryRoot("pi-undo-restore-workspace-");
+		await writeFile(workspace, "a.txt", "target\n");
+		const storeRoot = await temporaryRoot("pi-undo-restore-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "a.txt", "source\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		const journal = new MutationJournal(join(storeRoot, "mutations.jsonl"), "op-restore-conflict");
+		const engine = new RestoreEngine({
+			workspaceRoot: workspace,
+			store,
+			discovery,
+			beforeMutation: async (mutation) => {
+				if (mutation.phase === "apply" && mutation.kind === "write" && mutation.path === "a.txt") {
+					await writeFile(workspace, "a.txt", "external\n");
+				}
+			},
+		});
+
+		const result = await engine.apply(await engine.plan(current, target), target, {
+			opId: "op-restore-conflict",
+			mutationJournal: journal,
+		});
+
+		expect(result.code).toBe("recovery_required");
+		expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("external\n");
+		expect((await journal.load()).length).toBeGreaterThan(0);
+		expect((await journal.activeArtifacts()).size).toBeGreaterThan(0);
+	});
+
 	it("计划使用 root 并集并生成确定的深浅顺序与 digest", async () => {
 		const outer = await createGitRepo();
 		temporaryRoots.push(outer.root);
@@ -538,6 +583,141 @@ describe("RestoreEngine", () => {
 		expect(result.code).toBe("restore_failed_safe");
 		expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("current-a\n");
 		expect(await readFile(join(workspace, "b.txt"), "utf8")).toBe("current-b\n");
+	});
+
+	it("显式 journal 在第二个叶子失败后用新 ordinal rollback 并全部清理", async () => {
+		const workspace = await temporaryRoot("pi-undo-restore-workspace-");
+		await writeFile(workspace, "a.txt", "target-a\n");
+		await writeFile(workspace, "b.txt", "target-b\n");
+		const storeRoot = await temporaryRoot("pi-undo-restore-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "a.txt", "current-a\n");
+		await writeFile(workspace, "b.txt", "current-b\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		const journal = new MutationJournal(join(storeRoot, "mutations.jsonl"), "op-explicit-rollback");
+		const engine = new RestoreEngine({
+			workspaceRoot: workspace,
+			store,
+			discovery,
+			beforeMutation: (mutation) => {
+				if (mutation.phase === "apply" && mutation.path === "b.txt") throw new Error("注入第二叶子失败");
+			},
+		});
+
+		const result = await engine.apply(await engine.plan(current, target), target, {
+			opId: "op-explicit-rollback",
+			mutationJournal: journal,
+		});
+
+		expect(result.code).toBe("restore_failed_safe");
+		expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("current-a\n");
+		expect(await readFile(join(workspace, "b.txt"), "utf8")).toBe("current-b\n");
+		expect(await journal.load()).toMatchObject([
+			{ ordinal: 1, path: "a.txt", state: "CLEANED" },
+			{ ordinal: 2, path: "b.txt", state: "CLEANED" },
+			{ ordinal: 3, path: "a.txt", state: "CLEANED" },
+			{ ordinal: 4, path: "b.txt", state: "CLEANED" },
+		]);
+		expect(await journal.activeArtifacts()).toEqual(new Set());
+	});
+
+	it("rollback pending 无法终结时即使 current 可验证也返回 recovery_required", async () => {
+		const workspace = await temporaryRoot("pi-undo-restore-workspace-");
+		await writeFile(workspace, "a.txt", "target-a\n");
+		await writeFile(workspace, "b.txt", "target-b\n");
+		const storeRoot = await temporaryRoot("pi-undo-restore-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "a.txt", "current-a\n");
+		await writeFile(workspace, "b.txt", "current-b\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		const journal = new FailingSecondRollbackCleanJournal(
+			join(storeRoot, "mutations.jsonl"),
+			"op-pending-clean-failure",
+		);
+		const engine = new RestoreEngine({
+			workspaceRoot: workspace,
+			store,
+			discovery,
+			beforeMutation: (mutation) => {
+				if (
+					(mutation.phase === "apply" && mutation.path === "b.txt") ||
+					(mutation.phase === "rollback" && mutation.path === "a.txt")
+				) {
+					throw new Error("注入 mutation 失败");
+				}
+			},
+		});
+
+		const result = await engine.apply(await engine.plan(current, target), target, {
+			opId: "op-pending-clean-failure",
+			mutationJournal: journal,
+		});
+
+		expect(result.code).toBe("recovery_required");
+		expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("target-a\n");
+		expect(await readFile(join(workspace, "b.txt"), "utf8")).toBe("current-b\n");
+		expect((await journal.activeArtifacts()).size).toBeGreaterThan(0);
+	});
+
+	it("相同 plan 重复兼容 apply 使用不同 journal 身份", async () => {
+		const workspace = await temporaryRoot("pi-undo-restore-workspace-");
+		await writeFile(workspace, "a.txt", "target\n");
+		const storeRoot = await temporaryRoot("pi-undo-restore-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "a.txt", "current\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+		const plan = await engine.plan(current, target);
+		const journals = new Set<MutationJournal>();
+		const originalBegin = MutationJournal.prototype.begin;
+		const begin = vi.spyOn(MutationJournal.prototype, "begin").mockImplementation(function (
+			this: MutationJournal,
+			intent,
+		) {
+			journals.add(this);
+			return originalBegin.call(this, intent);
+		});
+
+		expect((await engine.apply(plan, target)).code).toBe("ok");
+		await writeFile(workspace, "a.txt", "current\n");
+		expect((await engine.apply(plan, target)).code).toBe("ok");
+		begin.mockRestore();
+
+		expect(journals.size).toBe(2);
+		expect(new Set([...journals].map((journal) => journal.operationId)).size).toBe(2);
+		expect(new Set([...journals].map((journal) => journal.storagePath)).size).toBe(2);
+		await Promise.all([...journals].map(async (journal) => {
+			const directory = dirname(journal.storagePath);
+			expect(directory.startsWith(join(tmpdir(), "pi-undo-restore-compat-"))).toBe(true);
+			await rm(directory, { recursive: true, force: true });
+		}));
+	});
+
+	it("apply options 的 opId 必须与 mutation journal identity 一致", async () => {
+		const workspace = await temporaryRoot("pi-undo-restore-workspace-");
+		const storeRoot = await temporaryRoot("pi-undo-restore-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot });
+		const current = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "new/file.txt", "target\n");
+		const target = await store.capture(await discovery.discover(workspace));
+		await rm(join(workspace, "new"), { recursive: true });
+		const journal = new MutationJournal(join(storeRoot, "mutations.jsonl"), "journal-operation");
+		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+
+		await expect(engine.apply(await engine.plan(current, target), target, {
+			opId: "different-operation",
+			mutationJournal: journal,
+		})).rejects.toThrow("opId");
+
+		await expect(lstat(join(workspace, "new"))).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await journal.load()).toEqual([]);
 	});
 
 	it("rollback 再失败时返回 partial/recovery 并保留 recovery pin", async () => {
@@ -993,7 +1173,7 @@ describe("RestoreEngine", () => {
 		expect(await readFile(join(workspace, "victim.txt"), "utf8")).toBe("third-state\n");
 	});
 
-	it("mutation 前中间目录被换成 symlink 时不越界并安全 rollback", async () => {
+	it("mutation 前中间目录被换成 symlink 时不越界并保留 recovery 现场", async () => {
 		const workspace = await temporaryRoot("pi-undo-restore-workspace-");
 		const outside = await temporaryRoot("pi-undo-restore-outside-");
 		await writeFile(workspace, "safe/file.txt", "target\n");
@@ -1006,6 +1186,7 @@ describe("RestoreEngine", () => {
 		const current = await store.capture(await discovery.discover(workspace));
 		const safeDirectory = join(workspace, "safe");
 		const heldDirectory = join(workspace, "safe-held");
+		const journal = new MutationJournal(join(storeRoot, "mutations.jsonl"), "op-parent-drift");
 		const engine = new RestoreEngine({
 			workspaceRoot: workspace,
 			store,
@@ -1022,12 +1203,15 @@ describe("RestoreEngine", () => {
 			},
 		});
 
-		const result = await engine.apply(await engine.plan(current, target), target);
+		const result = await engine.apply(await engine.plan(current, target), target, {
+			opId: "op-parent-drift",
+			mutationJournal: journal,
+		});
 
-		expect(result.code).toBe("restore_failed_safe");
-		expect(await readFile(join(workspace, "safe/file.txt"), "utf8")).toBe("current\n");
+		expect(result.code).toBe("recovery_required");
 		expect(await readFile(join(outside, "file.txt"), "utf8")).toBe("outside\n");
-		expect((await lstat(safeDirectory)).isDirectory()).toBe(true);
+		expect((await readdir(heldDirectory)).filter((name) => name.startsWith(".pi-undo-q1-"))).not.toEqual([]);
+		expect((await journal.activeArtifacts()).size).toBeGreaterThan(0);
 	});
 
 	it("post topology drift 触发 rollback 并再次验证 current", async () => {
@@ -1212,6 +1396,7 @@ describe("RestoreEngine", () => {
 		const target = await store.capture(await discovery.discover(workspace));
 		await writeFile(workspace, "file.txt", "current\n");
 		const current = await store.capture(await discovery.discover(workspace));
+		const journal = new MutationJournal(join(storeRoot, "mutations.jsonl"), "op-alias-drift");
 		let mutationHookCalls = 0;
 		const engine = new RestoreEngine({
 			workspaceRoot: alias,
@@ -1230,12 +1415,16 @@ describe("RestoreEngine", () => {
 			},
 		});
 
-		const result = await engine.apply(await engine.plan(current, target), target);
+		const result = await engine.apply(await engine.plan(current, target), target, {
+			opId: "op-alias-drift",
+			mutationJournal: journal,
+		});
 
-		expect(result.code).toBe("restore_failed_safe");
+		expect(result.code).toBe("recovery_required");
 		expect(mutationHookCalls).toBe(1);
-		expect(await readFile(join(workspace, "file.txt"), "utf8")).toBe("current\n");
 		expect(await readFile(join(outside, "file.txt"), "utf8")).toBe("outside-sentinel\n");
+		expect((await readdir(workspace)).filter((name) => name.startsWith(".pi-undo-q1-"))).not.toEqual([]);
+		expect((await journal.activeArtifacts()).size).toBeGreaterThan(0);
 	});
 
 	it("canonical workspace root 在 preflight 后换向也不能写到外部", async () => {
@@ -1251,6 +1440,7 @@ describe("RestoreEngine", () => {
 		const target = await store.capture(await discovery.discover(workspace));
 		await writeFile(workspace, "file.txt", "current\n");
 		const current = await store.capture(await discovery.discover(workspace));
+		const journal = new MutationJournal(join(storeRoot, "mutations.jsonl"), "op-root-drift");
 		let outsideBeforeRollback: string | undefined;
 		const engine = new RestoreEngine({
 			workspaceRoot: workspace,
@@ -1269,11 +1459,15 @@ describe("RestoreEngine", () => {
 			},
 		});
 
-		const result = await engine.apply(await engine.plan(current, target), target);
+		const result = await engine.apply(await engine.plan(current, target), target, {
+			opId: "op-root-drift",
+			mutationJournal: journal,
+		});
 
-		expect(result.code).toBe("restore_failed_safe");
-		expect(outsideBeforeRollback).toBe("outside-sentinel\n");
-		expect(await readFile(join(workspace, "file.txt"), "utf8")).toBe("current\n");
+		expect(result.code).toBe("recovery_required");
+		expect(outsideBeforeRollback).toBeUndefined();
 		expect(await readFile(join(outside, "file.txt"), "utf8")).toBe("outside-sentinel\n");
+		expect((await readdir(heldWorkspace)).filter((name) => name.startsWith(".pi-undo-q1-"))).not.toEqual([]);
+		expect((await journal.activeArtifacts()).size).toBeGreaterThan(0);
 	});
 });
