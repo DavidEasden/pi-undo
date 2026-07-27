@@ -124,6 +124,28 @@ describe("UndoController", () => {
 		expect(deps.calls).toEqual([]);
 	});
 
+	it("undo/redo 事务期间将新输入标记为 defer，事务完成后恢复正常", async () => {
+		let releaseCapture: (() => void) | undefined;
+		let captureStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => { captureStarted = resolve; });
+		const captureGate = new Promise<void>((resolve) => { releaseCapture = resolve; });
+		const deps = dependencies({
+			capture: async () => {
+				captureStarted!();
+				await captureGate;
+				return manifest("c");
+			},
+		});
+		const controller = new UndoControllerImpl(deps, { undoStack: [restoredCheckpoint()] });
+
+		const undo = controller.undo();
+		await started;
+		expect(await controller.prepareInput("下一项任务", { streaming: false })).toEqual({ action: "defer" });
+		releaseCapture!();
+		expect((await undo).code).toBe("ok");
+		expect(await controller.prepareInput("下一项任务", { streaming: true })).toEqual({ action: "continue" });
+	});
+
 	it("正常 run 只在 idle 输入建立 baseline，并在 settled 后持久化 checkpoint", async () => {
 		const deps = dependencies();
 		const controller = new UndoControllerImpl(deps);
@@ -490,6 +512,33 @@ describe("UndoController", () => {
 		expect(controller.history().locked).toBe(true);
 	});
 
+	it("事务进入 recovery lock 但尚未退出时仍 defer 输入，退出后才 handled", async () => {
+		let markRecoveryPhase: (() => void) | undefined;
+		let releaseRecoveryPhase: (() => void) | undefined;
+		const recoveryPhase = new Promise<void>((resolve) => { markRecoveryPhase = resolve; });
+		const recoveryGate = new Promise<void>((resolve) => { releaseRecoveryPhase = resolve; });
+		const deps = dependencies({
+			appendCursor: async () => ({ kind: "recovery_required", reason: "cursor_missing" }),
+		});
+		deps.journal.setPhase = async (_opId, phase) => {
+			if (phase !== "RECOVERY_REQUIRED") return;
+			markRecoveryPhase!();
+			await recoveryGate;
+		};
+		const controller = new UndoControllerImpl(deps);
+		await controller.prepareInput("修复文件", { streaming: false });
+		await controller.beforeAgentStart();
+		await controller.agentSettled();
+
+		const undo = controller.undo();
+		await recoveryPhase;
+		expect(controller.history().locked).toBe(true);
+		expect(await controller.prepareInput("不要丢失", { streaming: false })).toEqual({ action: "defer" });
+		releaseRecoveryPhase!();
+		expect((await undo).code).toBe("recovery_required");
+		expect(await controller.prepareInput("不要丢失", { streaming: false })).toEqual({ action: "handled" });
+	});
+
 	it("SESSION_MOVED journal 持久化 observed logical leaf", async () => {
 		let observed: string | null | undefined;
 		const deps = dependencies();
@@ -581,6 +630,7 @@ describe("UndoController", () => {
 		const controller = new UndoControllerImpl(deps);
 
 		expect(await controller.beforeTree({ targetLeafId: "requested-entry" })).toBeUndefined();
+		expect(await controller.prepareInput("tree 期间输入", { streaming: false })).toEqual({ action: "handled" });
 		expect(deps.calls).toEqual(["capture", "prepare"]);
 		await controller.afterTree({ newLeafId: "tree-leaf" });
 

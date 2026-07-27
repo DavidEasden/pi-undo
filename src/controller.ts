@@ -80,9 +80,10 @@ export interface OperationResult {
 	readonly refillPrompt?: string;
 }
 
-export interface InputEventResult {
-	readonly action: "continue" | "handled";
-}
+export type InputEventResult =
+	| { readonly action: "continue" }
+	| { readonly action: "handled" }
+	| { readonly action: "defer" };
 
 export interface InputContext {
 	readonly streaming: boolean;
@@ -163,6 +164,7 @@ export class UndoControllerImpl implements UndoController {
 	private locked = false;
 	private historyPaused = false;
 	private operationInFlight = false;
+	private promptDeferralInFlight = false;
 	private lastSafetyManifestId: ManifestId | null = null;
 
 	constructor(dependencies: ControllerDependencies, initialState: ControllerInitialState = {}) {
@@ -182,6 +184,7 @@ export class UndoControllerImpl implements UndoController {
 	}
 
 	async prepareInput(text: string, context: InputContext): Promise<InputEventResult> {
+		if (this.promptDeferralInFlight) return { action: "defer" };
 		if (this.locked || this.operationInFlight) return { action: "handled" };
 		if (context.streaming || text.length === 0) return { action: "continue" };
 		try {
@@ -382,6 +385,7 @@ export class UndoControllerImpl implements UndoController {
 	): Promise<OperationResult> {
 		if (this.locked || this.operationInFlight) return { code: "busy", changedFiles: 0 };
 		this.operationInFlight = true;
+		this.promptDeferralInFlight = true;
 		this.lastSafetyManifestId = null;
 		let lease: { release(): Promise<void> } | undefined;
 		try {
@@ -454,6 +458,7 @@ export class UndoControllerImpl implements UndoController {
 			if (lease !== undefined) {
 				await lease.release().catch(() => { this.locked = true; });
 			}
+			this.promptDeferralInFlight = false;
 			this.operationInFlight = false;
 		}
 	}
