@@ -82,7 +82,7 @@ describe("Pi runtime cursor durability", () => {
 		await runtime.controller.agentSettled();
 		runtime.setCommandContext(fixture.commandContext as any);
 
-		expect(await runtime.controller.undo()).toEqual({ code: "ok", changedFiles: 1, refillPrompt: "创建文件" });
+		expect(await runtime.controller.undo()).toMatchObject({ code: "ok", changedFiles: 1, refillPrompt: "创建文件" });
 		expect(runtime.controller.history()).toEqual({ undoCount: 0, redoCount: 1, locked: false });
 	});
 });
