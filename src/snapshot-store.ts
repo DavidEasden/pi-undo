@@ -125,6 +125,7 @@ export interface SnapshotStore {
 	pin(id: ManifestId, reason: string): Promise<void>;
 	unpin(id: ManifestId, reason: string): Promise<void>;
 	collectGarbage(): Promise<number>;
+	durableCacheDirectory(): Promise<string>;
 }
 
 export class SnapshotStore {
@@ -148,6 +149,12 @@ export class SnapshotStore {
 		this.discovery = options.discovery ?? new RootDiscovery(this.git);
 		this.lock = options.lock ?? new WorkspaceLock();
 		this.clock = options.clock ?? Date.now;
+	}
+
+	async durableCacheDirectory(): Promise<string> {
+		const directory = join(this.storeRoot, "durable-cache");
+		await mkdir(directory, { recursive: true });
+		return directory;
 	}
 
 	async capture(

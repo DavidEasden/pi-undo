@@ -32,12 +32,15 @@
 	"files": [
 		"extensions",
 		"src",
+		"native/bin",
 		"README.md"
 	],
 	"scripts": {
 		"test": "vitest run",
 		"test:watch": "vitest",
 		"test:integration": "vitest run test/extension.integration.test.ts test/pi-runtime.test.ts",
+		"test:native": "cargo test --manifest-path native/pi-undo-fs/Cargo.toml && vitest run test/native-restore.test.ts test/durable-pack.test.ts test/packed-recovery.test.ts",
+		"build:native": "cargo build --release --manifest-path native/pi-undo-fs/Cargo.toml",
 		"typecheck": "tsc --noEmit",
 		"pack:dry-run": "npm pack --dry-run"
 	},

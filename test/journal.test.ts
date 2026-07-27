@@ -101,6 +101,26 @@ describe("JournalStore", () => {
 		expect(pending?.state).toMatchObject({ phase: "APPLYING", revision: 3, observedLogicalLeaf: "summary-leaf" });
 	});
 
+	it("相邻 phase group 一次发布并保留逻辑 revision", async () => {
+		const root = await temporaryRoot("pi-undo-journal-group-");
+		const sessionFile = join(root, "session.jsonl");
+		const store = new JournalStore({ transactionsRoot: join(root, "transactions") });
+		const operation = descriptor(sessionFile);
+		await store.prepare(operation, { paths: ["a.txt"], planDigest: operation.planDigest });
+
+		await store.setPhases(operation.opId, [
+			{ phase: "SESSION_MOVED", observedLogicalLeaf: "before" },
+			{ phase: "APPLYING" },
+		]);
+
+		const [pending] = await store.loadPending();
+		expect(pending?.state).toMatchObject({
+			phase: "APPLYING",
+			revision: 3,
+			observedLogicalLeaf: "before",
+		});
+	});
+
 	it("已验证的启动恢复可以从中间 phase 原子收敛到终态", async () => {
 		const root = await temporaryRoot("pi-undo-journal-");
 		const operation = descriptor(join(root, "session.jsonl"));

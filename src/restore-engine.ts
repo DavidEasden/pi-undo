@@ -2,10 +2,20 @@ import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, rmdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
+import {
+	createDurablePack,
+	publishCachedDurablePack,
+	removeDurablePack,
+	type DurableLeafInput,
+	type DurablePack,
+	type DurablePackEntryInput,
+} from "./durable-pack.ts";
 import { assertManifest, assertOperationId, canonicalJson, checksum } from "./encoding.ts";
 import { MutationJournal } from "./mutation-journal.ts";
+import { createNativeFileBatch } from "./native-restore.ts";
+import { recoverPackedMutations } from "./packed-recovery.ts";
 import type { ManifestId, RestorePath, SnapshotManifest, SnapshotRoot } from "./model.ts";
 import {
 	assertNoSymlinkEscape,
@@ -25,8 +35,8 @@ import {
 import { SnapshotStoreError, type SnapshotStore } from "./snapshot-store.ts";
 
 const PREPARED_PLAN_CACHE_LIMIT = 16;
-const RESTORE_FILE_BATCH_MAX_ENTRIES = 128;
-const RESTORE_FILE_BATCH_MAX_BYTES = 32 * 1024 * 1024;
+const RESTORE_FILE_BATCH_MAX_ENTRIES = 1_024;
+const RESTORE_FILE_BATCH_MAX_BYTES = 64 * 1024 * 1024;
 const RESTORE_FILE_PREPARE_CONCURRENCY = 32;
 
 export interface RestorePlan {
@@ -54,6 +64,8 @@ export interface RestoreEngine {
 export interface RestoreApplyOptions {
 	readonly opId: string;
 	readonly mutationJournal: MutationJournal;
+	readonly forceTargetArtifactSync?: boolean;
+	readonly deferDurability?: boolean;
 }
 
 export interface RestoreEngineOptions {
@@ -102,6 +114,17 @@ export class RestoreEngine {
 	private readonly discovery: RootDiscovery;
 	private readonly beforeMutation: RestoreEngineOptions["beforeMutation"];
 	private readonly preparedPlans = new Map<string, PreparedRestorePlan>();
+	private readonly durablePackCache = new Map<string, {
+		readonly currentManifestId: ManifestId;
+		readonly targetManifestId: ManifestId;
+		readonly path: string;
+		readonly packChecksum: string;
+		readonly pinReason: string;
+	}>();
+	private readonly durablePackByPair = new Map<string, {
+		readonly planDigest: string;
+		readonly pack: DurablePack;
+	}>();
 
 	constructor(options: RestoreEngineOptions) {
 		this.requestedWorkspaceRoot = resolve(options.workspaceRoot);
@@ -197,6 +220,118 @@ export class RestoreEngine {
 		return plan;
 	}
 
+	async canReuseDurableSource(
+		current: SnapshotManifest,
+		target: SnapshotManifest,
+		scopePaths: readonly string[],
+	): Promise<boolean> {
+		const cached = this.durablePackByPair.get(durablePairKey(current.manifestId, target.manifestId, scopePaths));
+		if (cached === undefined) return false;
+		const cacheJournal = new MutationJournal(
+			join(dirname(cached.pack.storagePath), "mutations.jsonl"),
+			`cache-${cached.planDigest}`,
+		);
+		try {
+			if (await this.assertWorkspaceRootIdentity() !== current.workspaceIdentity) return false;
+			const topology = await this.discovery.discover(this.workspaceRoot);
+			this.assertCurrentTopology(current, target, topology);
+			const native = await createNativeFileBatch({
+				workspaceRoot: this.workspaceRoot,
+				planDigest: cached.planDigest,
+				journal: cacheJournal,
+			});
+			return native !== undefined && await native.verifySource(cached.pack);
+		} catch {
+			return false;
+		}
+	}
+
+	async prepareDurableRestore(
+		current: SnapshotManifest,
+		target: SnapshotManifest,
+		scopePaths: readonly string[],
+	): Promise<void> {
+		const plan = await this.plan(current, target, scopePaths);
+		const prepared = this.takePreparedPlan(plan);
+		if (prepared === undefined || !this.canUseNativeFilePlan(plan, prepared.targetPaths)) return;
+		const cacheRoot = await this.store.durableCacheDirectory();
+		const cacheOpId = `cache-${plan.planDigest}`;
+		const cacheJournal = new MutationJournal(
+			join(cacheRoot, plan.planDigest, "mutations.jsonl"),
+			cacheOpId,
+		);
+		await mkdir(dirname(cacheJournal.storagePath), { recursive: true });
+		const pack = await createDurablePack(cacheJournal, {
+			opId: cacheOpId,
+			planDigest: plan.planDigest,
+			entries: await this.durablePackEntries(
+				current,
+				target,
+				prepared.currentPaths,
+				prepared.targetPaths,
+				plan,
+				cacheOpId,
+			),
+		});
+		const pinReason = `durable-cache:${plan.planDigest}`;
+		const pinned: ManifestId[] = [];
+		try {
+			for (const manifestId of new Set([current.manifestId, target.manifestId])) {
+				await this.store.pin(manifestId, pinReason);
+				pinned.push(manifestId);
+			}
+		} catch (error) {
+			await Promise.all(pinned.map((manifestId) => this.store.unpin(manifestId, pinReason).catch(() => {})));
+			await rm(dirname(pack.storagePath), { recursive: true, force: true }).catch(() => {});
+			throw error;
+		}
+		await this.rememberDurablePack(
+			plan,
+			current,
+			target,
+			scopePaths,
+			pack,
+			pinReason,
+		);
+		this.rememberPreparedPlan(plan, prepared.currentPaths, prepared.targetPaths);
+	}
+
+	private async rememberDurablePack(
+		plan: RestorePlan,
+		current: SnapshotManifest,
+		target: SnapshotManifest,
+		scopePaths: readonly string[],
+		pack: DurablePack,
+		pinReason: string,
+	): Promise<void> {
+		this.durablePackCache.set(plan.planDigest, {
+			currentManifestId: current.manifestId,
+			targetManifestId: target.manifestId,
+			path: pack.storagePath,
+			packChecksum: pack.packChecksum,
+			pinReason,
+		});
+		this.durablePackByPair.set(durablePairKey(current.manifestId, target.manifestId, scopePaths), {
+			planDigest: plan.planDigest,
+			pack,
+		});
+		while (this.durablePackCache.size > PREPARED_PLAN_CACHE_LIMIT) {
+			const oldest = this.durablePackCache.entries().next().value as
+				| readonly [string, { readonly currentManifestId: ManifestId; readonly targetManifestId: ManifestId; readonly path: string; readonly packChecksum: string; readonly pinReason: string }]
+				| undefined;
+			if (oldest === undefined) break;
+			const [digest, entry] = oldest;
+			this.durablePackCache.delete(digest);
+			for (const [key, pair] of this.durablePackByPair) {
+				if (pair.planDigest === digest) this.durablePackByPair.delete(key);
+			}
+			await Promise.all([...new Set([entry.currentManifestId, entry.targetManifestId])].map(
+				(manifestId) => this.store.unpin(manifestId, entry.pinReason).catch(() => {}),
+			));
+			await rm(dirname(entry.path), { recursive: true, force: true }).catch(() => {});
+		}
+	}
+
 	private rememberPreparedPlan(
 		plan: RestorePlan,
 		currentPaths: ReadonlyMap<string, OwnedPath>,
@@ -255,14 +390,18 @@ export class RestoreEngine {
 		if (!hasValidPlanDigest(plan)) {
 			throw new Error("restore plan digest 与语义字段不匹配");
 		}
+		const pinsDeferred = effectiveOptions.deferDurability === true &&
+			this.durablePackCache.has(plan.planDigest);
 		const recoveryReason = `restore:${plan.planDigest}`;
 		const attemptReason = `${recoveryReason}:attempt:${randomUUID()}`;
 		const pinned = [...new Set([plan.currentManifestId, target.manifestId])];
 		const acquired: ManifestId[] = [];
 		try {
-			for (const manifestId of pinned) {
-				await this.store.pin(manifestId, attemptReason);
-				acquired.push(manifestId);
+			if (!pinsDeferred) {
+				for (const manifestId of pinned) {
+					await this.store.pin(manifestId, attemptReason);
+					acquired.push(manifestId);
+				}
 			}
 		} catch (error) {
 			await Promise.all(acquired.map(
@@ -272,10 +411,16 @@ export class RestoreEngine {
 		}
 
 		try {
-			const result = await this.applyPinned(plan, target, effectiveOptions, compatibilityMode);
+			const result = await this.applyPinned(
+				plan,
+				target,
+				effectiveOptions,
+				compatibilityMode,
+				pinsDeferred,
+			);
 			if (result.code === "partial_restore" || result.code === "recovery_required") {
-				let recoveryPinned = true;
-				for (const manifestId of pinned) {
+				let recoveryPinned = !pinsDeferred;
+				for (const manifestId of recoveryPinned ? pinned : []) {
 					try {
 						await this.store.pin(manifestId, recoveryReason);
 					} catch {
@@ -284,24 +429,24 @@ export class RestoreEngine {
 					}
 				}
 				if (recoveryPinned) {
-					await Promise.all(pinned.map(
+					await Promise.all(acquired.map(
 						(manifestId) => this.store.unpin(manifestId, attemptReason).catch(() => {}),
 					));
 				}
 				return result;
 			}
 
-			await Promise.all(pinned.map(
+			await Promise.all(acquired.map(
 				(manifestId) => this.store.unpin(manifestId, attemptReason).catch(() => {}),
 			));
-			if (result.code === "ok" || result.postFingerprint !== undefined) {
+			if (!pinsDeferred && (result.code === "ok" || result.postFingerprint !== undefined)) {
 				await Promise.all(pinned.map(
 					(manifestId) => this.store.unpin(manifestId, recoveryReason).catch(() => {}),
 				));
 			}
 			return result;
 		} catch (error) {
-			await Promise.all(pinned.map(
+			await Promise.all(acquired.map(
 				(manifestId) => this.store.unpin(manifestId, attemptReason).catch(() => {}),
 			));
 			throw error;
@@ -313,6 +458,7 @@ export class RestoreEngine {
 		target: SnapshotManifest,
 		options: RestoreApplyOptions,
 		compatibilityMode: boolean,
+		pinsDeferred: boolean,
 	): Promise<RestoreResult> {
 		const [current, storedTarget] = await Promise.all([
 			this.store.loadManifest(plan.currentManifestId),
@@ -327,10 +473,14 @@ export class RestoreEngine {
 			plan.scopePaths === undefined ? undefined : this.canonicalScope(plan.scopePaths),
 		);
 		let expectedPlan: RestorePlan;
-		let prepared: PreparedRestorePlan | undefined;
+		let prepared = options.deferDurability === true ? this.takePreparedPlan(plan) : undefined;
 		try {
-			expectedPlan = await this.plan(current, target, plan.scopePaths);
-			prepared = this.takePreparedPlan(expectedPlan);
+			if (prepared === undefined) {
+				expectedPlan = await this.plan(current, target, plan.scopePaths);
+				prepared = this.takePreparedPlan(expectedPlan);
+			} else {
+				expectedPlan = prepared.plan;
+			}
 		} catch (error) {
 			if (error instanceof SnapshotStoreError && error.code === "object_missing") {
 				return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
@@ -357,21 +507,86 @@ export class RestoreEngine {
 				this.readOwnedPaths(target, plan.scopePaths),
 			])
 			: [prepared.currentPaths, prepared.targetPaths];
-		const quarantine = new QuarantineManager({
-			workspaceRoot: this.requestedWorkspaceRoot,
-			journal: options.mutationJournal,
-		});
-		if (
-			compatibilityMode
-				? !await this.restorePendingMutations(quarantine, options.mutationJournal)
-				: (await options.mutationJournal.activeArtifacts()).size > 0
-		) {
+		if (compatibilityMode) {
+			const compatibilityQuarantine = new QuarantineManager({
+				workspaceRoot: this.requestedWorkspaceRoot,
+				journal: options.mutationJournal,
+			});
+			if (!await this.restorePendingMutations(compatibilityQuarantine, options.mutationJournal)) {
+				return { code: "recovery_required", verifiedPaths: 0, totalPaths: currentPaths.size };
+			}
+		} else if ((await options.mutationJournal.activeArtifacts()).size > 0) {
 			return { code: "recovery_required", verifiedPaths: 0, totalPaths: currentPaths.size };
 		}
 		try {
 			await this.assertCompleteVisibleSubset(topologyBefore, [current, target], options.mutationJournal);
 		} catch {
 			return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
+		}
+		let durablePack: DurablePack | undefined;
+		if (
+			!compatibilityMode &&
+			options.deferDurability === true &&
+			options.forceTargetArtifactSync !== true &&
+			this.canUseNativeFilePlan(plan, targetPaths)
+		) {
+			try {
+				const cached = this.durablePackCache.get(plan.planDigest);
+				if (
+					cached !== undefined &&
+					cached.currentManifestId === current.manifestId &&
+					cached.targetManifestId === target.manifestId
+				) {
+					durablePack = await publishCachedDurablePack(
+						cached.path,
+						options.mutationJournal,
+						plan.planDigest,
+						cached.packChecksum,
+					);
+				} else {
+					durablePack = await createDurablePack(options.mutationJournal, {
+						opId: options.opId,
+						planDigest: plan.planDigest,
+						entries: await this.durablePackEntries(current, target, currentPaths, targetPaths, plan, options.opId),
+					});
+				}
+			} catch {
+				await removeDurablePack(options.mutationJournal).catch(() => {});
+			}
+		}
+		const nativeFileBatch = durablePack !== undefined && this.beforeMutation === undefined
+			? await createNativeFileBatch({
+				workspaceRoot: this.workspaceRoot,
+				planDigest: plan.planDigest,
+				journal: options.mutationJournal,
+			})
+			: undefined;
+		if (durablePack !== undefined && nativeFileBatch === undefined) {
+			await removeDurablePack(options.mutationJournal).catch(() => {});
+			durablePack = undefined;
+		}
+		if (pinsDeferred && durablePack === undefined) {
+			return this.applyWithOptions(
+				plan,
+				target,
+				{ ...options, deferDurability: false },
+				compatibilityMode,
+			);
+		}
+		const durablePackEnabled = durablePack !== undefined;
+		if (nativeFileBatch !== undefined && durablePack !== undefined && this.canUseNativeFilePlan(plan, targetPaths)) {
+			const result = await this.applyNativeFilePlan(
+				plan,
+				current,
+				target,
+				currentPaths,
+				targetPaths,
+				topologyBefore,
+				options,
+				durablePack,
+				nativeFileBatch.run,
+			);
+			return result;
 		}
 		const preflight = await this.verifyKnownState(current, target, currentPaths, targetPaths, plan.scopePaths);
 		if (!preflight.ok) {
@@ -381,6 +596,11 @@ export class RestoreEngine {
 				totalPaths: preflight.totalPaths,
 			};
 		}
+		const quarantine = new QuarantineManager({
+			workspaceRoot: this.requestedWorkspaceRoot,
+			journal: options.mutationJournal,
+			syncTargetArtifacts: !durablePackEnabled,
+		});
 
 		const mutationContext: MutationContext = {
 			phase: "apply",
@@ -434,8 +654,135 @@ export class RestoreEngine {
 				targetPaths,
 				options,
 				plan.scopePaths,
+				!durablePackEnabled,
 			);
 		}
+	}
+
+	private canUseNativeFilePlan(
+		plan: RestorePlan,
+		targetPaths: ReadonlyMap<string, OwnedPath>,
+	): boolean {
+		return plan.deletePaths.length === 0 &&
+			plan.writePaths.length > 0 &&
+			plan.writePaths.every((path) => targetPaths.get(path)?.entry.kind === "file");
+	}
+
+	private async applyNativeFilePlan(
+		plan: RestorePlan,
+		current: SnapshotManifest,
+		target: SnapshotManifest,
+		currentPaths: ReadonlyMap<string, OwnedPath>,
+		targetPaths: ReadonlyMap<string, OwnedPath>,
+		topologyBefore: RootTopology,
+		options: RestoreApplyOptions,
+		pack: DurablePack,
+		nativeRun: (pack: DurablePack) => Promise<void>,
+	): Promise<RestoreResult> {
+		try {
+			await nativeRun(pack);
+			const topologyAfter = await this.discovery.discover(this.workspaceRoot);
+			assertUnchangedTopology(topologyBefore, topologyAfter);
+			await this.assertCompleteVisibleSubset(
+				topologyAfter,
+				[target],
+				options.mutationJournal,
+				pack.paths().flatMap((path) => {
+					const artifacts = pack.artifacts(path);
+					return artifacts === undefined
+						? []
+						: [artifacts.source, ...(artifacts.target === null ? [] : [artifacts.target])];
+				}),
+			);
+			if ((await options.mutationJournal.load()).length !== 0) {
+				return { code: "recovery_required", verifiedPaths: 0, totalPaths: plan.writePaths.length };
+			}
+			return { code: "ok", verifiedPaths: plan.writePaths.length, totalPaths: plan.writePaths.length };
+		} catch {
+			const packedRecovery = await recoverPackedMutations({
+				workspaceRoot: this.workspaceRoot,
+				journal: options.mutationJournal,
+				planDigest: plan.planDigest,
+				decision: "rollback",
+			});
+			if (packedRecovery.kind !== "clean") {
+				return { code: "recovery_required", verifiedPaths: 0, totalPaths: plan.writePaths.length };
+			}
+			return this.rollback(
+				current,
+				target,
+				topologyBefore,
+				currentPaths,
+				targetPaths,
+				options,
+				plan.scopePaths,
+				false,
+			);
+		}
+	}
+
+	private async durablePackEntries(
+		current: SnapshotManifest,
+		target: SnapshotManifest,
+		currentPaths: ReadonlyMap<string, OwnedPath>,
+		targetPaths: ReadonlyMap<string, OwnedPath>,
+		plan: RestorePlan,
+		opId: string,
+	): Promise<DurablePackEntryInput[]> {
+		const paths = [...new Set([...plan.deletePaths, ...plan.writePaths])].sort(comparePaths);
+		const result: DurablePackEntryInput[] = [];
+		for (const path of paths) {
+			const variants = new Map<string, DurableLeafInput>();
+			const absent: DurableLeafInput = { kind: "absent", fingerprint: fingerprintAbsent(path) };
+			variants.set(absent.fingerprint, absent);
+			const currentLeaf = await this.durableLeaf(current.manifestId, currentPaths.get(path));
+			if (currentLeaf !== undefined) variants.set(currentLeaf.fingerprint, currentLeaf);
+			const targetLeaf = await this.durableLeaf(target.manifestId, targetPaths.get(path));
+			if (targetLeaf !== undefined) variants.set(targetLeaf.fingerprint, targetLeaf);
+			if (currentLeaf === undefined && targetLeaf === undefined) continue;
+			const artifactId = checksum(canonicalJson({ opId, path })).slice(0, 32);
+			const parts = path.split("/");
+			const parent = parts.slice(0, -1).join("/");
+			const artifact = (role: "source" | "target"): string =>
+				`${parent === "" ? "" : `${parent}/`}.pi-undo-q2-${artifactId}-${role}`;
+			result.push({
+				path,
+				sourceArtifact: artifact("source"),
+				targetArtifact: targetLeaf?.kind === "file" ? artifact("target") : null,
+				sourceFingerprint: currentLeaf?.fingerprint ?? absent.fingerprint,
+				targetFingerprint: targetLeaf?.fingerprint ?? null,
+				variants: [...variants.values()],
+			});
+		}
+		return result;
+	}
+
+	private async durableLeaf(
+		manifestId: ManifestId,
+		owned: OwnedPath | undefined,
+	): Promise<DurableLeafInput | undefined> {
+		if (owned === undefined || owned.entry.kind === "directory") return undefined;
+		if (owned.entry.kind === "symlink") {
+			return {
+				kind: "symlink",
+				fingerprint: fingerprintSymlink(owned.absolutePath, owned.entry.linkText!),
+				linkText: owned.entry.linkText!,
+			};
+		}
+		if (owned.entry.blobId === null) throw new Error(`durable pack 普通文件缺少 blob：${owned.absolutePath}`);
+		const bytes = await this.store.readBlob(
+			manifestId,
+			owned.root.relativeRoot,
+			owned.entry.blobId,
+			owned.entry.relativePath,
+		);
+		const mode = owned.entry.mode & 0o777;
+		return {
+			kind: "file",
+			fingerprint: fingerprintBytes(owned.absolutePath, bytes, mode),
+			mode,
+			bytes,
+		};
 	}
 
 	private async readOwnedPaths(
@@ -729,7 +1076,8 @@ export class RestoreEngine {
 		currentPaths: ReadonlyMap<string, OwnedPath>,
 		targetPaths: ReadonlyMap<string, OwnedPath>,
 		options: RestoreApplyOptions,
-		scopePaths?: readonly string[],
+		scopePaths: readonly string[] | undefined,
+		syncTargetArtifacts: boolean,
 	): Promise<RestoreResult> {
 		let rollbackPlan: RestorePlan | undefined;
 		try {
@@ -747,6 +1095,7 @@ export class RestoreEngine {
 				quarantine: new QuarantineManager({
 					workspaceRoot: this.requestedWorkspaceRoot,
 					journal: options.mutationJournal,
+					syncTargetArtifacts,
 				}),
 			};
 			await this.deletePlannedPaths(
@@ -784,6 +1133,7 @@ export class RestoreEngine {
 				new QuarantineManager({
 					workspaceRoot: this.requestedWorkspaceRoot,
 					journal: options.mutationJournal,
+					syncTargetArtifacts,
 				}),
 				options.mutationJournal,
 			);
@@ -940,14 +1290,16 @@ export class RestoreEngine {
 			targetMode: target.entry.mode & 0o777,
 			sourceFingerprint: await this.expectedMutationFingerprint(context, target.absolutePath),
 			targetFingerprint: fingerprintBytes(target.absolutePath, bytes, target.entry.mode),
-			beforeInstall: async () => {
-				await this.beforeMutation?.({
-					phase: context.phase,
-					ordinal,
-					kind: "write",
-					path: target.absolutePath,
-				});
-			},
+			...(this.beforeMutation === undefined ? {} : {
+				beforeInstall: async () => {
+					await this.beforeMutation?.({
+						phase: context.phase,
+						ordinal,
+						kind: "write",
+						path: target.absolutePath,
+					});
+				},
+			}),
 		};
 	}
 
@@ -983,6 +1335,7 @@ export class RestoreEngine {
 		topology: RootTopology,
 		allowedManifests: readonly SnapshotManifest[],
 		mutationJournal?: MutationJournal,
+		extraExclusions: readonly string[] = [],
 	): Promise<void> {
 		if (allowedManifests.some((manifest) => manifest.coverage !== "complete")) {
 			return;
@@ -1000,8 +1353,12 @@ export class RestoreEngine {
 			}
 		}
 
+		const exclusions = new Set(extraExclusions);
+		if (mutationJournal !== undefined) {
+			for (const path of await mutationJournal.activeArtifacts()) exclusions.add(path);
+		}
 		const livePaths = await this.store.listVisibleLeafPaths(topology, {
-			excludePaths: mutationJournal === undefined ? undefined : [...await mutationJournal.activeArtifacts()],
+			excludePaths: exclusions.size === 0 ? undefined : [...exclusions],
 		});
 		for (const path of livePaths) {
 			if (!allowedPaths.has(path)) {
@@ -1445,6 +1802,14 @@ async function mapConcurrentOrdered<T, R>(
 	await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, () => worker()));
 	if (failed) throw failure;
 	return results;
+}
+
+function durablePairKey(
+	currentManifestId: ManifestId,
+	targetManifestId: ManifestId,
+	scopePaths: readonly string[],
+): string {
+	return `${currentManifestId}\0${targetManifestId}\0${checksum(canonicalJson([...scopePaths].sort(comparePaths)))}`;
 }
 
 function hasErrorCode(error: unknown, code: string): error is NodeJS.ErrnoException {

@@ -31,6 +31,10 @@ export interface JournalPhaseOptions {
 	readonly observedLogicalLeaf?: string | null;
 }
 
+export interface JournalPhaseTransition extends JournalPhaseOptions {
+	readonly phase: JournalPhase;
+}
+
 export type CursorMarkerInspection =
 	| { readonly kind: "absent" }
 	| { readonly kind: "match"; readonly needsTrailingNewline: boolean }
@@ -75,16 +79,31 @@ export class JournalStore {
 	}
 
 	async setPhase(opId: string, phase: JournalPhase, options: JournalPhaseOptions = {}): Promise<void> {
+		await this.setPhases(opId, [{ phase, ...options }]);
+	}
+
+	async setPhases(opId: string, transitions: readonly JournalPhaseTransition[]): Promise<void> {
+		if (transitions.length === 0) throw new Error("journal phase group 不能为空");
 		const pending = await this.load(opId);
-		if (!canTransition(pending.state.phase, phase)) {
-			throw new Error(`journal phase 不能回退或跳跃：${pending.state.phase} -> ${phase}`);
+		let phase = pending.state.phase;
+		let observedLogicalLeaf = pending.state.observedLogicalLeaf;
+		for (const transition of transitions) {
+			if (!canTransition(phase, transition.phase)) {
+				throw new Error(`journal phase 不能回退或跳跃：${phase} -> ${transition.phase}`);
+			}
+			phase = transition.phase;
+			if (transition.observedLogicalLeaf !== undefined) {
+				observedLogicalLeaf = transition.observedLogicalLeaf;
+			}
 		}
-		const observedLogicalLeaf = options.observedLogicalLeaf === undefined
-			? pending.state.observedLogicalLeaf
-			: options.observedLogicalLeaf;
 		await writeJsonAtomic(
 			join(this.operationDirectory(opId), "state.json"),
-			makeState(pending.descriptor, phase, pending.state.revision + 1, observedLogicalLeaf),
+			makeState(
+				pending.descriptor,
+				phase,
+				pending.state.revision + transitions.length,
+				observedLogicalLeaf,
+			),
 		);
 	}
 
@@ -112,6 +131,14 @@ export class JournalStore {
 			}
 		}
 		return result;
+	}
+
+	async assertLogicalCommitReady(opId: string, allowPendingMutations = false): Promise<void> {
+		if (!allowPendingMutations) await this.mutationJournal(opId).assertCleaned();
+		const pending = await this.load(opId);
+		if (pending.state.phase !== "CURSOR_COMMITTED") {
+			throw new Error("durable transaction 只能从 CURSOR_COMMITTED 开始 finalization");
+		}
 	}
 
 	async markCommitted(opId: string): Promise<void> {

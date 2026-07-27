@@ -12,9 +12,11 @@ import {
 	type ControllerDependencies,
 	type ControllerInitialState,
 } from "./controller.ts";
+import { finalizeDurablePack, hasDurablePack, loadDurablePack } from "./durable-pack.ts";
 import { assertCursor, canonicalJson, checksum } from "./encoding.ts";
 import { JournalStore, finalizeCursorMarker, inspectCursorMarkers } from "./journal.ts";
 import type { CheckpointRecord, ManifestId, SessionFileIdentity } from "./model.ts";
+import { cleanupPackedMutations, recoverPackedMutations } from "./packed-recovery.ts";
 import { JournalRecovery } from "./recovery.ts";
 import { QuarantineManager } from "./quarantine.ts";
 import { RestoreEngine } from "./restore-engine.ts";
@@ -58,8 +60,26 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 		),
 		recoverMutations: async (pending, decision) => {
 			const mutationJournal = journal.mutationJournal(pending.descriptor.opId);
+			if (await hasDurablePack(mutationJournal)) {
+				const result = await recoverPackedMutations({
+					workspaceRoot: context.cwd,
+					journal: mutationJournal,
+					planDigest: pending.descriptor.planDigest,
+					decision,
+					retainArtifacts: decision === "roll_forward",
+				});
+				if (result.kind === "clean" && decision === "roll_forward") {
+					await finalizeDurablePack(mutationJournal, context.cwd);
+					await cleanupPackedMutations({
+						workspaceRoot: context.cwd,
+						journal: mutationJournal,
+						planDigest: pending.descriptor.planDigest,
+					});
+				}
+				return result;
+			}
 			const quarantine = new QuarantineManager({ workspaceRoot: context.cwd, journal: mutationJournal });
-				try {
+			try {
 				const loaded = await mutationJournal.load();
 				const scopePaths = pending.descriptor.scopePaths;
 				if (loaded.some((record) => !scopePaths.some((scope) =>
@@ -95,9 +115,60 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 		applyRestore: (plan, target, operation) => restore.apply(plan, target, {
 			opId: operation.opId,
 			mutationJournal: journal.mutationJournal(operation.opId),
+			forceTargetArtifactSync: true,
 		}),
 		settle: (opId, phase) => journal.settleRecovery(opId, phase),
 	});
+
+	let finalizationQueue: Promise<void> = Promise.resolve();
+	let finalizationFailure: unknown;
+	const waitForFinalization = async (): Promise<void> => {
+		await finalizationQueue;
+		if (finalizationFailure !== undefined) throw finalizationFailure;
+	};
+	const scheduleFinalization = (opId: string): void => {
+		finalizationQueue = finalizationQueue.then(async () => {
+			const lease = await workspaceLock.acquire(initialTopology.workspaceIdentity);
+			try {
+				const mutationJournal = journal.mutationJournal(opId);
+				const pack = await loadDurablePack(mutationJournal, undefined, true);
+				const recovered = await recoverPackedMutations({
+					workspaceRoot: context.cwd,
+					journal: mutationJournal,
+					planDigest: pack.planDigest,
+					decision: "roll_forward",
+					retainArtifacts: true,
+				});
+				if (recovered.kind !== "clean") throw new Error("durable finalization mutation conflict");
+				await finalizeDurablePack(mutationJournal, context.cwd);
+				await cleanupPackedMutations({
+					workspaceRoot: context.cwd,
+					journal: mutationJournal,
+					planDigest: pack.planDigest,
+				});
+				await journal.markCommitted(opId);
+			} finally {
+				await lease.release();
+			}
+		}).catch((error: unknown) => {
+			finalizationFailure = error;
+		});
+	};
+	const transactionJournal: ControllerDependencies["journal"] = {
+		prepare: (descriptor, plan) => journal.prepare(descriptor, plan),
+		setPhase: (opId, phase, options) => journal.setPhase(opId, phase, options),
+		setPhases: (opId, transitions) => journal.setPhases(opId, transitions),
+		markCommitted: async (opId) => {
+			const mutationJournal = journal.mutationJournal(opId);
+			if (!await hasDurablePack(mutationJournal)) {
+				await journal.markCommitted(opId);
+				return;
+			}
+			await journal.assertLogicalCommitReady(opId, true);
+			scheduleFinalization(opId);
+		},
+		loadPending: () => journal.loadPending(),
+	};
 
 	const dependencies: ControllerDependencies = {
 		workspaceIdentity: initialTopology.workspaceIdentity,
@@ -106,7 +177,10 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 		abortAgent: async () => { context.abort(); },
 		waitForIdle: async (deadlineMs) => waitForIdle(commandContext, deadlineMs),
 		getLogicalLeafId: () => sessionStateFor(manager).getLogicalLeafId(),
-		acquireWorkspaceLock: () => workspaceLock.acquire(initialTopology.workspaceIdentity),
+		acquireWorkspaceLock: async () => {
+			await waitForFinalization();
+			return workspaceLock.acquire(initialTopology.workspaceIdentity);
+		},
 		findUserEntryAfter: (startEntryId) => findUserEntryAfter(manager, startEntryId),
 		resolveSessionTarget: (action, checkpoint) => action === "undo"
 			? logicalLeafAt(manager, entryParent(manager, checkpoint.userEntryId))
@@ -136,18 +210,32 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 		appendControl: async (customType, data) => appendControlEntry(pi, manager, customType, data),
 		appendCursor: async (cursor) => cursorWriter.appendCursor(cursor, pi, sourceFor(manager)),
 		capture,
+		captureSafety: async (referenceManifestId, targetManifestId, scopePaths) => {
+			const [reference, target] = await Promise.all([
+				store.loadManifest(referenceManifestId),
+				store.loadManifest(targetManifestId),
+			]);
+			if (await restore.canReuseDurableSource(reference, target, scopePaths)) return reference;
+			return capture(scopePaths);
+		},
 		changedPaths: async (before, after) => {
 			const plan = await restore.plan(before, after);
 			return [...new Set([...plan.deletePaths, ...plan.writePaths])].sort();
 		},
 		loadManifest: (manifestId) => store.loadManifest(manifestId),
 		planRestore: (current, target, scopePaths) => restore.plan(current, target, scopePaths),
+		prepareDurableRestore: (current, target, scopePaths) =>
+			restore.prepareDurableRestore(current, target, scopePaths),
 		applyRestore: (plan, target, operation) => restore.apply(plan, target, {
 			opId: operation.opId,
 			mutationJournal: journal.mutationJournal(operation.opId),
+			deferDurability: true,
 		}),
-		recoverPending: () => workspaceLock.withLock(initialTopology.workspaceIdentity, () => recovery.recover()),
-		journal,
+		recoverPending: async () => {
+			await waitForFinalization();
+			return workspaceLock.withLock(initialTopology.workspaceIdentity, () => recovery.recover());
+		},
+		journal: transactionJournal,
 		clock: Date.now,
 	};
 	const startupRecovery = await workspaceLock.withLock(

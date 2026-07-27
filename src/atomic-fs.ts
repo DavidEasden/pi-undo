@@ -99,13 +99,13 @@ export async function writeBytesExclusive(
 	file: string,
 	bytes: Uint8Array,
 	mode: number,
-	options: { readonly syncDirectory?: boolean } = {},
+	options: { readonly syncDirectory?: boolean; readonly syncFile?: boolean } = {},
 ): Promise<void> {
 	const handle = await open(file, "wx", mode);
 	try {
 		await handle.writeFile(Buffer.from(bytes));
 		await handle.chmod(mode);
-		await handle.sync();
+		if (options.syncFile !== false) await handle.sync();
 	} finally {
 		await handle.close();
 	}

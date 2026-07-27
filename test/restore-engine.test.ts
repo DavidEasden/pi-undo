@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { hasDurablePack } from "../src/durable-pack.ts";
 import { canonicalJson, checksum, topologyFingerprint } from "../src/encoding.ts";
 import { MutationJournal } from "../src/mutation-journal.ts";
 import { RestoreEngine, type RestoreMutation } from "../src/restore-engine.ts";
@@ -368,6 +369,67 @@ describe("RestoreEngine", () => {
 			code: "ENOENT",
 		});
 		expect(await readFile(join(repository.root, "managed-dir/ignored.txt"), "utf8")).toBe("preserve-me\n");
+	});
+
+	it("native 不可用时预生成 pack 自动回退 TypeScript durability", async () => {
+		const workspace = await temporaryRoot("pi-undo-native-fallback-workspace-");
+		await writeFile(workspace, "a.txt", "target\n");
+		const storeRoot = await temporaryRoot("pi-undo-native-fallback-store-");
+		const transactionRoot = await temporaryRoot("pi-undo-native-fallback-transaction-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "a.txt", "source\n");
+		const current = await store.capture(await discovery.discover(workspace), ["a.txt"]);
+		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+		await engine.prepareDurableRestore(current, target, ["a.txt"]);
+		const plan = await engine.plan(current, target, ["a.txt"]);
+		const journal = new MutationJournal(join(transactionRoot, "mutations.jsonl"), "native-fallback-1");
+		vi.stubEnv("PI_UNDO_DISABLE_NATIVE", "1");
+		try {
+			const result = await engine.apply(plan, target, {
+				opId: journal.operationId,
+				mutationJournal: journal,
+				deferDurability: true,
+			});
+			expect(result.code).toBe("ok");
+			expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("target\n");
+			expect(await journal.assertCleaned()).toBeUndefined();
+			expect(await hasDurablePack(journal)).toBe(false);
+		} finally {
+			vi.unstubAllEnvs();
+		}
+	});
+
+	it("预生成 cache pack 被改写时在 mutation 前回退 TypeScript", async () => {
+		const workspace = await temporaryRoot("pi-undo-cache-tamper-workspace-");
+		await writeFile(workspace, "a.txt", "target\n");
+		const storeRoot = await temporaryRoot("pi-undo-cache-tamper-store-");
+		const transactionRoot = await temporaryRoot("pi-undo-cache-tamper-transaction-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "a.txt", "source\n");
+		const current = await store.capture(await discovery.discover(workspace), ["a.txt"]);
+		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+		await engine.prepareDurableRestore(current, target, ["a.txt"]);
+		const plan = await engine.plan(current, target, ["a.txt"]);
+		await import("node:fs/promises").then(({ writeFile }) => writeFile(
+			join(storeRoot, "durable-cache", plan.planDigest, "durable-pack-v1.bin"),
+			"tampered pack",
+		));
+		expect(await engine.canReuseDurableSource(current, target, ["a.txt"])).toBe(false);
+		const journal = new MutationJournal(join(transactionRoot, "mutations.jsonl"), "cache-tamper-1");
+
+		const result = await engine.apply(plan, target, {
+			opId: journal.operationId,
+			mutationJournal: journal,
+			deferDurability: true,
+		});
+		expect(result.code).toBe("ok");
+		expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("target\n");
+		expect(await journal.assertCleaned()).toBeUndefined();
+		expect(await hasDurablePack(journal)).toBe(false);
 	});
 
 	it("target ignored-present proof 保留 current-only 叶子但不豁免真实删除", async () => {

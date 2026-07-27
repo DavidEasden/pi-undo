@@ -15,7 +15,7 @@ Each completed agent run creates a checkpoint that captures both the Pi session 
 - **External concurrency detection** — file fingerprint and inode checks detect external modification. Conflicting changes are never silently overwritten; the system fails closed or enters `recovery required`.
 - **No Git workflow** — snapshots use a private object database. No `git commit`, `git stash`, `git reset`, branches, or forges are required.
 - **Nested repositories** and **initialized submodules** are handled as independent roots. Their `.git` metadata is never modified.
-- **Performance** — batch WAL operations (up to 128 files per batch), parallel target artifact I/O (32 concurrent), concurrent request preparation (32 concurrent scoped blob reads plus fingerprint computation), scoped safety snapshots, and batch multi-file deletes keep restore fast at scale.
+- **Performance** — batch WAL operations (up to 1,024 files per batch), scoped safety snapshots, prebuilt durable transaction packs, and an optional precompiled native regular-file helper keep restore fast at scale. Unsupported platforms and failed integrity checks automatically use the TypeScript path.
 
 ## Requirements
 
@@ -123,7 +123,10 @@ ok files:104 total:~1050ms apply:~850ms capture:~90ms journal:~65ms
 
 Performance gains come from:
 
-- **Batch WAL durability** — write-once, fsync-once per batch of up to 128 entries instead of per-file.
+- **Batch WAL durability** — write-once, fsync-once per batch of up to 1,024 entries instead of per-file.
+- **Durable transaction packs** — source and target variants, fingerprints, modes, artifact names, and checksums are published and fsynced before native workspace mutation.
+- **Prebuilt reverse/forward packs** — completed agent runs prepare both directions and pin their manifests outside the undo/redo command hot path.
+- **Optional native helper** — verified regular-file batches use platform no-clobber primitives while retaining same-inode ownership artifacts; missing binaries or failed validation fall back before mutation.
 - **Scoped safety snapshots** — only paths recorded in a checkpoint's `changedPaths` are snapshotted for undo/redo, not the entire workspace.
 - **Parallel target I/O** — up to 32 target artifact files are written and synced concurrently.
 - **Concurrent request preparation** — blob reads, live-state checks, and fingerprint computation run at 32-wide concurrency.
@@ -148,8 +151,8 @@ Snapshots use a private Git object database and a temporary Git index. They neve
 The restore flow is:
 
 1. Validate current session, workspace topology, and target manifest.
-2. Write a durable WAL (`INTENT`) before changing any files.
-3. Capture a safety or rescue snapshot when required.
+2. Establish mutation authority before changing files: either durable JSON `INTENT` records on the TypeScript path or a complete fsynced transaction pack on the native path.
+3. Capture a safety snapshot when content differs from the preverified checkpoint source; otherwise reuse the pinned checkpoint manifest.
 4. Move the Pi session cursor to the target boundary.
 5. Restore workspace paths with fingerprint and inode checks and no-clobber installation.
 6. Verify the resulting session and workspace before committing the journal (`TARGET_VERIFIED` → `CLEANED`).
@@ -169,9 +172,9 @@ INTENT → SOURCE_QUARANTINED → SOURCE_VERIFIED → TARGET_INSTALLED → TARGE
 - **TARGET_VERIFIED** — workspace confirmed matching target state.
 - **CLEANED** — source and target artifacts removed.
 
-Batch operations (`beginMany`, `advanceBatch`) maintain the same per-file six-state contract while reducing physical fsync calls by grouping entries.
+Batch operations (`beginMany`, `advanceBatch`) maintain the same per-file six-state contract while reducing physical fsync calls by grouping entries. On the native path, the transaction pack is the pre-mutation `INTENT` authority; finalization or startup recovery materializes the same six per-file states into the append-only WAL before cleanup.
 
-Every record is checksum-linked to its predecessor. The journal is append-only and never mutated in place.
+Every WAL record is checksum-linked to its predecessor. The journal is append-only and never mutated in place. Native finalization advances through `TARGET_VERIFIED`, fsyncs the installed inode while its ownership marker is still present, then removes exact artifacts and appends `CLEANED`.
 
 ### Quarantine and External Concurrency
 
@@ -198,7 +201,7 @@ When `recovery_required` appears, first back up the workspace and Pi session JSO
 <sessionDir>/.pi-undo/transactions/
 ```
 
-A transaction directory may contain `descriptor.json`, `restore-plan.json`, `state.json`, and the mutation journal. Do not delete `.pi-undo` without a backup: unresolved quarantine artifacts may be the only surviving copy of a file version.
+A transaction directory may contain `descriptor.json`, `restore-plan.json`, `state.json`, `mutations.jsonl`, `durable-pack-v1.bin`, and a native helper request. Do not delete `.pi-undo` without a backup: unresolved packs or quarantine artifacts may be the only surviving copy of a file version.
 
 ## Limitations
 
@@ -235,6 +238,9 @@ src/
   journal.ts                 Transaction journal (session/descriptor/phase)
   model.ts                   Core types: manifest, root, session, plan
   mutation-journal.ts        WAL mutation journal (hash chain, batch ops)
+  durable-pack.ts            Pre-mutation source/target authority and finalization
+  native-restore.ts          Optional platform helper adapter with TypeScript fallback
+  packed-recovery.ts         Pack-to-WAL rollback/roll-forward recovery
   path-safety.ts             Symlink escape, relative path safety
   pi-runtime.ts              Pi integration layer (session/extension bridge)
   quarantine.ts              File isolation, no-clobber install, external concurrency
@@ -245,13 +251,16 @@ src/
   snapshot-store.ts          Git-backed content-addressed snapshot store
   status-reporter.ts         Phase timing and footer status
   workspace-lock.ts          Cross-instance workspace lock
+native/pi-undo-fs/           Rust no-clobber regular-file helper
+native/bin/                  Precompiled platform binaries included in release packages
 test/                        Unit, integration, recovery, and fault-injection tests
 ```
 
 ### Testing
 
 ```bash
-npm test                  # Full test suite (381+ tests)
+npm test                  # Full test suite (400+ tests)
+npm run test:native       # Rust helper and durable-pack recovery tests
 npm run test:watch        # Watch mode
 npm run test:integration  # Pi runtime and extension integration tests
 npm run typecheck         # TypeScript type checking

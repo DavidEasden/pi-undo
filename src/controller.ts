@@ -37,6 +37,11 @@ export interface ControllerDependencies {
 	readonly appendControl: (customType: string, data?: unknown) => Promise<string | null>;
 	readonly appendCursor: (cursor: CursorState) => Promise<CursorAppendResult>;
 	readonly capture: (scopePaths?: readonly string[]) => Promise<SnapshotManifest>;
+	readonly captureSafety?: (
+		referenceManifestId: ManifestId,
+		targetManifestId: ManifestId,
+		scopePaths: readonly string[],
+	) => Promise<SnapshotManifest>;
 	readonly changedPaths: (before: SnapshotManifest, after: SnapshotManifest) => Promise<readonly string[]>;
 	readonly loadManifest: (id: ManifestId) => Promise<SnapshotManifest>;
 	readonly planRestore: (
@@ -44,6 +49,11 @@ export interface ControllerDependencies {
 		target: SnapshotManifest,
 		scopePaths?: readonly string[],
 	) => Promise<RestorePlan>;
+	readonly prepareDurableRestore?: (
+		current: SnapshotManifest,
+		target: SnapshotManifest,
+		scopePaths: readonly string[],
+	) => Promise<void>;
 	readonly applyRestore: (
 		plan: RestorePlan,
 		target: SnapshotManifest,
@@ -64,6 +74,13 @@ export interface JournalPort {
 		opId: string,
 		phase: "SESSION_MOVED" | "APPLYING" | "FILES_VERIFIED" | "CURSOR_COMMITTED" | "ABORTING" | "ABORTED" | "RECOVERY_REQUIRED",
 		options?: { readonly observedLogicalLeaf?: string | null },
+	): Promise<void>;
+	setPhases?(
+		opId: string,
+		transitions: ReadonlyArray<{
+			readonly phase: Parameters<JournalPort["setPhase"]>[1];
+			readonly observedLogicalLeaf?: string | null;
+		}>,
 	): Promise<void>;
 	markCommitted(opId: string): Promise<void>;
 	loadPending(): Promise<readonly unknown[]>;
@@ -247,6 +264,12 @@ export class UndoControllerImpl implements UndoController {
 		try {
 			const after = await this.captureWithWorkspaceLock();
 			const changedPaths = await this.dependencies.changedPaths(staged.before, after);
+			if (changedPaths.length > 0 && this.dependencies.prepareDurableRestore !== undefined) {
+				await Promise.all([
+					this.dependencies.prepareDurableRestore(staged.before, after, changedPaths),
+					this.dependencies.prepareDurableRestore(after, staged.before, changedPaths),
+				]).catch(() => {});
+			}
 			const endLeafId = this.dependencies.getLogicalLeafId() ?? staged.startEntryId;
 			const checkpoint = this.createCheckpoint(staged, after, changedPaths, userEntryId, endLeafId);
 			const checkpointEntryId = await this.dependencies.appendControl("pi-undo:checkpoint", checkpoint);
@@ -326,10 +349,10 @@ export class UndoControllerImpl implements UndoController {
 				await this.dependencies.journal.setPhase(pending.descriptor.opId, "RECOVERY_REQUIRED");
 				return;
 			}
-			await this.dependencies.journal.setPhase(pending.descriptor.opId, "SESSION_MOVED", {
-				observedLogicalLeaf: event.newLeafId,
-			});
-			await this.dependencies.journal.setPhase(pending.descriptor.opId, "APPLYING");
+			await this.setJournalPhases(pending.descriptor.opId, [
+				{ phase: "SESSION_MOVED", observedLogicalLeaf: event.newLeafId },
+				{ phase: "APPLYING" },
+			]);
 			const applied = await this.dependencies.applyRestore(
 				pending.plan,
 				pending.target,
@@ -409,10 +432,22 @@ export class UndoControllerImpl implements UndoController {
 			if (checkpoint.changedPaths.length === 0) {
 				return done(await this.runSessionOnlyOperation(action, checkpoint, targetManifestId, profile));
 			}
+			const restoreTargetManifestId = targetManifestId ?? (
+				action === "undo" ? checkpoint.beforeManifestId : checkpoint.afterManifestId
+			);
+			const referenceManifestId = action === "undo"
+				? checkpoint.afterManifestId
+				: checkpoint.beforeManifestId;
 			let rollback: SnapshotManifest;
 			try {
 				rollback = await profile.measure("capture", () =>
-					this.dependencies.capture(checkpoint.changedPaths));
+					this.dependencies.captureSafety === undefined
+						? this.dependencies.capture(checkpoint.changedPaths)
+						: this.dependencies.captureSafety(
+							referenceManifestId,
+							restoreTargetManifestId,
+							checkpoint.changedPaths,
+						));
 			} catch {
 				return done({ code: "capture_failed", changedFiles: 0 });
 			}
@@ -420,9 +455,8 @@ export class UndoControllerImpl implements UndoController {
 			let plan: RestorePlan;
 			let targetLogicalLeaf: string | null;
 			try {
-				target = await profile.measure("load", () => this.dependencies.loadManifest(
-					targetManifestId ?? (action === "undo" ? checkpoint.beforeManifestId : checkpoint.afterManifestId),
-				));
+				target = await profile.measure("load", () =>
+					this.dependencies.loadManifest(restoreTargetManifestId));
 				plan = await profile.measure("plan", () =>
 					this.dependencies.planRestore(rollback, target, checkpoint.changedPaths));
 				targetLogicalLeaf = this.dependencies.resolveSessionTarget(action, checkpoint);
@@ -446,12 +480,10 @@ export class UndoControllerImpl implements UndoController {
 					this.dependencies.journal.setPhase(descriptor.opId, "RECOVERY_REQUIRED"));
 				return done({ code: "recovery_required", changedFiles: 0 });
 			}
-			await profile.measure("journal", async () => {
-				await this.dependencies.journal.setPhase(descriptor.opId, "SESSION_MOVED", {
-					observedLogicalLeaf: navigation.logicalLeafId,
-				});
-				await this.dependencies.journal.setPhase(descriptor.opId, "APPLYING");
-			});
+			await profile.measure("journal", () => this.setJournalPhases(descriptor.opId, [
+				{ phase: "SESSION_MOVED", observedLogicalLeaf: navigation.logicalLeafId },
+				{ phase: "APPLYING" },
+			]));
 			const applied = await profile.measure("apply", () =>
 				this.dependencies.applyRestore(plan, target, { opId: descriptor.opId }));
 			if (applied.code !== "ok") {
@@ -532,13 +564,11 @@ export class UndoControllerImpl implements UndoController {
 				this.dependencies.journal.setPhase(descriptor.opId, "RECOVERY_REQUIRED"));
 			return { code: "recovery_required", changedFiles: 0 };
 		}
-		await profile.measure("journal", async () => {
-			await this.dependencies.journal.setPhase(descriptor.opId, "SESSION_MOVED", {
-				observedLogicalLeaf: navigation.logicalLeafId,
-			});
-			await this.dependencies.journal.setPhase(descriptor.opId, "APPLYING");
-			await this.dependencies.journal.setPhase(descriptor.opId, "FILES_VERIFIED");
-		});
+		await profile.measure("journal", () => this.setJournalPhases(descriptor.opId, [
+			{ phase: "SESSION_MOVED", observedLogicalLeaf: navigation.logicalLeafId },
+			{ phase: "APPLYING" },
+			{ phase: "FILES_VERIFIED" },
+		]));
 		const cursorResult = await profile.measure("cursor", () =>
 			this.dependencies.appendCursor(this.createCursor(descriptor, action, checkpoint)));
 		if (cursorResult.kind === "recovery_required") {
@@ -570,6 +600,26 @@ export class UndoControllerImpl implements UndoController {
 			this.locked = true;
 			await this.dependencies.journal.setPhase(descriptor.opId, "RECOVERY_REQUIRED").catch(() => {});
 			return { code: "recovery_required", changedFiles: 0 };
+		}
+	}
+
+	private async setJournalPhases(
+		opId: string,
+		transitions: ReadonlyArray<{
+			readonly phase: Parameters<JournalPort["setPhase"]>[1];
+			readonly observedLogicalLeaf?: string | null;
+		}>,
+	): Promise<void> {
+		if (this.dependencies.journal.setPhases !== undefined) {
+			await this.dependencies.journal.setPhases(opId, transitions);
+			return;
+		}
+		for (const transition of transitions) {
+			await this.dependencies.journal.setPhase(opId, transition.phase, {
+				...(transition.observedLogicalLeaf === undefined
+					? {}
+					: { observedLogicalLeaf: transition.observedLogicalLeaf }),
+			});
 		}
 	}
 

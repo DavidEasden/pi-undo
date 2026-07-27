@@ -1,0 +1,107 @@
+name: Native binaries
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "native/pi-undo-fs/**"
+      - "src/durable-pack.ts"
+      - "src/native-restore.ts"
+      - ".github/workflows/native-binaries.yml"
+  pull_request:
+    paths:
+      - "native/pi-undo-fs/**"
+      - "src/durable-pack.ts"
+      - "src/native-restore.ts"
+      - ".github/workflows/native-binaries.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            output: pi-undo-fs-darwin-arm64
+          - target: x86_64-apple-darwin
+            output: pi-undo-fs-darwin-x64
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build helper
+        run: cargo build --release --locked --manifest-path native/pi-undo-fs/Cargo.toml --target "${{ matrix.target }}"
+      - name: Stage binary
+        run: |
+          mkdir -p native-artifact
+          cp "native/pi-undo-fs/target/${{ matrix.target }}/release/pi-undo-fs" "native-artifact/${{ matrix.output }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.output }}
+          path: native-artifact/${{ matrix.output }}
+
+  build-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            output: pi-undo-fs-linux-x64
+            linker: gcc
+          - target: aarch64-unknown-linux-gnu
+            output: pi-undo-fs-linux-arm64
+            linker: aarch64-linux-gnu-gcc
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install ARM64 linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build helper
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --locked --manifest-path native/pi-undo-fs/Cargo.toml --target "${{ matrix.target }}"
+      - name: Stage binary
+        run: |
+          mkdir -p native-artifact
+          cp "native/pi-undo-fs/target/${{ matrix.target }}/release/pi-undo-fs" "native-artifact/${{ matrix.output }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.output }}
+          path: native-artifact/${{ matrix.output }}
+
+  package:
+    needs: [build-macos, build-linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pi-undo-fs-*
+          path: native/bin
+          merge-multiple: true
+      - run: chmod +x native/bin/pi-undo-fs-*
+      - run: npm ci
+      - run: npm test
+      - name: Typecheck project sources
+        run: |
+          output="$(npx tsc --noEmit 2>&1 || true)"
+          filtered="$(printf '%s\n' "$output" | grep -vE 'undici-types|@modelcontextprotocol|ReadonlySessionManager|@google/genai' || true)"
+          test -z "$filtered" || { printf '%s\n' "$filtered"; exit 1; }
+      - run: npm pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: "*.tgz"
