@@ -9,6 +9,8 @@ import type { MutationJournal } from "./mutation-journal.ts";
 import type { MutationRecord } from "./model.ts";
 import { assertNoSymlinkEscape, relativeSafePath } from "./path-safety.ts";
 
+const BATCH_FILE_IO_CONCURRENCY = 32;
+
 export interface ReplaceFileRequest {
 	readonly path: string;
 	readonly targetBytes: Uint8Array;
@@ -173,7 +175,7 @@ export class QuarantineManager {
 			...replacement,
 			intent: intents[index]!,
 		}));
-		for (const replacement of replacements) {
+		const createTarget = async (replacement: PreparedFileReplacement): Promise<void> => {
 			await this.beforeTargetCreate?.();
 			await this.assertMutationPaths(replacement.request.path, replacement.targetArtifact);
 			await writeBytesExclusive(
@@ -187,6 +189,11 @@ export class QuarantineManager {
 				replacement.request.path,
 				replacement.request.targetFingerprint,
 			);
+		};
+		if (this.beforeTargetCreate === undefined) {
+			await mapConcurrentFailClosed(replacements, BATCH_FILE_IO_CONCURRENCY, createTarget);
+		} else {
+			for (const replacement of replacements) await createTarget(replacement);
 		}
 		await this.quarantineFileSources(replacements);
 		const installDirectories = new Set<string>();
@@ -207,8 +214,8 @@ export class QuarantineManager {
 		}
 		await syncDirectories(installDirectories);
 		for (const { request, targetArtifact, targetAbsolutePath } of replacements) {
-			await this.assertFingerprint(this.absolute(request.path), request.path, request.targetFingerprint);
 			await this.assertArtifactPath(request.path, targetArtifact);
+			await this.assertSameFileIdentity(this.absolute(request.path), targetAbsolutePath, request.path);
 			await this.assertFingerprint(targetAbsolutePath, request.path, request.targetFingerprint);
 		}
 		const targetRecords = await this.journal.advanceBatch(replacements.map(({ intent }) => ({
@@ -455,6 +462,7 @@ export class QuarantineManager {
 				throw new QuarantineError("unsafe_artifact", `absent source 不应存在 artifact：${owned.path}`);
 			}
 			if (originalFingerprint === owned.targetFingerprint) {
+				await this.assertRollbackTargetOwned(owned);
 				await this.assertFingerprint(original, owned.path, owned.targetFingerprint);
 				await unlink(original);
 				await fsyncDirectory(dirname(original));
@@ -485,6 +493,7 @@ export class QuarantineManager {
 			originalFingerprint === owned.targetFingerprint
 		) {
 			await this.assertMutationPaths(owned.path, owned.sourceArtifact);
+			await this.assertRollbackTargetOwned(owned);
 			await this.assertFingerprint(original, owned.path, owned.targetFingerprint);
 			await unlink(original);
 			await fsyncDirectory(dirname(original));
@@ -764,6 +773,27 @@ export class QuarantineManager {
 		}
 	}
 
+	private async assertRollbackTargetOwned(owned: MutationRecord): Promise<void> {
+		if (owned.targetArtifact === null) return;
+		const target = this.absolute(owned.targetArtifact);
+		if (!await exists(target)) return;
+		await this.assertArtifactPath(owned.path, owned.targetArtifact);
+		await this.assertFingerprint(target, owned.path, owned.targetFingerprint);
+		await this.assertSameFileIdentity(this.absolute(owned.path), target, owned.path);
+	}
+
+	private async assertSameFileIdentity(original: string, artifact: string, path: string): Promise<void> {
+		const [originalMetadata, artifactMetadata] = await Promise.all([lstat(original), lstat(artifact)]);
+		if (
+			!originalMetadata.isFile() ||
+			!artifactMetadata.isFile() ||
+			originalMetadata.dev !== artifactMetadata.dev ||
+			originalMetadata.ino !== artifactMetadata.ino
+		) {
+			throw new QuarantineError("external_concurrency", `target artifact ownership 已变化：${path}`);
+		}
+	}
+
 	private async assertFingerprint(absolutePath: string, logicalPath: string, expected: string): Promise<void> {
 		const actual = await fingerprintLeaf(absolutePath, logicalPath);
 		if (actual !== expected) {
@@ -854,6 +884,32 @@ function immutableMutation(record: MutationRecord): string {
 		sourceFingerprint: record.sourceFingerprint,
 		targetFingerprint: record.targetFingerprint,
 	});
+}
+
+async function mapConcurrentFailClosed<T>(
+	values: readonly T[],
+	concurrency: number,
+	operation: (value: T) => Promise<void>,
+): Promise<void> {
+	let nextIndex = 0;
+	let failed = false;
+	let failure: unknown;
+	async function worker(): Promise<void> {
+		while (!failed && nextIndex < values.length) {
+			const index = nextIndex;
+			nextIndex += 1;
+			try {
+				await operation(values[index]!);
+			} catch (error) {
+				if (!failed) failure = error;
+				failed = true;
+			}
+		}
+	}
+	await Promise.all(
+		Array.from({ length: Math.min(concurrency, values.length) }, () => worker()),
+	);
+	if (failed) throw failure;
 }
 
 async function syncDirectories(directories: ReadonlySet<string>): Promise<void> {

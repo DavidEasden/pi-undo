@@ -27,6 +27,7 @@ import { SnapshotStoreError, type SnapshotStore } from "./snapshot-store.ts";
 const PREPARED_PLAN_CACHE_LIMIT = 16;
 const RESTORE_FILE_BATCH_MAX_ENTRIES = 128;
 const RESTORE_FILE_BATCH_MAX_BYTES = 32 * 1024 * 1024;
+const RESTORE_FILE_PREPARE_CONCURRENCY = 32;
 
 export interface RestorePlan {
 	currentManifestId: ManifestId;
@@ -866,10 +867,15 @@ export class RestoreEngine {
 		let fileBatchRoot: string | undefined;
 		const flushFiles = async (): Promise<void> => {
 			if (fileBatch.length === 0) return;
-			const requests: ReplaceFileRequest[] = [];
-			for (const target of fileBatch) {
-				requests.push(await this.prepareFileReplacement(manifestId, target, context));
-			}
+			const pending = fileBatch.map((target) => {
+				context.ordinal += 1;
+				return { target, ordinal: context.ordinal };
+			});
+			const requests = await mapConcurrentOrdered(
+				pending,
+				RESTORE_FILE_PREPARE_CONCURRENCY,
+				({ target, ordinal }) => this.prepareFileReplacement(manifestId, target, context, ordinal),
+			);
 			await context.quarantine.replaceFiles(requests);
 			fileBatch = [];
 			fileBatchBytes = 0;
@@ -912,6 +918,7 @@ export class RestoreEngine {
 		manifestId: ManifestId,
 		target: OwnedPath,
 		context: MutationContext,
+		ordinal: number,
 	): Promise<ReplaceFileRequest> {
 		if (target.entry.kind !== "file" || target.entry.blobId === null) {
 			throw new Error(`批量普通文件缺少 blob：${target.absolutePath}`);
@@ -925,8 +932,6 @@ export class RestoreEngine {
 		if (bytes.byteLength !== target.entry.size) {
 			throw new Error(`普通文件 blob 大小不匹配：${target.absolutePath}`);
 		}
-		context.ordinal += 1;
-		const ordinal = context.ordinal;
 		await this.assertMutationPath(target.absolutePath);
 		await this.assertMutationState(context, "write", target.absolutePath);
 		return {
@@ -1414,6 +1419,32 @@ function hasValidPlanDigest(plan: RestorePlan): boolean {
 	} catch {
 		return false;
 	}
+}
+
+async function mapConcurrentOrdered<T, R>(
+	values: readonly T[],
+	concurrency: number,
+	operation: (value: T) => Promise<R>,
+): Promise<R[]> {
+	const results: R[] = new Array(values.length);
+	let nextIndex = 0;
+	let failed = false;
+	let failure: unknown;
+	async function worker(): Promise<void> {
+		while (!failed && nextIndex < values.length) {
+			const index = nextIndex;
+			nextIndex += 1;
+			try {
+				results[index] = await operation(values[index]!);
+			} catch (error) {
+				if (!failed) failure = error;
+				failed = true;
+			}
+		}
+	}
+	await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, () => worker()));
+	if (failed) throw failure;
+	return results;
 }
 
 function hasErrorCode(error: unknown, code: string): error is NodeJS.ErrnoException {

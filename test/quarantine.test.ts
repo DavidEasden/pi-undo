@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, readlink, readdir, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -48,6 +48,70 @@ describe("QuarantineManager", () => {
 		const artifacts = await manager.inspectArtifacts();
 		expect(artifacts).toContainEqual(expect.objectContaining({ role: "source", fingerprint: expect.any(String) }));
 		expect(artifacts).toContainEqual(expect.objectContaining({ role: "target", fingerprint: expect.any(String) }));
+	});
+
+	it("批量 target hook 失败后不调用后续 ordinal 且可由 INTENT 完整恢复", async () => {
+		const { root, journal } = await fixture();
+		let targetCreates = 0;
+		const manager = new QuarantineManager({
+			workspaceRoot: root,
+			journal,
+			beforeTargetCreate: () => {
+				targetCreates += 1;
+				if (targetCreates === 2) throw new Error("injected target failure");
+			},
+		});
+		const paths = ["a.txt", "b.txt", "c.txt"];
+		await Promise.all(paths.map((path) => writeFile(join(root, path), `old-${path}\n`)));
+		const requests = await Promise.all(paths.map(async (path) => {
+			const target = Buffer.from(`new-${path}\n`);
+			return {
+				path,
+				targetBytes: target,
+				targetMode: 0o644,
+				sourceFingerprint: await fingerprintFile(join(root, path), path),
+				targetFingerprint: fingerprintBytes(path, target, 0o644),
+			};
+		}));
+
+		await expect(manager.replaceFiles(requests)).rejects.toThrow("injected target failure");
+		expect(targetCreates).toBe(2);
+		for (const record of [...await journal.load()].reverse()) {
+			if (record.state !== "CLEANED") await manager.restoreMutation(record);
+		}
+
+		expect(await journal.assertCleaned()).toBeUndefined();
+		for (const path of paths) expect(await readFile(join(root, path), "utf8")).toBe(`old-${path}\n`);
+		expect(await manager.inspectArtifacts()).toEqual([]);
+	});
+
+	it("批量安装后同 fingerprint 外部 inode 冲突时 rollback 保留外部目录项", async () => {
+		const { root, journal } = await fixture();
+		const path = join(root, "a.txt");
+		const target = Buffer.from("target\n");
+		await writeFile(path, "source\n", { mode: 0o644 });
+		const manager = new QuarantineManager({
+			workspaceRoot: root,
+			journal,
+			linkFile: async (source, destination) => {
+				await link(source, destination);
+				await unlink(destination);
+				await writeFile(destination, target, { mode: 0o644 });
+			},
+		});
+
+		await expect(manager.replaceFiles([{
+			path: "a.txt",
+			targetBytes: target,
+			targetMode: 0o644,
+			sourceFingerprint: await fingerprintFile(path, "a.txt"),
+			targetFingerprint: fingerprintBytes("a.txt", target, 0o644),
+		}])).rejects.toThrow("ownership 已变化");
+		const record = (await journal.load())[0]!;
+		await expect(manager.restoreMutation(record)).rejects.toThrow("ownership 已变化");
+
+		expect(await readFile(path, "utf8")).toBe("target\n");
+		expect(await journal.activeArtifacts()).toEqual(new Set([record.sourceArtifact, record.targetArtifact!]));
 	});
 
 	it("普通文件替换使用 no-clobber 安装并保留可恢复 source", async () => {
@@ -546,11 +610,16 @@ describe("QuarantineManager", () => {
 		} else {
 			await writeFile(join(root, sourceArtifact), source, { mode: 0o644 });
 		}
-		if (state === "TARGET_INSTALLED" || state === "TARGET_VERIFIED") {
-			await writeFile(join(root, path), target, { mode: 0o644 });
-		}
-		if (state !== "TARGET_VERIFIED") {
+		if (state === "TARGET_INSTALLED") {
 			await writeFile(join(root, targetArtifact), target, { mode: 0o644 });
+			await link(join(root, targetArtifact), join(root, path));
+		} else {
+			if (state === "TARGET_VERIFIED") {
+				await writeFile(join(root, path), target, { mode: 0o644 });
+			}
+			if (state !== "TARGET_VERIFIED") {
+				await writeFile(join(root, targetArtifact), target, { mode: 0o644 });
+			}
 		}
 		let record = await journal.begin({
 			kind: "write",
