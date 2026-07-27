@@ -109,6 +109,46 @@ describe("undo/redo restore performance", () => {
 		}
 	}, 120_000);
 
+	it("一百文件 delete apply 使用 batch WAL 并恢复为空状态", async () => {
+		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-delete-perf-"));
+		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-delete-perf-store-"));
+		const journalRoot = await mkdtemp(join(tmpdir(), "pi-undo-delete-perf-journal-"));
+		try {
+			const git = new CountingGitRunner();
+			const discovery = new RootDiscovery(git);
+			const store = new SnapshotStore({ storeRoot, git, discovery });
+			const restore = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+			const topology = await discovery.discover(workspace);
+			const target = await store.capture(topology);
+			await mkdir(join(workspace, "src"));
+			const files = Array.from(
+				{ length: 100 },
+				(_, index) => `src/file-${String(index).padStart(3, "0")}.txt`,
+			);
+			await Promise.all(files.map((path, index) => writeFile(join(workspace, path), `created ${index}\n`)));
+			const scope = ["src", ...files];
+			const current = await store.capture(topology, scope);
+			const plan = await restore.plan(current, target, scope);
+			git.calls.length = 0;
+			const journalPath = join(journalRoot, "mutations.jsonl");
+			const journal = new MutationJournal(journalPath, "op-delete-performance");
+
+			const result = await restore.apply(plan, target, {
+				opId: "op-delete-performance",
+				mutationJournal: journal,
+			});
+
+			expect(result.code).toBe("ok");
+			await expect(readFile(join(workspace, files[0]!))).rejects.toMatchObject({ code: "ENOENT" });
+			expect(git.calls.length).toBeLessThanOrEqual(12);
+			expect((await readFile(journalPath, "utf8")).split("\n").filter(Boolean)).toHaveLength(100 * 6);
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+			await rm(journalRoot, { recursive: true, force: true });
+		}
+	}, 120_000);
+
 	it("scoped restore 的 Git 调用数不随未改动文件线性增长", async () => {
 		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-perf-"));
 		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-perf-store-"));

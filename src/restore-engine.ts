@@ -19,6 +19,7 @@ import {
 	fingerprintAbsent,
 	fingerprintBytes,
 	fingerprintSymlink,
+	type DeleteLeafRequest,
 	type ReplaceFileRequest,
 } from "./quarantine.ts";
 import { SnapshotStoreError, type SnapshotStore } from "./snapshot-store.ts";
@@ -393,12 +394,12 @@ export class RestoreEngine {
 			quarantine,
 		};
 		try {
-			for (const path of plan.deletePaths) {
-				if (await this.pathIsShadowedByTarget(target.manifestId, path, targetPaths)) {
-					continue;
-				}
-				await this.deletePath(path, mutationContext);
-			}
+			await this.deletePlannedPaths(
+				target.manifestId,
+				targetPaths,
+				plan.deletePaths,
+				mutationContext,
+			);
 			await this.writePlannedPaths(target.manifestId, targetPaths, plan.writePaths, mutationContext);
 
 			const topologyAfter = await this.discovery.discover(this.workspaceRoot);
@@ -537,6 +538,63 @@ export class RestoreEngine {
 			verifiedPaths += 1;
 		}
 		return { ok: true, verifiedPaths, totalPaths: paths.length };
+	}
+
+	private async deletePlannedPaths(
+		targetManifestId: ManifestId,
+		targetPaths: ReadonlyMap<string, OwnedPath>,
+		deletePaths: readonly string[],
+		context: MutationContext,
+	): Promise<void> {
+		let fileBatch: OwnedPath[] = [];
+		let fileBatchRoot: string | undefined;
+		const flushFiles = async (): Promise<void> => {
+			if (fileBatch.length === 0) return;
+			const requests: DeleteLeafRequest[] = [];
+			for (const source of fileBatch) {
+				context.ordinal += 1;
+				const ordinal = context.ordinal;
+				await this.beforeMutation?.({
+					phase: context.phase,
+					ordinal,
+					kind: "delete",
+					path: source.absolutePath,
+				});
+				await this.assertMutationPath(source.absolutePath);
+				await this.assertMutationState(context, "delete", source.absolutePath);
+				requests.push({
+					path: source.absolutePath,
+					sourceFingerprint: await this.expectedMutationFingerprint(context, source.absolutePath),
+					targetFingerprint: fingerprintAbsent(source.absolutePath),
+				});
+			}
+			await context.quarantine.deleteFiles(requests);
+			fileBatch = [];
+			fileBatchRoot = undefined;
+		};
+		for (const path of deletePaths) {
+			if (await this.pathIsShadowedByTarget(targetManifestId, path, targetPaths)) continue;
+			const source = context.sourcePaths.get(path);
+			const live = await lstat(this.absolutePath(path)).catch((error) => {
+				if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ENOTDIR")) return null;
+				throw error;
+			});
+			if (live === null) continue;
+			if (source?.entry.kind !== "file" || live.isSymbolicLink() || !live.isFile()) {
+				await flushFiles();
+				await this.deletePath(path, context);
+				continue;
+			}
+			if (
+				fileBatch.length > 0 &&
+				(fileBatchRoot !== source.root.relativeRoot || fileBatch.length >= RESTORE_FILE_BATCH_MAX_ENTRIES)
+			) {
+				await flushFiles();
+			}
+			fileBatch.push(source);
+			fileBatchRoot = source.root.relativeRoot;
+		}
+		await flushFiles();
 	}
 
 	private async deletePath(path: string, context: MutationContext): Promise<void> {
@@ -690,12 +748,12 @@ export class RestoreEngine {
 					journal: options.mutationJournal,
 				}),
 			};
-			for (const path of rollbackPlan.deletePaths) {
-				if (await this.pathIsShadowedByTarget(current.manifestId, path, currentPaths)) {
-					continue;
-				}
-				await this.deletePath(path, context);
-			}
+			await this.deletePlannedPaths(
+				current.manifestId,
+				currentPaths,
+				rollbackPlan.deletePaths,
+				context,
+			);
 			await this.writePlannedPaths(current.manifestId, currentPaths, rollbackPlan.writePaths, context);
 			const topologyAfter = await this.discovery.discover(this.workspaceRoot);
 			assertUnchangedTopology(topologyBefore, topologyAfter);

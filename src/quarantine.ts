@@ -232,7 +232,9 @@ export class QuarantineManager {
 		})));
 	}
 
-	private async quarantineFileSources(replacements: readonly PreparedFileReplacement[]): Promise<void> {
+	private async quarantineFileSources(
+		replacements: readonly { readonly intent: MutationRecord }[],
+	): Promise<void> {
 		const capturedDirectories = new Set<string>();
 		for (const { intent } of replacements) {
 			const original = this.absolute(intent.path);
@@ -373,6 +375,56 @@ export class QuarantineManager {
 			intent.ordinal,
 			["SOURCE_QUARANTINED", "SOURCE_VERIFIED", "TARGET_INSTALLED", "TARGET_VERIFIED"],
 		)).at(-1)!;
+	}
+
+	async deleteFiles(requests: readonly DeleteLeafRequest[]): Promise<void> {
+		if (requests.length === 0) return;
+		const prepared: Array<{
+			readonly request: DeleteLeafRequest;
+			readonly sourceArtifact: string;
+		}> = [];
+		for (const request of requests) {
+			await this.assertWorkspaceIdentity();
+			await this.assertPath(request.path);
+			assertFingerprint(request.sourceFingerprint);
+			assertFingerprint(request.targetFingerprint);
+			if (request.targetFingerprint !== fingerprintAbsent(request.path)) {
+				throw new QuarantineError("fingerprint_mismatch", `删除目标 fingerprint 不是 absent：${request.path}`);
+			}
+			const artifacts = await this.artifactPaths(request.path, false);
+			prepared.push({ request, sourceArtifact: artifacts.sourceArtifact });
+		}
+		const intents = await this.journal.beginMany(prepared.map(({ request, sourceArtifact }) => ({
+			kind: "delete" as const,
+			path: request.path,
+			sourceArtifact,
+			targetArtifact: null,
+			sourceFingerprint: request.sourceFingerprint,
+			targetFingerprint: request.targetFingerprint,
+		})));
+		const mutations = intents.map((intent) => ({ intent }));
+		await this.quarantineFileSources(mutations);
+		for (const { request } of prepared) {
+			await this.assertFingerprint(this.absolute(request.path), request.path, request.targetFingerprint);
+		}
+		const targetRecords = await this.journal.advanceBatch(intents.map((intent) => ({
+			ordinal: intent.ordinal,
+			states: ["SOURCE_QUARANTINED", "SOURCE_VERIFIED", "TARGET_INSTALLED", "TARGET_VERIFIED"],
+		})));
+		const verifiedRecords: MutationRecord[] = [];
+		for (const record of targetRecords) {
+			if (record.state === "TARGET_VERIFIED") {
+				verifiedRecords.push(await this.assertOwnedRecord(record));
+			}
+		}
+		if (verifiedRecords.length !== intents.length) {
+			throw new Error("批量 delete TARGET_VERIFIED record 缺失");
+		}
+		await this.cleanupVerifiedArtifactsBatch(verifiedRecords);
+		await this.journal.advanceBatch(intents.map((intent) => ({
+			ordinal: intent.ordinal,
+			states: ["CLEANED"],
+		})));
 	}
 
 	async restoreMutation(record: MutationRecord): Promise<void> {
