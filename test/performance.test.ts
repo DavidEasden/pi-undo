@@ -1,10 +1,11 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
 import { GitRunner, type GitRunOptions, type GitRunResult } from "../src/git-runner.ts";
+import { MutationJournal } from "../src/mutation-journal.ts";
 import { RestoreEngine } from "../src/restore-engine.ts";
 import { RootDiscovery } from "../src/root-discovery.ts";
 import { SnapshotStore } from "../src/snapshot-store.ts";
@@ -66,6 +67,45 @@ describe("undo/redo restore performance", () => {
 		} finally {
 			await rm(workspace, { recursive: true, force: true });
 			await rm(storeRoot, { recursive: true, force: true });
+		}
+	}, 120_000);
+
+	it("一百零四文件 apply 批量读取 blob 且保留完整逻辑 WAL", async () => {
+		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-apply-perf-"));
+		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-apply-perf-store-"));
+		const journalRoot = await mkdtemp(join(tmpdir(), "pi-undo-apply-perf-journal-"));
+		try {
+			await mkdir(join(workspace, "src"));
+			const scope = Array.from(
+				{ length: 104 },
+				(_, index) => `src/file-${String(index).padStart(3, "0")}.txt`,
+			);
+			await Promise.all(scope.map((path, index) => writeFile(join(workspace, path), `before ${index}\n`)));
+			const git = new CountingGitRunner();
+			const discovery = new RootDiscovery(git);
+			const store = new SnapshotStore({ storeRoot, git, discovery });
+			const restore = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+			const topology = await discovery.discover(workspace);
+			const target = await store.capture(topology);
+			await Promise.all(scope.map((path, index) => writeFile(join(workspace, path), `after ${index}\n`)));
+			const current = await store.capture(topology, scope);
+			const plan = await restore.plan(current, target, scope);
+			git.calls.length = 0;
+			const journalPath = join(journalRoot, "mutations.jsonl");
+			const journal = new MutationJournal(journalPath, "op-apply-performance");
+
+			const result = await restore.apply(plan, target, {
+				opId: "op-apply-performance",
+				mutationJournal: journal,
+			});
+
+			expect(result.code).toBe("ok");
+			expect(git.calls.length).toBeLessThanOrEqual(12);
+			expect((await readFile(journalPath, "utf8")).split("\n").filter(Boolean)).toHaveLength(104 * 6);
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+			await rm(journalRoot, { recursive: true, force: true });
 		}
 	}, 120_000);
 

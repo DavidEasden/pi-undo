@@ -1,4 +1,4 @@
-import { open, readFile } from "node:fs/promises";
+import { open, readFile, stat } from "node:fs/promises";
 import { dirname } from "node:path";
 
 import { fsyncDirectory } from "./atomic-fs.ts";
@@ -14,6 +14,19 @@ export interface MutationIntent {
 	readonly targetFingerprint: string;
 }
 
+interface JournalRecords {
+	readonly latest: readonly MutationRecord[];
+	readonly tail: MutationRecord | undefined;
+	readonly durableEnd: number;
+	readonly hasNonDurableTail: boolean;
+	readonly fileExisted: boolean;
+}
+
+interface CachedJournalRecords {
+	readonly records: JournalRecords;
+	readonly fingerprint: string;
+}
+
 const stateOrder: readonly MutationState[] = [
 	"INTENT",
 	"SOURCE_QUARANTINED",
@@ -27,6 +40,7 @@ export class MutationJournal {
 	private readonly path: string;
 	private readonly opId: string;
 	private mutationQueue: Promise<void> = Promise.resolve();
+	private cachedRecords: CachedJournalRecords | undefined;
 
 	constructor(path: string, opId: string) {
 		this.path = path;
@@ -65,12 +79,16 @@ export class MutationJournal {
 			previousChecksum: current.tail?.checksum ?? null,
 		};
 		const record = assertMutationRecord({ ...content, checksum: checksum(canonicalJson(content)) });
-		await this.append(record, current.durableEnd, current.hasNonDurableTail);
+		await this.append([record], current);
 		return record;
 	}
 
 	advance(ordinal: number, state: MutationState): Promise<MutationRecord> {
 		return this.enqueueMutation(() => this.advanceMutation(ordinal, state));
+	}
+
+	advanceMany(ordinal: number, states: readonly MutationState[]): Promise<readonly MutationRecord[]> {
+		return this.enqueueMutation(() => this.advanceManyMutation(ordinal, states));
 	}
 
 	markRollbackCleaned(ordinal: number): Promise<MutationRecord> {
@@ -87,16 +105,48 @@ export class MutationJournal {
 	}
 
 	private async advanceMutation(ordinal: number, state: MutationState): Promise<MutationRecord> {
+		const [record] = await this.advanceManyMutation(ordinal, [state]);
+		return record!;
+	}
+
+	private async advanceManyMutation(
+		ordinal: number,
+		states: readonly MutationState[],
+	): Promise<readonly MutationRecord[]> {
+		if (states.length === 0) throw new Error("mutation 批量状态不能为空");
 		const current = await this.readRecords();
-		const previous = current.latest[ordinal - 1];
-		if (previous === undefined || stateOrder.indexOf(state) !== stateOrder.indexOf(previous.state) + 1) {
-			throw new Error(`mutation state 必须严格推进：${previous?.state ?? "missing"} -> ${state}`);
+		const latest = [...current.latest];
+		let tail = current.tail;
+		const records: MutationRecord[] = [];
+		for (const state of states) {
+			const previous = latest[ordinal - 1];
+			if (previous === undefined || stateOrder.indexOf(state) !== stateOrder.indexOf(previous.state) + 1) {
+				throw new Error(`mutation state 必须严格推进：${previous?.state ?? "missing"} -> ${state}`);
+			}
+			const content = {
+				schemaVersion: previous.schemaVersion,
+				opId: previous.opId,
+				ordinal: previous.ordinal,
+				state,
+				kind: previous.kind,
+				path: previous.path,
+				sourceArtifact: previous.sourceArtifact,
+				targetArtifact: previous.targetArtifact,
+				sourceFingerprint: previous.sourceFingerprint,
+				targetFingerprint: previous.targetFingerprint,
+				previousChecksum: tail?.checksum ?? null,
+			};
+			const record = assertMutationRecord({ ...content, checksum: checksum(canonicalJson(content)) });
+			records.push(record);
+			latest[ordinal - 1] = record;
+			tail = record;
 		}
-		return this.appendState(current, previous, state);
+		await this.append(records, current);
+		return records;
 	}
 
 	private async appendState(
-		current: Awaited<ReturnType<MutationJournal["readRecords"]>>,
+		current: JournalRecords,
 		previous: MutationRecord,
 		state: MutationState,
 	): Promise<MutationRecord> {
@@ -114,7 +164,7 @@ export class MutationJournal {
 			previousChecksum: current.tail?.checksum ?? null,
 		};
 		const record = assertMutationRecord({ ...content, checksum: checksum(canonicalJson(content)) });
-		await this.append(record, current.durableEnd, current.hasNonDurableTail);
+		await this.append([record], current);
 		return record;
 	}
 
@@ -140,20 +190,25 @@ export class MutationJournal {
 		}
 	}
 
-	private async readRecords(): Promise<{
-		readonly latest: readonly MutationRecord[];
-		readonly tail: MutationRecord | undefined;
-		readonly durableEnd: number;
-		readonly hasNonDurableTail: boolean;
-	}> {
+	private async readRecords(): Promise<JournalRecords> {
+		const before = await journalFileFingerprint(this.path);
+		if (before !== null && this.cachedRecords?.fingerprint === before) {
+			return this.cachedRecords.records;
+		}
 		let bytes: Buffer;
 		try {
 			bytes = await readFile(this.path);
 		} catch (error) {
 			if (hasErrorCode(error, "ENOENT")) {
-				return { latest: [], tail: undefined, durableEnd: 0, hasNonDurableTail: false };
+				const records = emptyJournalRecords();
+				this.cachedRecords = undefined;
+				return records;
 			}
 			throw error;
+		}
+		const after = await journalFileFingerprint(this.path);
+		if (before === null || after === null || before !== after) {
+			throw new Error("mutation journal 读取期间发生变化");
 		}
 
 		const durableEnd = bytes.at(-1) === 0x0a ? bytes.length : bytes.lastIndexOf(0x0a) + 1;
@@ -163,7 +218,7 @@ export class MutationJournal {
 		let tail: MutationRecord | undefined;
 
 		for (const line of lines) {
-			const record = assertMutationRecord(JSON.parse(line));
+			const record = Object.freeze(assertMutationRecord(JSON.parse(line)));
 			if (record.opId !== this.opId) throw new Error("mutation record opId 与 journal 不匹配");
 			if (record.previousChecksum !== (tail?.checksum ?? null)) {
 				throw new Error("mutation journal hash chain 断裂");
@@ -185,24 +240,78 @@ export class MutationJournal {
 			tail = record;
 		}
 
-		return { latest, tail, durableEnd, hasNonDurableTail: durableEnd !== bytes.length };
+		const records: JournalRecords = {
+			latest: Object.freeze(latest),
+			tail,
+			durableEnd,
+			hasNonDurableTail: durableEnd !== bytes.length,
+			fileExisted: true,
+		};
+		this.cachedRecords = { records, fingerprint: after };
+		return records;
 	}
 
-	private async append(record: MutationRecord, durableEnd: number, hasNonDurableTail: boolean): Promise<void> {
+	private async append(records: readonly MutationRecord[], current: JournalRecords): Promise<void> {
 		const directory = dirname(this.path);
+		const lines = records.map((record) => `${canonicalJson(record)}\n`).join("");
 		const handle = await open(this.path, "a+", 0o600);
 		try {
-			if (hasNonDurableTail) {
-				await handle.truncate(durableEnd);
+			if (current.hasNonDurableTail) {
+				await handle.truncate(current.durableEnd);
 				await handle.sync();
-				await fsyncDirectory(directory);
 			}
-			await handle.writeFile(`${canonicalJson(record)}\n`);
+			await handle.writeFile(lines);
 			await handle.sync();
 		} finally {
 			await handle.close();
 		}
-		await fsyncDirectory(directory);
+		if (!current.fileExisted) await fsyncDirectory(directory);
+		const fingerprint = await journalFileFingerprint(this.path);
+		if (fingerprint === null) throw new Error("mutation journal append 后丢失");
+		const latest = [...current.latest];
+		let tail = current.tail;
+		for (const record of records) {
+			const durableRecord = Object.freeze({ ...record });
+			latest[record.ordinal - 1] = durableRecord;
+			tail = durableRecord;
+		}
+		this.cachedRecords = {
+			records: {
+				latest: Object.freeze(latest),
+				tail,
+				durableEnd: current.durableEnd + Buffer.byteLength(lines),
+				hasNonDurableTail: false,
+				fileExisted: true,
+			},
+			fingerprint,
+		};
+	}
+}
+
+function emptyJournalRecords(): JournalRecords {
+	return {
+		latest: Object.freeze([]),
+		tail: undefined,
+		durableEnd: 0,
+		hasNonDurableTail: false,
+		fileExisted: false,
+	};
+}
+
+async function journalFileFingerprint(path: string): Promise<string | null> {
+	try {
+		const metadata = await stat(path, { bigint: true });
+		return [
+			metadata.dev,
+			metadata.ino,
+			metadata.mode,
+			metadata.size,
+			metadata.mtimeNs,
+			metadata.ctimeNs,
+		].join(":");
+	} catch (error) {
+		if (hasErrorCode(error, "ENOENT")) return null;
+		throw error;
 	}
 }
 

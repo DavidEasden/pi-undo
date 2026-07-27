@@ -109,6 +109,19 @@ describe("MutationJournal", () => {
 		expect(await readFile(file, "utf8")).toBe(`${canonicalJson(begun)}\n${canonicalJson(advanced)}\n`);
 	});
 
+	it("advanceMany 单次提交多个连续状态并保持逐记录 hash chain", async () => {
+		const { journal, file } = await journalFixture();
+		const begun = await journal.begin(intent());
+
+		const advanced = await journal.advanceMany(1, ["SOURCE_QUARANTINED", "SOURCE_VERIFIED"]);
+
+		expect(advanced).toHaveLength(2);
+		expect(advanced[0]).toMatchObject({ state: "SOURCE_QUARANTINED", previousChecksum: begun.checksum });
+		expect(advanced[1]).toMatchObject({ state: "SOURCE_VERIFIED", previousChecksum: advanced[0]!.checksum });
+		expect(await new MutationJournal(file, "operation-1").load()).toEqual([advanced[1]]);
+		expect((await readFile(file, "utf8")).split("\n").filter(Boolean)).toHaveLength(3);
+	});
+
 	it("两个 ordinal 共用按物理追加顺序形成的全局 hash chain", async () => {
 		const { journal } = await journalFixture();
 		const first = await journal.begin(intent());
@@ -217,6 +230,17 @@ describe("MutationJournal", () => {
 		await journal.markRollbackCleaned(1);
 		await expect(journal.markRollbackCleaned(1)).rejects.toThrow("rollback");
 		await expect(journal.advance(1, "SOURCE_QUARANTINED")).rejects.toThrow("严格推进");
+	});
+
+	it("缓存通过文件 fingerprint 发现同长度外部覆写并重新验证 checksum", async () => {
+		const { journal, file } = await journalFixture();
+		await journal.begin(intent());
+		const original = await readFile(file, "utf8");
+		const tampered = original.replace('"path":"a.txt"', '"path":"x.txt"');
+		expect(Buffer.byteLength(tampered)).toBe(Buffer.byteLength(original));
+		await writeFile(file, tampered);
+
+		await expect(journal.load()).rejects.toThrow();
 	});
 
 	it("拒绝同一 ordinal 的不同 immutable payload", async () => {

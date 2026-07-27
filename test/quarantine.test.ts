@@ -258,7 +258,7 @@ describe("QuarantineManager", () => {
 		expect(await journal.load()).toMatchObject([{ state: "CLEANED" }]);
 	});
 
-	it("rollForwardMutation 从 SOURCE_VERIFIED 的 target artifact 完成普通文件安装", async () => {
+	it("rollForwardMutation 从 INTENT 的 source/target artifacts 完成普通文件安装", async () => {
 		const { root, journal, manager } = await fixture();
 		const path = join(root, "a.txt");
 		await writeFile(path, "old\n");

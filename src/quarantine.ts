@@ -89,7 +89,7 @@ export class QuarantineManager {
 		this.beforeTargetCreate = options.beforeTargetCreate;
 	}
 
-	async replaceFile(request: ReplaceFileRequest): Promise<void> {
+	async replaceFile(request: ReplaceFileRequest): Promise<MutationRecord> {
 		await this.assertWorkspaceIdentity();
 		await this.assertPath(request.path);
 		assertFingerprint(request.sourceFingerprint);
@@ -106,7 +106,12 @@ export class QuarantineManager {
 		const targetArtifact = this.absolute(artifacts.targetArtifact!);
 		await this.beforeTargetCreate?.();
 		await this.assertMutationPaths(request.path, artifacts.targetArtifact!);
-		await writeBytesExclusive(targetArtifact, request.targetBytes, request.targetMode);
+		await writeBytesExclusive(
+			targetArtifact,
+			request.targetBytes,
+			request.targetMode,
+			{ syncDirectory: false },
+		);
 		await this.assertFingerprint(targetArtifact, request.path, request.targetFingerprint);
 		await this.quarantineSource(intent);
 		await request.beforeInstall?.();
@@ -121,15 +126,17 @@ export class QuarantineManager {
 			throw error;
 		}
 		await fsyncDirectory(dirname(this.absolute(request.path)));
-		await this.journal.advance(intent.ordinal, "TARGET_INSTALLED");
 		await this.assertFingerprint(this.absolute(request.path), request.path, request.targetFingerprint);
 		await this.assertArtifactPath(request.path, artifacts.targetArtifact!);
+		const targetStates = await this.journal.advanceMany(
+			intent.ordinal,
+			["SOURCE_QUARANTINED", "SOURCE_VERIFIED", "TARGET_INSTALLED", "TARGET_VERIFIED"],
+		);
 		await unlink(targetArtifact);
-		await fsyncDirectory(dirname(targetArtifact));
-		await this.journal.advance(intent.ordinal, "TARGET_VERIFIED");
+		return targetStates.at(-1)!;
 	}
 
-	async replaceSymlink(request: ReplaceSymlinkRequest): Promise<void> {
+	async replaceSymlink(request: ReplaceSymlinkRequest): Promise<MutationRecord> {
 		await this.assertWorkspaceIdentity();
 		await this.assertPath(request.path);
 		assertFingerprint(request.sourceFingerprint);
@@ -157,12 +164,14 @@ export class QuarantineManager {
 			throw error;
 		}
 		await fsyncDirectory(dirname(this.absolute(request.path)));
-		await this.journal.advance(intent.ordinal, "TARGET_INSTALLED");
 		await this.assertFingerprint(this.absolute(request.path), request.path, request.targetFingerprint);
-		await this.journal.advance(intent.ordinal, "TARGET_VERIFIED");
+		return (await this.journal.advanceMany(
+			intent.ordinal,
+			["SOURCE_QUARANTINED", "SOURCE_VERIFIED", "TARGET_INSTALLED", "TARGET_VERIFIED"],
+		)).at(-1)!;
 	}
 
-	async deleteLeaf(request: DeleteLeafRequest): Promise<void> {
+	async deleteLeaf(request: DeleteLeafRequest): Promise<MutationRecord> {
 		await this.assertWorkspaceIdentity();
 		await this.assertPath(request.path);
 		assertFingerprint(request.sourceFingerprint);
@@ -179,9 +188,11 @@ export class QuarantineManager {
 			targetFingerprint: request.targetFingerprint,
 		});
 		await this.quarantineSource(intent);
-		await this.journal.advance(intent.ordinal, "TARGET_INSTALLED");
 		await this.assertFingerprint(this.absolute(request.path), request.path, request.targetFingerprint);
-		await this.journal.advance(intent.ordinal, "TARGET_VERIFIED");
+		return (await this.journal.advanceMany(
+			intent.ordinal,
+			["SOURCE_QUARANTINED", "SOURCE_VERIFIED", "TARGET_INSTALLED", "TARGET_VERIFIED"],
+		)).at(-1)!;
 	}
 
 	async restoreMutation(record: MutationRecord): Promise<void> {
@@ -272,6 +283,35 @@ export class QuarantineManager {
 
 	async rollForwardMutation(record: MutationRecord): Promise<void> {
 		let owned = await this.assertOwnedRecord(record);
+		if (owned.state === "INTENT") {
+			const source = this.absolute(owned.sourceArtifact);
+			const original = this.absolute(owned.path);
+			const originalFingerprint = await fingerprintLeaf(original, owned.path);
+			if (owned.sourceFingerprint === fingerprintAbsent(owned.path)) {
+				if (await exists(source) || originalFingerprint !== owned.sourceFingerprint) {
+					throw new QuarantineError("external_concurrency", `INTENT absent source 现场冲突：${owned.path}`);
+				}
+			} else {
+				await this.assertFingerprint(source, owned.path, owned.sourceFingerprint);
+				if (originalFingerprint === owned.sourceFingerprint) {
+					const [sourceMetadata, originalMetadata] = await Promise.all([lstat(source), lstat(original)]);
+					if (
+					sourceMetadata.isFile() &&
+					(sourceMetadata.dev !== originalMetadata.dev || sourceMetadata.ino !== originalMetadata.ino)
+					) {
+						throw new QuarantineError("external_concurrency", `INTENT source inode 冲突：${owned.path}`);
+					}
+					await unlink(original);
+					await fsyncDirectory(dirname(original));
+				} else if (originalFingerprint !== fingerprintAbsent(owned.path)) {
+					throw new QuarantineError("external_concurrency", `INTENT original 现场冲突：${owned.path}`);
+				}
+			}
+			owned = (await this.journal.advanceMany(
+				owned.ordinal,
+				["SOURCE_QUARANTINED", "SOURCE_VERIFIED"],
+			)).at(-1)!;
+		}
 		if (owned.state === "SOURCE_QUARANTINED") {
 			if (owned.sourceFingerprint === fingerprintAbsent(owned.path)) {
 				if (await exists(this.absolute(owned.sourceArtifact))) {
@@ -373,9 +413,7 @@ export class QuarantineManager {
 			if (await exists(source)) {
 				throw new QuarantineError("unsafe_artifact", `absent source 不应存在 artifact：${record.path}`);
 			}
-			await this.journal.advance(record.ordinal, "SOURCE_QUARANTINED");
 			await this.assertFingerprint(original, record.path, record.sourceFingerprint);
-			await this.journal.advance(record.ordinal, "SOURCE_VERIFIED");
 			return;
 		}
 		const metadata = await lstat(original);
@@ -409,10 +447,7 @@ export class QuarantineManager {
 			}
 		}
 		await unlink(original);
-		await fsyncDirectory(dirname(original));
-		await this.journal.advance(record.ordinal, "SOURCE_QUARANTINED");
 		await this.assertFingerprint(source, record.path, record.sourceFingerprint);
-		await this.journal.advance(record.ordinal, "SOURCE_VERIFIED");
 	}
 
 	private async cleanupRollbackTarget(record: MutationRecord): Promise<void> {

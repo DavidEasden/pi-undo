@@ -570,12 +570,12 @@ export class RestoreEngine {
 			return;
 		}
 		await this.mutate(context, "delete", path, async () => {
-			await context.quarantine.deleteLeaf({
+			const record = await context.quarantine.deleteLeaf({
 				path,
 				sourceFingerprint: await this.expectedMutationFingerprint(context, path),
 				targetFingerprint: fingerprintAbsent(path),
 			});
-			await this.cleanupLatestMutation(context);
+			await context.quarantine.cleanupMutation(record);
 		});
 	}
 
@@ -617,14 +617,14 @@ export class RestoreEngine {
 				throw new Error(`symlink 存在类型或内容冲突：${path}`);
 			}
 			await this.mutate(context, "symlink", path, async (beforeInstall) => {
-				await context.quarantine.replaceSymlink({
+				const record = await context.quarantine.replaceSymlink({
 					path,
 					targetLinkText: linkText,
 					sourceFingerprint: await this.expectedMutationFingerprint(context, path),
 					targetFingerprint: fingerprintSymlink(path, linkText),
 					beforeInstall,
 				});
-				await this.cleanupLatestMutation(context);
+				await context.quarantine.cleanupMutation(record);
 			}, true);
 			return;
 		}
@@ -646,7 +646,7 @@ export class RestoreEngine {
 			"write",
 			path,
 			async (beforeInstall) => {
-				await context.quarantine.replaceFile({
+				const record = await context.quarantine.replaceFile({
 					path,
 					targetBytes: bytes,
 					targetMode: target.entry.mode & 0o777,
@@ -654,7 +654,7 @@ export class RestoreEngine {
 					targetFingerprint: fingerprintBytes(path, bytes, target.entry.mode),
 					beforeInstall,
 				});
-				await this.cleanupLatestMutation(context);
+				await context.quarantine.cleanupMutation(record);
 			},
 			true,
 		);
@@ -784,8 +784,9 @@ export class RestoreEngine {
 		deferHook = false,
 	): Promise<void> {
 		context.ordinal += 1;
+		const ordinal = context.ordinal;
 		const beforeInstall = async (): Promise<void> => {
-			await this.beforeMutation?.({ phase: context.phase, ordinal: context.ordinal, kind, path });
+			await this.beforeMutation?.({ phase: context.phase, ordinal, kind, path });
 		};
 		if (!deferHook) await beforeInstall();
 		await this.assertMutationPath(path);
@@ -970,13 +971,6 @@ export class RestoreEngine {
 		} catch {
 			return false;
 		}
-	}
-
-	private async cleanupLatestMutation(context: MutationContext): Promise<void> {
-		const records = await context.mutationJournal.load();
-		const record = records.at(-1);
-		if (record === undefined) throw new Error("quarantine mutation 记录缺失");
-		await context.quarantine.cleanupMutation(record);
 	}
 
 	private async restorePendingMutations(

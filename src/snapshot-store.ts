@@ -32,12 +32,16 @@ const GC_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 const IGNORE_POLICY = "git-check-ignore-v1";
 const NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
 const TREE_CACHE_LIMIT = 256;
+const TREE_BLOB_MEMBERSHIP_LIMIT = 65_536;
 const HASH_BATCH_MAX_PATHS = process.platform === "win32" ? 128 : 2_048;
 const HASH_BATCH_MAX_ARGUMENT_BYTES = process.platform === "win32" ? 24 * 1024 : 128 * 1024;
 const HASH_BATCH_CONCURRENCY = 4;
 const FILE_SYSTEM_INSPECTION_CONCURRENCY = 32;
 const INDEX_BATCH_MAX_ENTRIES = 4_096;
 const INDEX_BATCH_MAX_BYTES = 8 * 1024 * 1024;
+const BLOB_CACHE_MAX_BYTES = 128 * 1024 * 1024;
+const BLOB_BATCH_MAX_BYTES = 16 * 1024 * 1024;
+const BLOB_BATCH_MAX_ENTRIES = 256;
 
 interface PinRecord {
 	readonly schemaVersion: 1;
@@ -73,6 +77,11 @@ interface VisibleLeaf {
 	readonly kind: "file" | "symlink";
 	readonly mode: number;
 	readonly fingerprint: string;
+}
+
+interface CachedBlob {
+	readonly promise: Promise<Uint8Array>;
+	size: number;
 }
 
 export interface SnapshotStoreOptions {
@@ -126,8 +135,11 @@ export class SnapshotStore {
 	private readonly lock: WorkspaceLock;
 	private readonly clock: () => number;
 	private readonly manifestLocations = new Map<string, string>();
-	// Tree ID 是内容寻址且不可变；这里只缓存解析元数据，blob bytes 与完整性仍逐次读取/校验。
+	// Tree 与 blob 都由 object ID 内容寻址；缓存只复用已从私有 ODB 读取的不可变内容。
 	private readonly treeEntriesCache = new Map<string, Promise<CapturedTreeEntry[]>>();
+	private readonly treeBlobMembership = new Map<string, string>();
+	private readonly blobCache = new Map<string, CachedBlob>();
+	private blobCacheBytes = 0;
 
 	constructor(options: SnapshotStoreOptions = {}) {
 		this.storeRoot = resolve(options.storeRoot ?? join(tmpdir(), "pi-undo-snapshot-store"));
@@ -337,6 +349,7 @@ export class SnapshotStore {
 					throw new SnapshotStoreError("object_missing", "ignored-present proof 与 root tree 冲突");
 				}
 				await this.assertObjectsComplete(gitDirectory, root.treeId, entries);
+				if (scopePaths !== undefined) await this.preloadBlobBytes(gitDirectory, entries);
 				if (rootScope === undefined && root.objectClosure !== treeObjectClosure(root.treeId, entries)) {
 					throw new SnapshotStoreError("object_missing", "root tree 对象闭包校验失败");
 				}
@@ -429,17 +442,24 @@ export class SnapshotStore {
 		const storeDirectory = dirname(dirname(manifestPath));
 		const gitDirectory = this.rootGitDirectory(storeDirectory, root);
 		try {
-			const entries = await this.readTreeEntries(
-				gitDirectory,
-				root.treeId,
-				relativePath === undefined ? undefined : [relativeSafePath("/", relativePath)],
-			);
-			if (!entries.some((entry) => entry.objectId === blobId && (
-				relativePath === undefined || entry.relativePath === relativePath
-			))) {
-				throw new SnapshotStoreError("object_missing", "blob 不属于指定 root tree");
+			const safeRelativePath = relativePath === undefined ? undefined : relativeSafePath("/", relativePath);
+			if (safeRelativePath === undefined) {
+				const entries = await this.readTreeEntries(gitDirectory, root.treeId);
+				if (!entries.some((entry) => entry.objectId === blobId)) {
+					throw new SnapshotStoreError("object_missing", "blob 不属于指定 root tree");
+				}
+			} else {
+				const membershipKey = treeBlobMembershipKey(gitDirectory, root.treeId, safeRelativePath);
+				let ownedBlobId = this.treeBlobMembership.get(membershipKey);
+				if (ownedBlobId === undefined) {
+					await this.readTreeEntries(gitDirectory, root.treeId, [safeRelativePath]);
+					ownedBlobId = this.treeBlobMembership.get(membershipKey);
+				}
+				if (ownedBlobId !== blobId) {
+					throw new SnapshotStoreError("object_missing", "blob 不属于指定 root tree path");
+				}
 			}
-			return await this.readBlobBytes(gitDirectory, blobId);
+			return new Uint8Array(await this.readBlobBytes(gitDirectory, blobId));
 		} catch (error) {
 			if (error instanceof SnapshotStoreError) {
 				throw error;
@@ -886,7 +906,20 @@ export class SnapshotStore {
 			"-z",
 			treeId,
 			...(scope === undefined ? [] : ["--", ...scope.map(literalPathspec)]),
-		]).then(parseTreeEntries);
+		]).then((output) => {
+			const entries = parseTreeEntries(output);
+			for (const entry of entries) {
+				const membershipKey = treeBlobMembershipKey(gitDirectory, treeId, entry.relativePath);
+				this.treeBlobMembership.delete(membershipKey);
+				this.treeBlobMembership.set(membershipKey, entry.objectId);
+			}
+			while (this.treeBlobMembership.size > TREE_BLOB_MEMBERSHIP_LIMIT) {
+				const oldest = this.treeBlobMembership.keys().next().value as string | undefined;
+				if (oldest === undefined) break;
+				this.treeBlobMembership.delete(oldest);
+			}
+			return entries;
+		});
 		this.treeEntriesCache.set(key, pending);
 		while (this.treeEntriesCache.size > TREE_CACHE_LIMIT) {
 			const oldest = this.treeEntriesCache.keys().next().value as string | undefined;
@@ -930,6 +963,26 @@ export class SnapshotStore {
 		}
 	}
 
+	private async preloadBlobBytes(
+		gitDirectory: string,
+		entries: readonly CapturedTreeEntry[],
+	): Promise<void> {
+		const unique = new Map<string, CapturedTreeEntry>();
+		for (const entry of entries) {
+			if (!this.blobCache.has(blobCacheKey(gitDirectory, entry.objectId))) unique.set(entry.objectId, entry);
+		}
+		for (const batch of blobReadBatches([...unique.values()])) {
+			const loaded = parseBatchBlobOutput(
+				await this.runGitBytes(["cat-file", "--batch"], {
+					env: privateObjectEnvironment(gitDirectory),
+					stdin: `${batch.map((entry) => entry.objectId).join("\n")}\n`,
+				}),
+				batch,
+			);
+			for (const [objectId, bytes] of loaded) this.rememberBlobBytes(gitDirectory, objectId, bytes);
+		}
+	}
+
 	private async readBlobText(gitDirectory: string, objectId: string): Promise<string> {
 		return decodeUtf8(
 			await this.readBlobBytes(gitDirectory, objectId),
@@ -938,7 +991,51 @@ export class SnapshotStore {
 	}
 
 	private async readBlobBytes(gitDirectory: string, objectId: string): Promise<Uint8Array> {
-		return this.runPrivateGitBytes(gitDirectory, ["cat-file", "blob", objectId]);
+		const key = blobCacheKey(gitDirectory, objectId);
+		const cached = this.blobCache.get(key);
+		if (cached !== undefined) {
+			this.blobCache.delete(key);
+			this.blobCache.set(key, cached);
+			return cached.promise;
+		}
+		const entry: CachedBlob = {
+			promise: this.runPrivateGitBytes(gitDirectory, ["cat-file", "blob", objectId]),
+			size: 0,
+		};
+		this.blobCache.set(key, entry);
+		try {
+			const bytes = await entry.promise;
+			this.finishBlobCacheEntry(key, entry, bytes.byteLength);
+			return bytes;
+		} catch (error) {
+			if (this.blobCache.get(key) === entry) this.blobCache.delete(key);
+			throw error;
+		}
+	}
+
+	private rememberBlobBytes(gitDirectory: string, objectId: string, bytes: Uint8Array): void {
+		const key = blobCacheKey(gitDirectory, objectId);
+		if (this.blobCache.has(key) || bytes.byteLength > BLOB_CACHE_MAX_BYTES) return;
+		const entry: CachedBlob = { promise: Promise.resolve(bytes), size: 0 };
+		this.blobCache.set(key, entry);
+		this.finishBlobCacheEntry(key, entry, bytes.byteLength);
+	}
+
+	private finishBlobCacheEntry(key: string, entry: CachedBlob, size: number): void {
+		if (this.blobCache.get(key) !== entry) return;
+		if (size > BLOB_CACHE_MAX_BYTES) {
+			this.blobCache.delete(key);
+			return;
+		}
+		entry.size = size;
+		this.blobCacheBytes += size;
+		while (this.blobCacheBytes > BLOB_CACHE_MAX_BYTES) {
+			const oldestKey = this.blobCache.keys().next().value as string | undefined;
+			if (oldestKey === undefined) break;
+			const oldest = this.blobCache.get(oldestKey)!;
+			this.blobCache.delete(oldestKey);
+			this.blobCacheBytes -= oldest.size;
+		}
 	}
 
 	private runPrivateGit(gitDirectory: string, args: readonly string[]): Promise<string> {
@@ -1306,6 +1403,62 @@ function isolatedGitConfiguration(): Readonly<Record<string, string | undefined>
 		GIT_CONFIG_NOSYSTEM: "1",
 		GIT_ATTR_NOSYSTEM: "1",
 	};
+}
+
+function treeBlobMembershipKey(gitDirectory: string, treeId: string, relativePath: string): string {
+	return `${gitDirectory}\0${treeId}\0${relativePath}`;
+}
+
+function blobCacheKey(gitDirectory: string, objectId: string): string {
+	return `${gitDirectory}\0${objectId}`;
+}
+
+function blobReadBatches(entries: readonly CapturedTreeEntry[]): CapturedTreeEntry[][] {
+	const result: CapturedTreeEntry[][] = [];
+	let batch: CapturedTreeEntry[] = [];
+	let bytes = 0;
+	for (const entry of entries) {
+		if (
+			batch.length > 0 &&
+			(batch.length >= BLOB_BATCH_MAX_ENTRIES || bytes + entry.size > BLOB_BATCH_MAX_BYTES)
+		) {
+			result.push(batch);
+			batch = [];
+			bytes = 0;
+		}
+		batch.push(entry);
+		bytes += entry.size;
+	}
+	if (batch.length > 0) result.push(batch);
+	return result;
+}
+
+function parseBatchBlobOutput(
+	output: Uint8Array,
+	expected: readonly CapturedTreeEntry[],
+): Map<string, Uint8Array> {
+	const result = new Map<string, Uint8Array>();
+	let offset = 0;
+	for (const entry of expected) {
+		const lineEnd = output.indexOf(0x0a, offset);
+		if (lineEnd < 0) throw new SnapshotStoreError("object_missing", "Git blob batch header 不完整");
+		const header = decodeUtf8(output.subarray(offset, lineEnd));
+		const match = header.match(/^([0-9a-f]{40,64}) blob ([0-9]+)$/);
+		if (match === null || match[1] !== entry.objectId || Number(match[2]) !== entry.size) {
+			throw new SnapshotStoreError("object_missing", `Git blob batch header 无效：${entry.objectId}`);
+		}
+		const contentStart = lineEnd + 1;
+		const contentEnd = contentStart + entry.size;
+		if (contentEnd >= output.length || output[contentEnd] !== 0x0a) {
+			throw new SnapshotStoreError("object_missing", `Git blob batch 内容不完整：${entry.objectId}`);
+		}
+		result.set(entry.objectId, output.slice(contentStart, contentEnd));
+		offset = contentEnd + 1;
+	}
+	if (offset !== output.length) {
+		throw new SnapshotStoreError("object_missing", "Git blob batch 输出包含多余内容");
+	}
+	return result;
 }
 
 function indexInfoBatches(
