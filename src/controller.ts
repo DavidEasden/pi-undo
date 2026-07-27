@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 
 import { canonicalJson, checksum } from "./encoding.ts";
 import type {
@@ -73,11 +74,17 @@ export type CursorAppendResult =
 	| { readonly kind: "volatile"; readonly reason: string }
 	| { readonly kind: "recovery_required"; readonly reason: string };
 
+export interface OperationTiming {
+	readonly phase: string;
+	readonly durationMs: number;
+}
+
 export interface OperationResult {
 	readonly code: ResultCode;
 	readonly changedFiles: number;
 	readonly message?: string;
 	readonly refillPrompt?: string;
+	readonly timings?: readonly OperationTiming[];
 }
 
 export type InputEventResult =
@@ -384,79 +391,101 @@ export class UndoControllerImpl implements UndoController {
 		targetManifestId?: ManifestId,
 	): Promise<OperationResult> {
 		if (this.locked || this.operationInFlight) return { code: "busy", changedFiles: 0 };
+		const profile = new OperationProfiler();
+		const done = (result: OperationResult): OperationResult => profile.attach(result);
 		this.operationInFlight = true;
 		this.promptDeferralInFlight = true;
 		this.lastSafetyManifestId = null;
 		let lease: { release(): Promise<void> } | undefined;
 		try {
-			if (!await this.ensureIdle()) return { code: "idle_timeout", changedFiles: 0 };
+			if (!await profile.measure("idle", () => this.ensureIdle())) {
+				return done({ code: "idle_timeout", changedFiles: 0 });
+			}
 			try {
-				lease = await this.dependencies.acquireWorkspaceLock();
+				lease = await profile.measure("lock", () => this.dependencies.acquireWorkspaceLock());
 			} catch {
-				return { code: "busy", changedFiles: 0 };
+				return done({ code: "busy", changedFiles: 0 });
 			}
 			let rollback: SnapshotManifest;
 			try {
-				rollback = await this.dependencies.capture(checkpoint.changedPaths);
+				rollback = await profile.measure("capture", () =>
+					this.dependencies.capture(checkpoint.changedPaths));
 			} catch {
-				return { code: "capture_failed", changedFiles: 0 };
+				return done({ code: "capture_failed", changedFiles: 0 });
 			}
 			let target: SnapshotManifest;
 			let plan: RestorePlan;
 			let targetLogicalLeaf: string | null;
 			try {
-				target = await this.dependencies.loadManifest(
+				target = await profile.measure("load", () => this.dependencies.loadManifest(
 					targetManifestId ?? (action === "undo" ? checkpoint.beforeManifestId : checkpoint.afterManifestId),
-				);
-				plan = await this.dependencies.planRestore(rollback, target, checkpoint.changedPaths);
+				));
+				plan = await profile.measure("plan", () =>
+					this.dependencies.planRestore(rollback, target, checkpoint.changedPaths));
 				targetLogicalLeaf = this.dependencies.resolveSessionTarget(action, checkpoint);
 			} catch {
-				return { code: "restore_failed_safe", changedFiles: 0 };
+				return done({ code: "restore_failed_safe", changedFiles: 0 });
 			}
 			const descriptor = this.createDescriptor(action, rollback, target, plan, targetLogicalLeaf);
-			await this.dependencies.journal.prepare(descriptor, plan);
-			const navigation = await this.dependencies.navigateSession(action, checkpoint);
+			await profile.measure("journal", () => this.dependencies.journal.prepare(descriptor, plan));
+			const navigation = await profile.measure("navigate", () =>
+				this.dependencies.navigateSession(action, checkpoint));
 			if (navigation.cancelled) {
-				await this.dependencies.journal.setPhase(descriptor.opId, "ABORTING");
-				await this.dependencies.journal.setPhase(descriptor.opId, "ABORTED");
-				return { code: "restore_failed_safe", changedFiles: 0 };
+				await profile.measure("journal", async () => {
+					await this.dependencies.journal.setPhase(descriptor.opId, "ABORTING");
+					await this.dependencies.journal.setPhase(descriptor.opId, "ABORTED");
+				});
+				return done({ code: "restore_failed_safe", changedFiles: 0 });
 			}
 			if (navigation.logicalLeafId !== descriptor.toLogicalLeaf) {
 				this.locked = true;
-				await this.dependencies.journal.setPhase(descriptor.opId, "RECOVERY_REQUIRED");
-				return { code: "recovery_required", changedFiles: 0 };
+				await profile.measure("journal", () =>
+					this.dependencies.journal.setPhase(descriptor.opId, "RECOVERY_REQUIRED"));
+				return done({ code: "recovery_required", changedFiles: 0 });
 			}
-			await this.dependencies.journal.setPhase(descriptor.opId, "SESSION_MOVED", {
-				observedLogicalLeaf: navigation.logicalLeafId,
+			await profile.measure("journal", async () => {
+				await this.dependencies.journal.setPhase(descriptor.opId, "SESSION_MOVED", {
+					observedLogicalLeaf: navigation.logicalLeafId,
+				});
+				await this.dependencies.journal.setPhase(descriptor.opId, "APPLYING");
 			});
-			await this.dependencies.journal.setPhase(descriptor.opId, "APPLYING");
-			const applied = await this.dependencies.applyRestore(plan, target, { opId: descriptor.opId });
-			if (applied.code !== "ok") return this.compensate(descriptor, rollback, target, applied);
-			await this.dependencies.journal.setPhase(descriptor.opId, "FILES_VERIFIED");
+			const applied = await profile.measure("apply", () =>
+				this.dependencies.applyRestore(plan, target, { opId: descriptor.opId }));
+			if (applied.code !== "ok") {
+				return done(await profile.measure("compensate", () =>
+					this.compensate(descriptor, rollback, target, applied)));
+			}
+			await profile.measure("journal", () =>
+				this.dependencies.journal.setPhase(descriptor.opId, "FILES_VERIFIED"));
 			const cursor = this.createCursor(descriptor, action, checkpoint);
-			const cursorResult = await this.dependencies.appendCursor(cursor);
+			const cursorResult = await profile.measure("cursor", () => this.dependencies.appendCursor(cursor));
 			if (cursorResult.kind === "recovery_required") {
 				this.locked = true;
-				await this.dependencies.journal.setPhase(descriptor.opId, "RECOVERY_REQUIRED").catch(() => {});
-				return { code: "recovery_required", changedFiles: applied.verifiedPaths };
+				await profile.measure("journal", () =>
+					this.dependencies.journal.setPhase(descriptor.opId, "RECOVERY_REQUIRED").catch(() => {}));
+				return done({ code: "recovery_required", changedFiles: applied.verifiedPaths });
 			}
 			if (cursorResult.kind === "volatile") {
-				return this.compensate(descriptor, rollback, target, {
+				return done(await profile.measure("compensate", () => this.compensate(descriptor, rollback, target, {
 					code: "recovery_required",
 					verifiedPaths: applied.verifiedPaths,
 					totalPaths: applied.totalPaths,
-				});
+				})));
 			}
-			await this.dependencies.journal.setPhase(descriptor.opId, "CURSOR_COMMITTED");
-			await this.dependencies.journal.markCommitted(descriptor.opId);
+			await profile.measure("commit", async () => {
+				await this.dependencies.journal.setPhase(descriptor.opId, "CURSOR_COMMITTED");
+				await this.dependencies.journal.markCommitted(descriptor.opId);
+			});
 			this.lastSafetyManifestId = rollback.manifestId;
-			return { code: "ok", changedFiles: applied.verifiedPaths };
+			return done({ code: "ok", changedFiles: applied.verifiedPaths });
 		} catch {
 			this.locked = true;
-			return { code: "recovery_required", changedFiles: 0 };
+			return done({ code: "recovery_required", changedFiles: 0 });
 		} finally {
-			if (lease !== undefined) {
-				await lease.release().catch(() => { this.locked = true; });
+			const activeLease = lease;
+			if (activeLease !== undefined) {
+				await profile.measure("unlock", () =>
+					activeLease.release().catch(() => { this.locked = true; }));
 			}
 			this.promptDeferralInFlight = false;
 			this.operationInFlight = false;
@@ -601,6 +630,31 @@ export class UndoControllerImpl implements UndoController {
 			descriptorChecksum: descriptor.checksum,
 		};
 		return { ...payload, checksum: checksum(canonicalJson(payload)) };
+	}
+}
+
+class OperationProfiler {
+	private readonly durations = new Map<string, number>();
+
+	async measure<T>(phase: string, operation: () => Promise<T>): Promise<T> {
+		const started = performance.now();
+		try {
+			return await operation();
+		} finally {
+			this.durations.set(phase, (this.durations.get(phase) ?? 0) + performance.now() - started);
+		}
+	}
+
+	attach(result: OperationResult): OperationResult {
+		const total = [...this.durations.values()].reduce((sum, duration) => sum + duration, 0);
+		if (total < 1_000) return result;
+		return {
+			...result,
+			timings: [...this.durations].map(([phase, durationMs]) => ({
+				phase,
+				durationMs: Math.round(durationMs),
+			})),
+		};
 	}
 }
 

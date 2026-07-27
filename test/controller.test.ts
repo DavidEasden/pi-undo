@@ -1,4 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { performance } from "node:perf_hooks";
+
+import { describe, expect, it, vi } from "vitest";
 
 import { UndoControllerImpl, type ControllerDependencies } from "../src/controller.ts";
 import { canonicalJson, checksum } from "../src/encoding.ts";
@@ -362,6 +364,28 @@ describe("UndoController", () => {
 		expect(capturedScopes).toEqual([undefined, undefined, ["file.txt"]]);
 		expect(observedScope).toEqual(["file.txt"]);
 		expect(descriptorScope).toEqual(["file.txt"]);
+	});
+
+	it("慢操作返回分阶段耗时且不改变结果 code", async () => {
+		const deps = dependencies();
+		const controller = new UndoControllerImpl(deps);
+		await controller.prepareInput("修复文件", { streaming: false });
+		await controller.beforeAgentStart();
+		await controller.agentSettled();
+		let now = 0;
+		const clock = vi.spyOn(performance, "now").mockImplementation(() => {
+			now += 100;
+			return now;
+		});
+
+		const result = await controller.undo();
+		clock.mockRestore();
+
+		expect(result.code).toBe("ok");
+		expect(result.timings).toEqual(expect.arrayContaining([
+			expect.objectContaining({ phase: "navigate", durationMs: 100 }),
+			expect.objectContaining({ phase: "apply", durationMs: 100 }),
+		]));
 	});
 
 	it("session 导航取消或 observed logical leaf 不匹配时不恢复文件", async () => {

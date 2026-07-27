@@ -43,9 +43,12 @@ export class StatusReporter {
 		this.context.ui.setStatus("pi-undo", undefined);
 	}
 
-	result(result: OperationResult): void {
+	result(result: OperationResult, totalMs?: number): void {
 		const details = result.message === undefined ? "" : ` ${sanitize(result.message)}`;
-		const message = sanitize(`${result.code} files:${result.changedFiles}${details}`);
+		const timing = totalMs !== undefined && totalMs >= 1_000
+			? formatTiming(totalMs, result.timings)
+			: "";
+		const message = sanitize(`${result.code} files:${result.changedFiles}${details}${timing}`);
 		const type = result.code === "ok" || result.code === "noop"
 			? "info"
 			: result.code === "recovery_required" ? "error" : "warning";
@@ -66,6 +69,16 @@ export class StatusReporter {
 	private setStatus(text: string): void {
 		this.context.ui.setStatus("pi-undo", sanitize(text));
 	}
+}
+
+function formatTiming(totalMs: number, timings: OperationResult["timings"]): string {
+	const phases = [...(timings ?? [])]
+		.filter((timing) => timing.durationMs >= 5)
+		.sort((left, right) => right.durationMs - left.durationMs)
+		.slice(0, 5)
+		.map((timing) => `${timing.phase}:${timing.durationMs}ms`)
+		.join(" ");
+	return ` total:${Math.round(totalMs)}ms${phases.length === 0 ? "" : ` ${phases}`}`;
 }
 
 function sanitize(value: string): string {

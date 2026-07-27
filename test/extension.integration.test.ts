@@ -468,9 +468,18 @@ describe("StatusReporter", () => {
 	it("操作结果使用单行 notify，并按模式安全回填 prompt", () => {
 		const tui = context("tui");
 		const tuiReporter = new StatusReporter(tui.value);
-		tuiReporter.result({ code: "ok", changedFiles: 3, message: "done\n/path/file" });
+		tuiReporter.result({
+			code: "ok",
+			changedFiles: 3,
+			message: "done\n/path/file",
+			timings: [
+				{ phase: "navigate", durationMs: 9_000 },
+				{ phase: "apply", durationMs: 600 },
+			],
+		}, 10_250);
 
 		expect(tui.notifications[0]![0]).not.toContain("\n");
+		expect(tui.notifications[0]![0]).toContain("total:10250ms navigate:9000ms apply:600ms");
 		expect(tuiReporter.refillPrompt("原始 prompt")).toBe("written");
 		expect(tui.editor).toBe("原始 prompt");
 		expect(new StatusReporter(context("tui", "用户正在输入").value).refillPrompt("旧 prompt")).toBe("skipped");

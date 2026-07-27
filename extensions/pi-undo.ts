@@ -1,3 +1,5 @@
+import { performance } from "node:perf_hooks";
+
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -135,6 +137,7 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 			activeAction = action;
 			active.reporter.setPhase(action === "undo" ? "undoing" : "redoing");
 			active.setCommandContext?.(context);
+			const commandStarted = performance.now();
 			let result;
 			try {
 				result = action === "undo"
@@ -146,7 +149,7 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 				if (commandSet === activeCommands && commandSet.size === 0) activeAction = undefined;
 			}
 			if (commandGeneration !== generation || runtime !== active) return;
-			active.reporter.result(result);
+			active.reporter.result(result, performance.now() - commandStarted);
 			const hasDeferredPrompt = deferredPrompts.length > 0 || replaying !== undefined;
 			if (
 				action === "undo" && result.code === "ok" && result.refillPrompt !== undefined &&
