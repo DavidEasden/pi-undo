@@ -1,4 +1,4 @@
-import { access, chmod, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -73,6 +73,23 @@ class ToggleMissingBatchGitRunner extends GitRunner {
 			)));
 		}
 		return super.run(args, options);
+	}
+}
+
+class MutatingAfterHashGitRunner extends GitRunner {
+	private mutated = false;
+
+	constructor(private readonly targetPath: string) {
+		super();
+	}
+
+	override async run(args: readonly string[], options?: GitRunOptions): Promise<GitRunResult> {
+		const result = await super.run(args, options);
+		if (!this.mutated && args[0] === "hash-object") {
+			this.mutated = true;
+			await writeFile(this.targetPath, "external replacement\n");
+		}
+		return result;
 	}
 }
 
@@ -518,6 +535,40 @@ describe("SnapshotStore", () => {
 
 		expect((await store.listTree(manifest.manifestId, ".")).map((entry) => entry.relativePath))
 			.toEqual([specialPath]);
+	});
+
+	it("批量 index 支持 TAB、换行、Unicode、空格与前导 dash 路径", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		const paths = ["tab\tname.txt", "line\nname.txt", "中文 file.txt", "-leading.txt"];
+		for (const path of paths) await writeFixtureFile(workspace, path, `${path}\n`);
+		const topology = await new RootDiscovery().discover(workspace);
+		const store = new SnapshotStore({ storeRoot });
+
+		const manifest = await store.capture(topology);
+		const entries = (await store.listTree(manifest.manifestId, "."))
+			.filter((entry) => entry.kind !== "directory");
+		expect(entries.map((entry) => entry.relativePath).sort()).toEqual([...paths].sort());
+		for (const entry of entries) {
+			expect(entry.blobId).not.toBeNull();
+			expect(Buffer.from(await store.readBlob(manifest.manifestId, ".", entry.blobId!)).toString("utf8"))
+				.toBe(`${entry.relativePath}\n`);
+		}
+		await expect(store.assertComplete(manifest.manifestId)).resolves.toBeUndefined();
+	});
+
+	it("批量 hash 后叶子被外部改写时不发布 manifest", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		const targetPath = join(workspace, "file.txt");
+		await writeFixtureFile(workspace, "file.txt", "before\n");
+		const git = new MutatingAfterHashGitRunner(targetPath);
+		const discovery = new RootDiscovery(git);
+		const topology = await discovery.discover(workspace);
+		const store = new SnapshotStore({ storeRoot, git, discovery });
+
+		await expect(store.capture(topology)).rejects.toMatchObject({ code: "capture_failed" });
+		await expectNoPublishedManifest(storeRoot);
 	});
 
 	it("partial scope 的 ignored-present proof 只记录 scope 内现存叶子", async () => {

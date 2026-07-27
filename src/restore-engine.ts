@@ -22,6 +22,8 @@ import {
 } from "./quarantine.ts";
 import { SnapshotStoreError, type SnapshotStore } from "./snapshot-store.ts";
 
+const PREPARED_PLAN_CACHE_LIMIT = 16;
+
 export interface RestorePlan {
 	currentManifestId: ManifestId;
 	targetManifestId: ManifestId;
@@ -69,6 +71,12 @@ interface OwnedPath {
 	readonly root: SnapshotRoot;
 }
 
+interface PreparedRestorePlan {
+	readonly plan: RestorePlan;
+	readonly currentPaths: ReadonlyMap<string, OwnedPath>;
+	readonly targetPaths: ReadonlyMap<string, OwnedPath>;
+}
+
 interface MutationContext {
 	readonly phase: RestoreMutation["phase"];
 	readonly sourceManifestId: ManifestId;
@@ -88,6 +96,7 @@ export class RestoreEngine {
 	private readonly store: SnapshotStore;
 	private readonly discovery: RootDiscovery;
 	private readonly beforeMutation: RestoreEngineOptions["beforeMutation"];
+	private readonly preparedPlans = new Map<string, PreparedRestorePlan>();
 
 	constructor(options: RestoreEngineOptions) {
 		this.requestedWorkspaceRoot = resolve(options.workspaceRoot);
@@ -174,10 +183,33 @@ export class RestoreEngine {
 			writePaths,
 			...(scope === undefined ? {} : { scopePaths: [...scope] }),
 		};
-		return {
+		const plan = {
 			...semanticPlan,
 			planDigest: checksum(canonicalJson(semanticPlan)),
 		};
+		this.rememberPreparedPlan(plan, currentPaths, targetPaths);
+		return plan;
+	}
+
+	private rememberPreparedPlan(
+		plan: RestorePlan,
+		currentPaths: ReadonlyMap<string, OwnedPath>,
+		targetPaths: ReadonlyMap<string, OwnedPath>,
+	): void {
+		const cachedPlan = cloneRestorePlan(plan);
+		this.preparedPlans.set(preparedPlanKey(cachedPlan), { plan: cachedPlan, currentPaths, targetPaths });
+		while (this.preparedPlans.size > PREPARED_PLAN_CACHE_LIMIT) {
+			const oldest = this.preparedPlans.keys().next().value as string | undefined;
+			if (oldest === undefined) break;
+			this.preparedPlans.delete(oldest);
+		}
+	}
+
+	private takePreparedPlan(plan: RestorePlan): PreparedRestorePlan | undefined {
+		const key = preparedPlanKey(plan);
+		const prepared = this.preparedPlans.get(key);
+		if (prepared !== undefined) this.preparedPlans.delete(key);
+		return prepared;
 	}
 
 	async apply(
@@ -285,8 +317,10 @@ export class RestoreEngine {
 		}
 		assertCompatibleManifests(current, target);
 		let expectedPlan: RestorePlan;
+		let prepared: PreparedRestorePlan | undefined;
 		try {
 			expectedPlan = await this.plan(current, target, plan.scopePaths);
+			prepared = this.takePreparedPlan(expectedPlan);
 		} catch (error) {
 			if (error instanceof SnapshotStoreError && error.code === "object_missing") {
 				return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
@@ -307,10 +341,9 @@ export class RestoreEngine {
 		} catch {
 			return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
 		}
-		const [currentPaths, targetPaths] = await Promise.all([
-			this.readOwnedPaths(current),
-			this.readOwnedPaths(target),
-		]);
+		const [currentPaths, targetPaths] = prepared === undefined
+			? await Promise.all([this.readOwnedPaths(current), this.readOwnedPaths(target)])
+			: [prepared.currentPaths, prepared.targetPaths];
 		const quarantine = new QuarantineManager({
 			workspaceRoot: this.requestedWorkspaceRoot,
 			journal: options.mutationJournal,
@@ -1022,6 +1055,22 @@ export class RestoreEngine {
 		}
 		return new Set(canonical);
 	}
+}
+
+function preparedPlanKey(plan: RestorePlan): string {
+	return `${plan.currentManifestId}\0${plan.targetManifestId}\0${plan.planDigest}`;
+}
+
+function cloneRestorePlan(plan: RestorePlan): RestorePlan {
+	return {
+		currentManifestId: plan.currentManifestId,
+		targetManifestId: plan.targetManifestId,
+		boundaryRoots: [...plan.boundaryRoots],
+		deletePaths: [...plan.deletePaths],
+		writePaths: [...plan.writePaths],
+		...(plan.scopePaths === undefined ? {} : { scopePaths: [...plan.scopePaths] }),
+		planDigest: plan.planDigest,
+	};
 }
 
 function sameEntry(left: RestorePath, right: RestorePath): boolean {

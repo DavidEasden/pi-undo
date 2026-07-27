@@ -19,6 +19,34 @@ class CountingGitRunner extends GitRunner {
 }
 
 describe("undo/redo restore performance", () => {
+	it("四千文件 rollback snapshot 使用分块批量 Git 调用", async () => {
+		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-capture-perf-"));
+		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-capture-perf-store-"));
+		try {
+			await mkdir(join(workspace, "src"));
+			await Promise.all(Array.from({ length: 4_100 }, (_, index) => writeFile(
+				join(workspace, "src", `file-${String(index).padStart(5, "0")}.txt`),
+				`content ${index}\n`,
+			)));
+			const git = new CountingGitRunner();
+			const discovery = new RootDiscovery(git);
+			const store = new SnapshotStore({ storeRoot, git, discovery });
+			const topology = await discovery.discover(workspace);
+			git.calls.length = 0;
+
+			await store.capture(topology);
+
+			expect(countCommand(git.calls, "hash-object")).toBeLessThanOrEqual(33);
+			expect(countCommand(git.calls, "update-index")).toBe(2);
+			expect(countCommand(git.calls, "write-tree")).toBe(1);
+			expect(countCommand(git.calls, "cat-file")).toBe(1);
+			expect(git.calls.length).toBeLessThanOrEqual(52);
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+		}
+	}, 120_000);
+
 	it("scoped restore 的 Git 调用数不随未改动文件线性增长", async () => {
 		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-perf-"));
 		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-perf-store-"));

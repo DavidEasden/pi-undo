@@ -1,3 +1,4 @@
+import type { Stats } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -31,6 +32,10 @@ const GC_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 const IGNORE_POLICY = "git-check-ignore-v1";
 const NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
 const TREE_CACHE_LIMIT = 256;
+const HASH_BATCH_MAX_PATHS = 128;
+const HASH_BATCH_MAX_ARGUMENT_BYTES = 24 * 1024;
+const INDEX_BATCH_MAX_ENTRIES = 4_096;
+const INDEX_BATCH_MAX_BYTES = 8 * 1024 * 1024;
 
 interface PinRecord {
 	readonly schemaVersion: 1;
@@ -65,6 +70,7 @@ interface VisibleLeaf {
 	readonly relativePath: string;
 	readonly kind: "file" | "symlink";
 	readonly mode: number;
+	readonly fingerprint: string;
 }
 
 export interface SnapshotStoreOptions {
@@ -635,41 +641,63 @@ export class SnapshotStore {
 		exclusions: readonly string[],
 		exactExclusions: readonly string[],
 	): Promise<void> {
-		for (const leaf of await this.collectVisibleLeaves(
+		const leaves = await this.collectVisibleLeaves(
 			cwd,
 			environment,
 			gitBacked,
 			inclusions,
 			exclusions,
 			exactExclusions,
-		)) {
-			const absolutePath = join(cwd, ...leaf.relativePath.split("/"));
-			let objectId: string;
-			if (leaf.kind === "symlink") {
-				const linkText = await readlink(absolutePath, { encoding: "buffer" });
-				decodeUtf8(linkText, "symlink target 不是可无损表示的 UTF-8");
-				objectId = (await this.runGit(["hash-object", "-w", "--stdin"], {
-					cwd,
-					env: environment,
-					stdin: linkText,
-				})).trim();
-			} else {
-				objectId = (await this.runGit(["hash-object", "-w", "--no-filters", "--", leaf.relativePath], {
-					cwd,
-					env: environment,
-				})).trim();
+		);
+		const objectIds = new Map<string, string>();
+		for (const batch of hashPathBatches(leaves.filter((leaf) => leaf.kind === "file"))) {
+			for (const leaf of batch) await this.assertVisibleLeafUnchanged(cwd, leaf);
+			const output = await this.runGit([
+				"hash-object",
+				"-w",
+				"--no-filters",
+				"--",
+				...batch.map((leaf) => leaf.relativePath),
+			], { cwd, env: environment });
+			const hashes = parseObjectIdLines(output, batch.length);
+			for (const leaf of batch) await this.assertVisibleLeafUnchanged(cwd, leaf);
+			for (let index = 0; index < batch.length; index += 1) {
+				objectIds.set(batch[index]!.relativePath, hashes[index]!);
 			}
+		}
+		for (const leaf of leaves) {
+			if (leaf.kind !== "symlink") continue;
+			await this.assertVisibleLeafUnchanged(cwd, leaf);
+			const linkText = await readlink(join(cwd, ...leaf.relativePath.split("/")), { encoding: "buffer" });
+			decodeUtf8(linkText, "symlink target 不是可无损表示的 UTF-8");
+			const objectId = (await this.runGit(["hash-object", "-w", "--stdin"], {
+				cwd,
+				env: environment,
+				stdin: linkText,
+			})).trim();
 			if (!isObjectId(objectId)) {
 				throw new SnapshotStoreError("capture_failed", `文件对象 materialize 失败：${leaf.relativePath}`);
 			}
-			await this.runGit([
-				"update-index",
-				"--add",
-				"--cacheinfo",
-				leaf.mode.toString(8),
-				objectId,
-				leaf.relativePath,
-			], { cwd, env: environment });
+			await this.assertVisibleLeafUnchanged(cwd, leaf);
+			objectIds.set(leaf.relativePath, objectId);
+		}
+		for (const indexInput of indexInfoBatches(leaves, objectIds)) {
+			await this.runGit(["update-index", "-z", "--index-info"], {
+				cwd,
+				env: environment,
+				stdin: indexInput,
+			});
+		}
+	}
+
+	private async assertVisibleLeafUnchanged(cwd: string, leaf: VisibleLeaf): Promise<void> {
+		await assertNoSymlinkEscape(cwd, leaf.relativePath);
+		const metadata = await lstat(join(cwd, ...leaf.relativePath.split("/"))).catch((error) => {
+			if (hasErrorCode(error, "ENOENT")) return null;
+			throw error;
+		});
+		if (metadata === null || visibleLeafFingerprint(metadata) !== leaf.fingerprint) {
+			throw new SnapshotStoreError("capture_failed", `捕获期间工作区叶子已变化：${leaf.relativePath}`);
 		}
 	}
 
@@ -709,12 +737,18 @@ export class SnapshotStore {
 			});
 			if (metadata === null) continue;
 			if (metadata.isSymbolicLink()) {
-				result.push({ relativePath, kind: "symlink", mode: 0o120000 });
+				result.push({
+					relativePath,
+					kind: "symlink",
+					mode: 0o120000,
+					fingerprint: visibleLeafFingerprint(metadata),
+				});
 			} else if (metadata.isFile()) {
 				result.push({
 					relativePath,
 					kind: "file",
 					mode: (metadata.mode & 0o111) === 0 ? 0o100644 : 0o100755,
+					fingerprint: visibleLeafFingerprint(metadata),
 				});
 			} else {
 				throw new SnapshotStoreError("capture_failed", `不支持的工作区文件类型：${relativePath}`);
@@ -1198,6 +1232,76 @@ function isolatedGitConfiguration(): Readonly<Record<string, string | undefined>
 		GIT_CONFIG_NOSYSTEM: "1",
 		GIT_ATTR_NOSYSTEM: "1",
 	};
+}
+
+function indexInfoBatches(
+	leaves: readonly VisibleLeaf[],
+	objectIds: ReadonlyMap<string, string>,
+): Buffer[] {
+	const result: Buffer[] = [];
+	let records: string[] = [];
+	let bytes = 0;
+	for (const leaf of leaves) {
+		const objectId = objectIds.get(leaf.relativePath);
+		if (objectId === undefined) {
+			throw new SnapshotStoreError("capture_failed", `文件对象 materialize 结果缺失：${leaf.relativePath}`);
+		}
+		const record = `${leaf.mode.toString(8)} ${objectId}\t${leaf.relativePath}\0`;
+		const recordBytes = Buffer.byteLength(record, "utf8");
+		if (
+			records.length > 0 &&
+			(records.length >= INDEX_BATCH_MAX_ENTRIES || bytes + recordBytes > INDEX_BATCH_MAX_BYTES)
+		) {
+			result.push(Buffer.from(records.join(""), "utf8"));
+			records = [];
+			bytes = 0;
+		}
+		records.push(record);
+		bytes += recordBytes;
+	}
+	if (records.length > 0) result.push(Buffer.from(records.join(""), "utf8"));
+	return result;
+}
+
+function visibleLeafFingerprint(metadata: Stats): string {
+	return checksum(canonicalJson({
+		kind: metadata.isSymbolicLink() ? "symlink" : metadata.isFile() ? "file" : "other",
+		dev: metadata.dev,
+		ino: metadata.ino,
+		mode: metadata.mode,
+		size: metadata.size,
+		mtimeMs: metadata.mtimeMs,
+		ctimeMs: metadata.ctimeMs,
+	}));
+}
+
+function hashPathBatches(leaves: readonly VisibleLeaf[]): VisibleLeaf[][] {
+	const result: VisibleLeaf[][] = [];
+	let current: VisibleLeaf[] = [];
+	let argumentBytes = 0;
+	for (const leaf of leaves) {
+		const leafBytes = Buffer.byteLength(leaf.relativePath, "utf8") + 1;
+		if (
+			current.length > 0 &&
+			(current.length >= HASH_BATCH_MAX_PATHS || argumentBytes + leafBytes > HASH_BATCH_MAX_ARGUMENT_BYTES)
+		) {
+			result.push(current);
+			current = [];
+			argumentBytes = 0;
+		}
+		current.push(leaf);
+		argumentBytes += leafBytes;
+	}
+	if (current.length > 0) result.push(current);
+	return result;
+}
+
+function parseObjectIdLines(output: string, expectedCount: number): string[] {
+	const lines = output.endsWith("\n") ? output.slice(0, -1).split("\n") : output.split("\n");
+	if (lines.length !== expectedCount || lines.some((line) => !isObjectId(line))) {
+		throw new SnapshotStoreError("capture_failed", "git hash-object 批量输出无效");
+	}
+	return lines;
 }
 
 function parseTreeEntries(output: Uint8Array): CapturedTreeEntry[] {

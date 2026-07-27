@@ -5,6 +5,8 @@ import { checksum, topologyFingerprint } from "./encoding.ts";
 import { GitRunner } from "./git-runner.ts";
 import type { DiscoveryRoot } from "./model.ts";
 
+const DIRECTORY_SCAN_CONCURRENCY = 16;
+
 interface RepositoryInfo {
 	readonly absoluteRoot: string;
 	readonly commonGitDir: string;
@@ -87,22 +89,27 @@ export class RootDiscovery {
 		directory: string,
 		activeRoots: Map<string, DiscoveredRoot>,
 	): Promise<void> {
-		if (!await isSafeDirectory(directory, workspaceIdentity)) {
-			return;
-		}
-		const entries = await readdir(directory, { withFileTypes: true });
-		if (!await isSafeDirectory(directory, workspaceIdentity)) {
-			return;
-		}
-		for (const entry of entries) {
-			if (entry.name === ".git" || entry.isSymbolicLink() || !entry.isDirectory()) {
-				continue;
+		let level: Array<{ readonly path: string; readonly inspect: boolean }> = [{ path: directory, inspect: false }];
+		while (level.length > 0) {
+			const next: Array<{ readonly path: string; readonly inspect: true }> = [];
+			for (let index = 0; index < level.length; index += DIRECTORY_SCAN_CONCURRENCY) {
+				const children = await Promise.all(level.slice(index, index + DIRECTORY_SCAN_CONCURRENCY).map(
+					(candidate) => this.scanDirectoryNode(workspaceIdentity, candidate, activeRoots),
+				));
+				for (const group of children) next.push(...group);
 			}
-			const candidate = join(directory, entry.name);
-			if (!await isSafeDirectory(candidate, workspaceIdentity)) {
-				continue;
-			}
-			const inspection = await this.inspectRepository(candidate, workspaceIdentity);
+			level = next;
+		}
+	}
+
+	private async scanDirectoryNode(
+		workspaceIdentity: string,
+		candidate: { readonly path: string; readonly inspect: boolean },
+		activeRoots: Map<string, DiscoveredRoot>,
+	): Promise<Array<{ readonly path: string; readonly inspect: true }>> {
+		if (!await isSafeDirectory(candidate.path, workspaceIdentity)) return [];
+		if (candidate.inspect) {
+			const inspection = await this.inspectRepository(candidate.path, workspaceIdentity);
 			if (inspection.kind === "active") {
 				activeRoots.set(
 					inspection.repository.absoluteRoot,
@@ -111,8 +118,13 @@ export class RootDiscovery {
 			} else if (inspection.kind === "broken") {
 				activeRoots.set(inspection.absoluteRoot, brokenRoot(workspaceIdentity, inspection.absoluteRoot));
 			}
-			await this.scanDirectory(workspaceIdentity, candidate, activeRoots);
+			if (!await isSafeDirectory(candidate.path, workspaceIdentity)) return [];
 		}
+		const entries = await readdir(candidate.path, { withFileTypes: true });
+		if (!await isSafeDirectory(candidate.path, workspaceIdentity)) return [];
+		return entries
+			.filter((entry) => entry.name !== ".git" && !entry.isSymbolicLink() && entry.isDirectory())
+			.map((entry) => ({ path: join(candidate.path, entry.name), inspect: true as const }));
 	}
 
 	private async inspectRepository(candidate: string, workspaceIdentity: string): Promise<RepositoryInspection> {
