@@ -1,6 +1,6 @@
 {
 	"name": "@davideasden/pi-undo",
-	"version": "0.2.0",
+	"version": "0.2.1",
 	"description": "Persistent workspace undo and redo for Pi",
 	"type": "module",
 	"keywords": [
