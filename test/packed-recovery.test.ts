@@ -4,9 +4,13 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { createDurablePack, finalizeDurablePack } from "../src/durable-pack.ts";
+import { createDurablePack, finalizeDurablePack, loadDurablePack } from "../src/durable-pack.ts";
 import { MutationJournal } from "../src/mutation-journal.ts";
-import { cleanupPackedMutations, recoverPackedMutations } from "../src/packed-recovery.ts";
+import {
+	cleanupPackedMutations,
+	materializePackedMutationJournal,
+	recoverPackedMutations,
+} from "../src/packed-recovery.ts";
 import { fingerprintBytes } from "../src/quarantine.ts";
 
 const roots: string[] = [];
@@ -68,6 +72,123 @@ describe("packed mutation recovery", () => {
 		})).toEqual({ kind: "clean" });
 		expect(await readFile(join(fixtureValue.root, "a.txt"))).toEqual(fixtureValue.source);
 		expect(await fixtureValue.journal.assertCleaned()).toBeUndefined();
+	});
+
+	it("durable INTENT 前缀从 pack 补齐后再恢复全部路径", async () => {
+		const fixtureValue = await fixture("target");
+		const sourceFingerprintA = fingerprintBytes("a.txt", fixtureValue.source, 0o644);
+		const targetFingerprintA = fingerprintBytes("a.txt", fixtureValue.target, 0o644);
+		const sourceB = Buffer.from("source-b\n");
+		const targetB = Buffer.from("target-b\n");
+		const sourceFingerprintB = fingerprintBytes("b.txt", sourceB, 0o644);
+		const targetFingerprintB = fingerprintBytes("b.txt", targetB, 0o644);
+		await createDurablePack(fixtureValue.journal, {
+			opId: fixtureValue.journal.operationId,
+			planDigest: fixtureValue.planDigest,
+			entries: [
+				{
+					path: "a.txt",
+					sourceArtifact: ".pi-undo-q2-11111111111111111111111111111111-source",
+					targetArtifact: ".pi-undo-q2-11111111111111111111111111111111-target",
+					sourceFingerprint: sourceFingerprintA,
+					targetFingerprint: targetFingerprintA,
+					variants: [
+						{ kind: "file", fingerprint: sourceFingerprintA, mode: 0o644, bytes: fixtureValue.source },
+						{ kind: "file", fingerprint: targetFingerprintA, mode: 0o644, bytes: fixtureValue.target },
+					],
+				},
+				{
+					path: "b.txt",
+					sourceArtifact: ".pi-undo-q2-22222222222222222222222222222222-source",
+					targetArtifact: ".pi-undo-q2-22222222222222222222222222222222-target",
+					sourceFingerprint: sourceFingerprintB,
+					targetFingerprint: targetFingerprintB,
+					variants: [
+						{ kind: "file", fingerprint: sourceFingerprintB, mode: 0o644, bytes: sourceB },
+						{ kind: "file", fingerprint: targetFingerprintB, mode: 0o644, bytes: targetB },
+					],
+				},
+			],
+		});
+		await writeFile(join(fixtureValue.root, ".pi-undo-q2-22222222222222222222222222222222-source"), sourceB);
+		await writeFile(join(fixtureValue.root, "b.txt"), targetB);
+		await link(
+			join(fixtureValue.root, "b.txt"),
+			join(fixtureValue.root, ".pi-undo-q2-22222222222222222222222222222222-target"),
+		);
+		await fixtureValue.journal.beginMany([{
+			kind: "write",
+			path: "a.txt",
+			sourceArtifact: ".pi-undo-q2-11111111111111111111111111111111-source",
+			targetArtifact: ".pi-undo-q2-11111111111111111111111111111111-target",
+			sourceFingerprint: sourceFingerprintA,
+			targetFingerprint: targetFingerprintA,
+		}]);
+
+		expect(await recoverPackedMutations({
+			workspaceRoot: fixtureValue.root,
+			journal: fixtureValue.journal,
+			planDigest: fixtureValue.planDigest,
+			decision: "roll_forward",
+			retainArtifacts: true,
+		})).toEqual({ kind: "clean" });
+		expect((await fixtureValue.journal.load()).map((record) => [record.path, record.state])).toEqual([
+			["a.txt", "TARGET_VERIFIED"],
+			["b.txt", "TARGET_VERIFIED"],
+		]);
+	});
+
+	it("WAL immutable payload 与 pack 不匹配时 fail closed", async () => {
+		const fixtureValue = await fixture("target");
+		await fixtureValue.journal.beginMany([{
+			kind: "write",
+			path: "a.txt",
+			sourceArtifact: ".pi-undo-q2-33333333333333333333333333333333-source",
+			targetArtifact: ".pi-undo-q2-11111111111111111111111111111111-target",
+			sourceFingerprint: fingerprintBytes("a.txt", fixtureValue.source, 0o644),
+			targetFingerprint: fingerprintBytes("a.txt", fixtureValue.target, 0o644),
+		}]);
+
+		expect(await recoverPackedMutations({
+			workspaceRoot: fixtureValue.root,
+			journal: fixtureValue.journal,
+			planDigest: fixtureValue.planDigest,
+			decision: "rollback",
+		})).toEqual({ kind: "conflict", paths: 1 });
+		expect((await fixtureValue.journal.load())[0]?.state).toBe("INTENT");
+		expect(await readFile(join(fixtureValue.root, "a.txt"))).toEqual(fixtureValue.target);
+	});
+
+	it("WAL records 超出 pack 路径数量时 fail closed", async () => {
+		const fixtureValue = await fixture("target");
+		const sourceFingerprint = fingerprintBytes("a.txt", fixtureValue.source, 0o644);
+		const targetFingerprint = fingerprintBytes("a.txt", fixtureValue.target, 0o644);
+		await fixtureValue.journal.beginMany([
+			{
+				kind: "write",
+				path: "a.txt",
+				sourceArtifact: ".pi-undo-q2-11111111111111111111111111111111-source",
+				targetArtifact: ".pi-undo-q2-11111111111111111111111111111111-target",
+				sourceFingerprint,
+				targetFingerprint,
+			},
+			{
+				kind: "write",
+				path: "b.txt",
+				sourceArtifact: ".pi-undo-q2-22222222222222222222222222222222-source",
+				targetArtifact: ".pi-undo-q2-22222222222222222222222222222222-target",
+				sourceFingerprint: fingerprintBytes("b.txt", fixtureValue.source, 0o644),
+				targetFingerprint: fingerprintBytes("b.txt", fixtureValue.target, 0o644),
+			},
+		]);
+
+		expect(await recoverPackedMutations({
+			workspaceRoot: fixtureValue.root,
+			journal: fixtureValue.journal,
+			planDigest: fixtureValue.planDigest,
+			decision: "rollback",
+		})).toEqual({ kind: "conflict", paths: 2 });
+		expect((await fixtureValue.journal.load()).every((record) => record.state === "INTENT")).toBe(true);
 	});
 
 	it("source 已隔离且 target 未安装时 rollback 从 pack 恢复", async () => {
@@ -186,6 +307,54 @@ describe("packed mutation recovery", () => {
 			"TARGET_VERIFIED",
 			"CLEANED",
 		]);
+	});
+
+	it("native success 快路径并行 materialize WAL 与 fsync 后保留完整状态链", async () => {
+		const fixtureValue = await fixture("target");
+		const pack = await loadDurablePack(fixtureValue.journal, fixtureValue.planDigest, true);
+
+		await Promise.all([
+			materializePackedMutationJournal(fixtureValue.journal, pack),
+			finalizeDurablePack(fixtureValue.journal, fixtureValue.root, {
+				allowCleanedOwnershipWithoutMarker: false,
+			}),
+		]);
+		expect((await fixtureValue.journal.load())[0]?.state).toBe("TARGET_VERIFIED");
+		await cleanupPackedMutations({
+			workspaceRoot: fixtureValue.root,
+			journal: fixtureValue.journal,
+			planDigest: fixtureValue.planDigest,
+		});
+
+		const states = (await readFile(fixtureValue.journal.storagePath, "utf8"))
+			.trimEnd()
+			.split("\n")
+			.map((line) => (JSON.parse(line) as { state: string }).state);
+		expect(states).toEqual([
+			"INTENT",
+			"SOURCE_QUARANTINED",
+			"SOURCE_VERIFIED",
+			"TARGET_INSTALLED",
+			"TARGET_VERIFIED",
+			"CLEANED",
+		]);
+	});
+
+	it("native success 快路径仍拒绝同 fingerprint 不同 inode 的 external replacement", async () => {
+		const fixtureValue = await fixture("target");
+		const pack = await loadDurablePack(fixtureValue.journal, fixtureValue.planDigest, true);
+		await materializePackedMutationJournal(fixtureValue.journal, pack);
+		const original = join(fixtureValue.root, "a.txt");
+		await unlink(original);
+		await writeFile(original, fixtureValue.target);
+
+		await expect(finalizeDurablePack(fixtureValue.journal, fixtureValue.root))
+			.rejects.toThrow("target ownership 冲突");
+		expect((await fixtureValue.journal.load())[0]?.state).toBe("TARGET_VERIFIED");
+		expect(await readFile(join(
+			fixtureValue.root,
+			".pi-undo-q2-11111111111111111111111111111111-source",
+		))).toEqual(fixtureValue.source);
 	});
 
 	it("CLEANED 后 ownership marker 已清理仍可完成 cursor-after finalization", async () => {

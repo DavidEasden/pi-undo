@@ -305,9 +305,12 @@ export async function publishCachedDurablePack(
 export async function finalizeDurablePack(
 	journal: MutationJournal,
 	workspaceRoot: string,
+	options: { readonly allowCleanedOwnershipWithoutMarker?: boolean } = {},
 ): Promise<void> {
 	const pack = await loadDurablePack(journal, undefined, true);
-	const mutationStates = new Map((await journal.load()).map((record) => [record.path, record.state]));
+	const mutationStates = options.allowCleanedOwnershipWithoutMarker === false
+		? undefined
+		: new Map((await journal.load()).map((record) => [record.path, record.state]));
 	const canonicalRoot = resolve(workspaceRoot);
 	const directories = new Set<string>();
 	await mapConcurrent(pack.paths(), FINALIZE_CONCURRENCY, async (path) => {
@@ -325,23 +328,23 @@ export async function finalizeDurablePack(
 				throw new Error(`durable finalization target artifact 缺失：${path}`);
 			}
 			const targetArtifact = join(canonicalRoot, ...artifacts.target.split("/"));
-			if (await fingerprintFile(absolute, path) !== leaf.fingerprint) {
-				throw new Error(`durable finalization 文件 fingerprint 冲突：${path}`);
-			}
 			const targetArtifactExists = await lstat(targetArtifact).then(() => true, (error) => {
 				if (hasErrorCode(error, "ENOENT")) return false;
 				throw error;
 			});
 			if (targetArtifactExists) {
-				if (await fingerprintFile(targetArtifact, path) !== leaf.fingerprint) {
-					throw new Error(`durable finalization target artifact fingerprint 冲突：${path}`);
-				}
 				await assertSameFileIdentity(absolute, targetArtifact, path);
+				if (await fingerprintFile(absolute, path) !== leaf.fingerprint) {
+					throw new Error(`durable finalization 文件 fingerprint 冲突：${path}`);
+				}
 				await fsyncFile(targetArtifact);
 				await assertSameFileIdentity(absolute, targetArtifact, path);
 			} else {
-				if (mutationStates.get(path) !== "CLEANED") {
+				if (mutationStates?.get(path) !== "CLEANED") {
 					throw new Error(`durable finalization target ownership 缺失：${path}`);
+				}
+				if (await fingerprintFile(absolute, path) !== leaf.fingerprint) {
+					throw new Error(`durable finalization 文件 fingerprint 冲突：${path}`);
 				}
 				await fsyncFile(absolute);
 			}

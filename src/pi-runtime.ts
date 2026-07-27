@@ -16,7 +16,11 @@ import { finalizeDurablePack, hasDurablePack, loadDurablePack } from "./durable-
 import { assertCursor, canonicalJson, checksum } from "./encoding.ts";
 import { JournalStore, finalizeCursorMarker, inspectCursorMarkers } from "./journal.ts";
 import type { CheckpointRecord, ManifestId, SessionFileIdentity } from "./model.ts";
-import { cleanupPackedMutations, recoverPackedMutations } from "./packed-recovery.ts";
+import {
+	cleanupPackedMutations,
+	materializePackedMutationJournal,
+	recoverPackedMutations,
+} from "./packed-recovery.ts";
 import { JournalRecovery } from "./recovery.ts";
 import { QuarantineManager } from "./quarantine.ts";
 import { RestoreEngine } from "./restore-engine.ts";
@@ -132,15 +136,14 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 			try {
 				const mutationJournal = journal.mutationJournal(opId);
 				const pack = await loadDurablePack(mutationJournal, undefined, true);
-				const recovered = await recoverPackedMutations({
-					workspaceRoot: context.cwd,
-					journal: mutationJournal,
-					planDigest: pack.planDigest,
-					decision: "roll_forward",
-					retainArtifacts: true,
-				});
-				if (recovered.kind !== "clean") throw new Error("durable finalization mutation conflict");
-				await finalizeDurablePack(mutationJournal, context.cwd);
+				const [materialized, finalized] = await Promise.allSettled([
+					materializePackedMutationJournal(mutationJournal, pack),
+					finalizeDurablePack(mutationJournal, context.cwd, {
+						allowCleanedOwnershipWithoutMarker: false,
+					}),
+				]);
+				if (materialized.status === "rejected") throw materialized.reason;
+				if (finalized.status === "rejected") throw finalized.reason;
 				await cleanupPackedMutations({
 					workspaceRoot: context.cwd,
 					journal: mutationJournal,

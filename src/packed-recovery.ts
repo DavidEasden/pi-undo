@@ -2,7 +2,7 @@ import { link, lstat, rm, unlink } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 
 import { fsyncDirectory, writeBytesExclusive } from "./atomic-fs.ts";
-import { loadDurablePack, type DurableLeaf } from "./durable-pack.ts";
+import { loadDurablePack, type DurableLeaf, type DurablePack } from "./durable-pack.ts";
 import type { MutationJournal } from "./mutation-journal.ts";
 import type { MutationRecord, MutationState } from "./model.ts";
 import { assertNoSymlinkEscape, relativeSafePath } from "./path-safety.ts";
@@ -19,6 +19,19 @@ const stateOrder: readonly MutationState[] = [
 	"CLEANED",
 ];
 
+export async function materializePackedMutationJournal(
+	journal: MutationJournal,
+	pack: DurablePack,
+): Promise<void> {
+	const records = await ensurePackedIntents(journal, pack, await journal.load());
+	const terminalIndex = stateOrder.indexOf("TARGET_VERIFIED");
+	const advances = records.map((record) => ({
+		ordinal: record.ordinal,
+		states: stateOrder.slice(stateOrder.indexOf(record.state) + 1, terminalIndex + 1),
+	})).filter((advance) => advance.states.length > 0);
+	if (advances.length > 0) await journal.advanceBatch(advances);
+}
+
 export async function recoverPackedMutations(options: {
 	readonly workspaceRoot: string;
 	readonly journal: MutationJournal;
@@ -29,31 +42,7 @@ export async function recoverPackedMutations(options: {
 	try {
 		const workspaceRoot = resolve(options.workspaceRoot);
 		const pack = await loadDurablePack(options.journal, options.planDigest, true);
-		let records = [...await options.journal.load()];
-		if (records.length === 0) {
-			records = [...await options.journal.beginMany(pack.paths().map((path) => {
-				const artifacts = pack.artifacts(path);
-				const sourceFingerprint = pack.sourceFingerprint(path);
-				const targetFingerprint = pack.targetFingerprint(path);
-				if (
-					artifacts === undefined ||
-					artifacts.target === null ||
-					sourceFingerprint === undefined ||
-					targetFingerprint === undefined ||
-					targetFingerprint === null
-				) {
-					throw new Error(`packed recovery intent 缺失：${path}`);
-				}
-				return {
-					kind: "write" as const,
-					path,
-					sourceArtifact: artifacts.source,
-					targetArtifact: artifacts.target,
-					sourceFingerprint,
-					targetFingerprint,
-				};
-			}))];
-		}
+		const records = await ensurePackedIntents(options.journal, pack, await options.journal.load());
 		await mapConcurrent(records, PACKED_RECOVERY_CONCURRENCY, async (record) => {
 			if (record.kind !== "write" || record.targetArtifact === null) throw new Error("packed recovery 只支持普通文件 write");
 			const source = pack.leaf(record.path, record.sourceFingerprint);
@@ -112,8 +101,6 @@ export async function cleanupPackedMutations(options: {
 		const targetArtifact = join(workspaceRoot, ...record.targetArtifact.split("/"));
 		const source = pack.leaf(record.path, record.sourceFingerprint);
 		if (source === undefined) throw new Error(`packed cleanup source variant 缺失：${record.path}`);
-		await assertArtifact(sourceArtifact, record.path, record.sourceFingerprint, source.kind === "absent");
-		await assertArtifact(targetArtifact, record.path, record.targetFingerprint, false);
 		if (await pathExists(targetArtifact)) {
 			await assertSameFileIdentity(original, targetArtifact, record.path);
 		} else if (record.state !== "CLEANED") {
@@ -128,6 +115,62 @@ export async function cleanupPackedMutations(options: {
 		.map((record) => ({ ordinal: record.ordinal, states: ["CLEANED" as const] }));
 	if (advances.length > 0) await options.journal.advanceBatch(advances);
 	await options.journal.assertCleaned();
+}
+
+async function ensurePackedIntents(
+	journal: MutationJournal,
+	pack: DurablePack,
+	loaded: readonly MutationRecord[],
+): Promise<MutationRecord[]> {
+	const paths = pack.paths();
+	if (loaded.length > paths.length) throw new Error("packed mutation journal 路径数量不匹配");
+	const records = [...loaded];
+	for (let index = 0; index < records.length; index += 1) {
+		assertPackedRecord(pack, paths[index]!, records[index]!);
+	}
+	if (records.length < paths.length) {
+		records.push(...await journal.beginMany(
+			paths.slice(records.length).map((path) => packedIntent(pack, path)),
+		));
+	}
+	return records;
+}
+
+function packedIntent(pack: DurablePack, path: string) {
+	const artifacts = pack.artifacts(path);
+	const sourceFingerprint = pack.sourceFingerprint(path);
+	const targetFingerprint = pack.targetFingerprint(path);
+	if (
+		artifacts === undefined ||
+		artifacts.target === null ||
+		sourceFingerprint === undefined ||
+		targetFingerprint === undefined ||
+		targetFingerprint === null
+	) {
+		throw new Error(`packed recovery intent 缺失：${path}`);
+	}
+	return {
+		kind: "write" as const,
+		path,
+		sourceArtifact: artifacts.source,
+		targetArtifact: artifacts.target,
+		sourceFingerprint,
+		targetFingerprint,
+	};
+}
+
+function assertPackedRecord(pack: DurablePack, path: string, record: MutationRecord): void {
+	const expected = packedIntent(pack, path);
+	if (
+		record.kind !== expected.kind ||
+		record.path !== expected.path ||
+		record.sourceArtifact !== expected.sourceArtifact ||
+		record.targetArtifact !== expected.targetArtifact ||
+		record.sourceFingerprint !== expected.sourceFingerprint ||
+		record.targetFingerprint !== expected.targetFingerprint
+	) {
+		throw new Error(`packed mutation journal 与 pack 不匹配：${path}`);
+	}
 }
 
 async function normalizeRecord(
