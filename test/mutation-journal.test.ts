@@ -122,6 +122,33 @@ describe("MutationJournal", () => {
 		expect((await readFile(file, "utf8")).split("\n").filter(Boolean)).toHaveLength(3);
 	});
 
+	it("beginMany 与 advanceBatch 跨 ordinal 保持全局物理 hash chain", async () => {
+		const { journal, file } = await journalFixture();
+		const begun = await journal.beginMany([
+			intent(),
+			intent("b.txt", {
+				sourceArtifact: ".b.txt.pi-undo-source",
+				targetArtifact: ".b.txt.pi-undo-target",
+			}),
+		]);
+
+		const advanced = await journal.advanceBatch(begun.map((record) => ({
+			ordinal: record.ordinal,
+			states: ["SOURCE_QUARANTINED", "SOURCE_VERIFIED"],
+		})));
+
+		expect(begun.map((record) => record.ordinal)).toEqual([1, 2]);
+		expect(advanced).toHaveLength(4);
+		for (let index = 1; index < advanced.length; index += 1) {
+			expect(advanced[index]!.previousChecksum).toBe(advanced[index - 1]!.checksum);
+		}
+		expect(await new MutationJournal(file, "operation-1").load()).toMatchObject([
+			{ ordinal: 1, state: "SOURCE_VERIFIED" },
+			{ ordinal: 2, state: "SOURCE_VERIFIED" },
+		]);
+		expect((await readFile(file, "utf8")).split("\n").filter(Boolean)).toHaveLength(6);
+	});
+
 	it("两个 ordinal 共用按物理追加顺序形成的全局 hash chain", async () => {
 		const { journal } = await journalFixture();
 		const first = await journal.begin(intent());

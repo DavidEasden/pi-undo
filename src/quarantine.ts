@@ -18,6 +18,14 @@ export interface ReplaceFileRequest {
 	readonly beforeInstall?: () => void | Promise<void>;
 }
 
+interface PreparedFileReplacement {
+	readonly request: ReplaceFileRequest;
+	readonly sourceArtifact: string;
+	readonly targetArtifact: string;
+	readonly targetAbsolutePath: string;
+	readonly intent: MutationRecord;
+}
+
 export interface ReplaceSymlinkRequest {
 	readonly path: string;
 	readonly targetLinkText: string;
@@ -136,6 +144,178 @@ export class QuarantineManager {
 		return targetStates.at(-1)!;
 	}
 
+	async replaceFiles(requests: readonly ReplaceFileRequest[]): Promise<void> {
+		if (requests.length === 0) return;
+		const prepared: Array<Omit<PreparedFileReplacement, "intent">> = [];
+		for (const request of requests) {
+			await this.assertWorkspaceIdentity();
+			await this.assertPath(request.path);
+			assertFingerprint(request.sourceFingerprint);
+			assertFingerprint(request.targetFingerprint);
+			assertMode(request.targetMode);
+			const artifacts = await this.artifactPaths(request.path, true);
+			prepared.push({
+				request,
+				sourceArtifact: artifacts.sourceArtifact,
+				targetArtifact: artifacts.targetArtifact!,
+				targetAbsolutePath: this.absolute(artifacts.targetArtifact!),
+			});
+		}
+		const intents = await this.journal.beginMany(prepared.map(({ request, sourceArtifact, targetArtifact }) => ({
+			kind: "write" as const,
+			path: request.path,
+			sourceArtifact,
+			targetArtifact,
+			sourceFingerprint: request.sourceFingerprint,
+			targetFingerprint: request.targetFingerprint,
+		})));
+		const replacements: PreparedFileReplacement[] = prepared.map((replacement, index) => ({
+			...replacement,
+			intent: intents[index]!,
+		}));
+		for (const replacement of replacements) {
+			await this.beforeTargetCreate?.();
+			await this.assertMutationPaths(replacement.request.path, replacement.targetArtifact);
+			await writeBytesExclusive(
+				replacement.targetAbsolutePath,
+				replacement.request.targetBytes,
+				replacement.request.targetMode,
+				{ syncDirectory: false },
+			);
+			await this.assertFingerprint(
+				replacement.targetAbsolutePath,
+				replacement.request.path,
+				replacement.request.targetFingerprint,
+			);
+		}
+		await this.quarantineFileSources(replacements);
+		const installDirectories = new Set<string>();
+		for (const replacement of replacements) {
+			const { request, targetArtifact, targetAbsolutePath } = replacement;
+			await request.beforeInstall?.();
+			await this.assertMutationPaths(request.path, targetArtifact);
+			await this.assertFingerprint(targetAbsolutePath, request.path, request.targetFingerprint);
+			try {
+				await this.linkFile(targetAbsolutePath, this.absolute(request.path));
+			} catch (error) {
+				if (hasErrorCode(error, "EEXIST")) {
+					throw new QuarantineError("external_concurrency", `检测到外部并发修改：${request.path}`);
+				}
+				throw error;
+			}
+			installDirectories.add(dirname(this.absolute(request.path)));
+		}
+		await syncDirectories(installDirectories);
+		for (const { request, targetArtifact, targetAbsolutePath } of replacements) {
+			await this.assertFingerprint(this.absolute(request.path), request.path, request.targetFingerprint);
+			await this.assertArtifactPath(request.path, targetArtifact);
+			await this.assertFingerprint(targetAbsolutePath, request.path, request.targetFingerprint);
+		}
+		const targetRecords = await this.journal.advanceBatch(replacements.map(({ intent }) => ({
+			ordinal: intent.ordinal,
+			states: ["SOURCE_QUARANTINED", "SOURCE_VERIFIED", "TARGET_INSTALLED", "TARGET_VERIFIED"],
+		})));
+		const verifiedByOrdinal = new Map(
+			targetRecords.filter((record) => record.state === "TARGET_VERIFIED")
+				.map((record) => [record.ordinal, record]),
+		);
+		const verifiedRecords: MutationRecord[] = [];
+		for (const replacement of replacements) {
+			const verified = verifiedByOrdinal.get(replacement.intent.ordinal);
+			if (verified === undefined) throw new Error("批量 TARGET_VERIFIED record 缺失");
+			verifiedRecords.push(await this.assertOwnedRecord(verified));
+		}
+		await this.cleanupVerifiedArtifactsBatch(verifiedRecords);
+		await this.journal.advanceBatch(replacements.map(({ intent }) => ({
+			ordinal: intent.ordinal,
+			states: ["CLEANED"],
+		})));
+	}
+
+	private async quarantineFileSources(replacements: readonly PreparedFileReplacement[]): Promise<void> {
+		const capturedDirectories = new Set<string>();
+		for (const { intent } of replacements) {
+			const original = this.absolute(intent.path);
+			const source = this.absolute(intent.sourceArtifact);
+			await this.assertFingerprint(original, intent.path, intent.sourceFingerprint);
+			if (intent.sourceFingerprint === fingerprintAbsent(intent.path)) {
+				if (await exists(source)) {
+					throw new QuarantineError("unsafe_artifact", `absent source 不应存在 artifact：${intent.path}`);
+				}
+				continue;
+			}
+			const metadata = await lstat(original);
+			if (!metadata.isFile()) throw new QuarantineError("unsafe_artifact", "批量 quarantine 只支持普通文件");
+			await this.beforeSourceCapture?.();
+			await this.assertMutationPaths(intent.path, intent.sourceArtifact);
+			try {
+				await link(original, source);
+			} catch (error) {
+				if (hasErrorCode(error, "EEXIST")) {
+					throw new QuarantineError("external_concurrency", `source artifact 被抢占：${intent.path}`);
+				}
+				throw error;
+			}
+			capturedDirectories.add(dirname(original));
+		}
+		await syncDirectories(capturedDirectories);
+
+		const removedDirectories = new Set<string>();
+		for (const { intent } of replacements) {
+			if (intent.sourceFingerprint === fingerprintAbsent(intent.path)) continue;
+			const original = this.absolute(intent.path);
+			const source = this.absolute(intent.sourceArtifact);
+			await this.beforeSourceRemove?.();
+			await this.assertMutationPaths(intent.path, intent.sourceArtifact);
+			await this.assertFingerprint(source, intent.path, intent.sourceFingerprint);
+			await this.assertFingerprint(original, intent.path, intent.sourceFingerprint);
+			const [sourceMetadata, originalMetadata] = await Promise.all([lstat(source), lstat(original)]);
+			if (sourceMetadata.dev !== originalMetadata.dev || sourceMetadata.ino !== originalMetadata.ino) {
+				throw new QuarantineError("external_concurrency", `source 隔离前原路径已变化：${intent.path}`);
+			}
+			await unlink(original);
+			removedDirectories.add(dirname(original));
+		}
+		await syncDirectories(removedDirectories);
+		for (const { intent } of replacements) {
+			await this.assertFingerprint(this.absolute(intent.path), intent.path, fingerprintAbsent(intent.path));
+			if (intent.sourceFingerprint !== fingerprintAbsent(intent.path)) {
+				await this.assertFingerprint(
+					this.absolute(intent.sourceArtifact),
+					intent.path,
+					intent.sourceFingerprint,
+				);
+			}
+		}
+	}
+
+	private async cleanupVerifiedArtifactsBatch(records: readonly MutationRecord[]): Promise<void> {
+		const directories = new Set<string>();
+		for (const owned of records) {
+			if (owned.state !== "TARGET_VERIFIED") {
+				throw new QuarantineError("unsafe_artifact", "只有 TARGET_VERIFIED mutation 可以批量清理");
+			}
+			await this.assertFingerprint(this.absolute(owned.path), owned.path, owned.targetFingerprint);
+			const source = this.absolute(owned.sourceArtifact);
+			if (await exists(source)) {
+				await this.assertArtifactPath(owned.path, owned.sourceArtifact);
+				await this.assertFingerprint(source, owned.path, owned.sourceFingerprint);
+				await unlink(source);
+				directories.add(dirname(source));
+			}
+			if (owned.targetArtifact !== null) {
+				const target = this.absolute(owned.targetArtifact);
+				if (await exists(target)) {
+					await this.assertArtifactPath(owned.path, owned.targetArtifact);
+					await this.assertFingerprint(target, owned.path, owned.targetFingerprint);
+					await unlink(target);
+					directories.add(dirname(target));
+				}
+			}
+		}
+		await syncDirectories(directories);
+	}
+
 	async replaceSymlink(request: ReplaceSymlinkRequest): Promise<MutationRecord> {
 		await this.assertWorkspaceIdentity();
 		await this.assertPath(request.path);
@@ -208,6 +388,14 @@ export class QuarantineManager {
 				throw new QuarantineError("external_concurrency", `已 CLEANED rollback 现场不一致：${owned.path}`);
 			}
 			await this.assertTargetArtifactAbsent(owned);
+			return;
+		}
+		if (
+			owned.state === "TARGET_VERIFIED" && !sourceWasAbsent && !sourceExists &&
+			originalFingerprint === owned.targetFingerprint
+		) {
+			await this.cleanupRollbackTarget(owned);
+			await this.journal.markRollbackCleaned(owned.ordinal);
 			return;
 		}
 		if (sourceWasAbsent) {
@@ -363,9 +551,15 @@ export class QuarantineManager {
 	async cleanupMutation(record: MutationRecord): Promise<void> {
 		const owned = await this.assertOwnedRecord(record);
 		if (owned.state === "CLEANED") return;
+		await this.cleanupVerifiedArtifacts(owned);
+		await this.journal.advance(owned.ordinal, "CLEANED");
+	}
+
+	private async cleanupVerifiedArtifacts(owned: MutationRecord): Promise<void> {
 		if (owned.state !== "TARGET_VERIFIED") {
 			throw new QuarantineError("unsafe_artifact", "只有 TARGET_VERIFIED mutation 可以清理");
 		}
+		await this.assertFingerprint(this.absolute(owned.path), owned.path, owned.targetFingerprint);
 		const source = this.absolute(owned.sourceArtifact);
 		if (await exists(source)) {
 			await this.assertArtifactPath(owned.path, owned.sourceArtifact);
@@ -382,7 +576,6 @@ export class QuarantineManager {
 				await fsyncDirectory(dirname(target));
 			}
 		}
-		await this.journal.advance(owned.ordinal, "CLEANED");
 	}
 
 	async inspectArtifacts(): Promise<readonly QuarantineArtifact[]> {
@@ -609,6 +802,10 @@ function immutableMutation(record: MutationRecord): string {
 		sourceFingerprint: record.sourceFingerprint,
 		targetFingerprint: record.targetFingerprint,
 	});
+}
+
+async function syncDirectories(directories: ReadonlySet<string>): Promise<void> {
+	for (const directory of directories) await fsyncDirectory(directory);
 }
 
 async function exists(path: string): Promise<boolean> {

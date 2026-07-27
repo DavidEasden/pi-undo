@@ -14,6 +14,11 @@ export interface MutationIntent {
 	readonly targetFingerprint: string;
 }
 
+export interface MutationAdvance {
+	readonly ordinal: number;
+	readonly states: readonly MutationState[];
+}
+
 interface JournalRecords {
 	readonly latest: readonly MutationRecord[];
 	readonly tail: MutationRecord | undefined;
@@ -60,27 +65,39 @@ export class MutationJournal {
 	}
 
 	begin(intent: MutationIntent): Promise<MutationRecord> {
-		return this.enqueueMutation(() => this.beginMutation(intent));
+		return this.enqueueMutation(async () => (await this.beginManyMutation([intent]))[0]!);
 	}
 
-	private async beginMutation(intent: MutationIntent): Promise<MutationRecord> {
+	beginMany(intents: readonly MutationIntent[]): Promise<readonly MutationRecord[]> {
+		return this.enqueueMutation(() => this.beginManyMutation(intents));
+	}
+
+	private async beginManyMutation(intents: readonly MutationIntent[]): Promise<readonly MutationRecord[]> {
+		if (intents.length === 0) throw new Error("mutation 批量 intent 不能为空");
 		const current = await this.readRecords();
-		const content = {
-			schemaVersion: 1 as const,
-			opId: this.opId,
-			ordinal: current.latest.length + 1,
-			state: "INTENT" as const,
-			kind: intent.kind,
-			path: intent.path,
-			sourceArtifact: intent.sourceArtifact,
-			targetArtifact: intent.targetArtifact,
-			sourceFingerprint: intent.sourceFingerprint,
-			targetFingerprint: intent.targetFingerprint,
-			previousChecksum: current.tail?.checksum ?? null,
-		};
-		const record = assertMutationRecord({ ...content, checksum: checksum(canonicalJson(content)) });
-		await this.append([record], current);
-		return record;
+		let tail = current.tail;
+		const records: MutationRecord[] = [];
+		for (let index = 0; index < intents.length; index += 1) {
+			const intent = intents[index]!;
+			const content = {
+				schemaVersion: 1 as const,
+				opId: this.opId,
+				ordinal: current.latest.length + index + 1,
+				state: "INTENT" as const,
+				kind: intent.kind,
+				path: intent.path,
+				sourceArtifact: intent.sourceArtifact,
+				targetArtifact: intent.targetArtifact,
+				sourceFingerprint: intent.sourceFingerprint,
+				targetFingerprint: intent.targetFingerprint,
+				previousChecksum: tail?.checksum ?? null,
+			};
+			const record = assertMutationRecord({ ...content, checksum: checksum(canonicalJson(content)) });
+			records.push(record);
+			tail = record;
+		}
+		await this.append(records, current);
+		return records;
 	}
 
 	advance(ordinal: number, state: MutationState): Promise<MutationRecord> {
@@ -89,6 +106,10 @@ export class MutationJournal {
 
 	advanceMany(ordinal: number, states: readonly MutationState[]): Promise<readonly MutationRecord[]> {
 		return this.enqueueMutation(() => this.advanceManyMutation(ordinal, states));
+	}
+
+	advanceBatch(advances: readonly MutationAdvance[]): Promise<readonly MutationRecord[]> {
+		return this.enqueueMutation(() => this.advanceBatchMutation(advances));
 	}
 
 	markRollbackCleaned(ordinal: number): Promise<MutationRecord> {
@@ -109,37 +130,47 @@ export class MutationJournal {
 		return record!;
 	}
 
-	private async advanceManyMutation(
+	private advanceManyMutation(
 		ordinal: number,
 		states: readonly MutationState[],
 	): Promise<readonly MutationRecord[]> {
-		if (states.length === 0) throw new Error("mutation 批量状态不能为空");
+		return this.advanceBatchMutation([{ ordinal, states }]);
+	}
+
+	private async advanceBatchMutation(
+		advances: readonly MutationAdvance[],
+	): Promise<readonly MutationRecord[]> {
+		if (advances.length === 0 || advances.some((advance) => advance.states.length === 0)) {
+			throw new Error("mutation 批量状态不能为空");
+		}
 		const current = await this.readRecords();
 		const latest = [...current.latest];
 		let tail = current.tail;
 		const records: MutationRecord[] = [];
-		for (const state of states) {
-			const previous = latest[ordinal - 1];
-			if (previous === undefined || stateOrder.indexOf(state) !== stateOrder.indexOf(previous.state) + 1) {
-				throw new Error(`mutation state 必须严格推进：${previous?.state ?? "missing"} -> ${state}`);
+		for (const advance of advances) {
+			for (const state of advance.states) {
+				const previous = latest[advance.ordinal - 1];
+				if (previous === undefined || stateOrder.indexOf(state) !== stateOrder.indexOf(previous.state) + 1) {
+					throw new Error(`mutation state 必须严格推进：${previous?.state ?? "missing"} -> ${state}`);
+				}
+				const content = {
+					schemaVersion: previous.schemaVersion,
+					opId: previous.opId,
+					ordinal: previous.ordinal,
+					state,
+					kind: previous.kind,
+					path: previous.path,
+					sourceArtifact: previous.sourceArtifact,
+					targetArtifact: previous.targetArtifact,
+					sourceFingerprint: previous.sourceFingerprint,
+					targetFingerprint: previous.targetFingerprint,
+					previousChecksum: tail?.checksum ?? null,
+				};
+				const record = assertMutationRecord({ ...content, checksum: checksum(canonicalJson(content)) });
+				records.push(record);
+				latest[advance.ordinal - 1] = record;
+				tail = record;
 			}
-			const content = {
-				schemaVersion: previous.schemaVersion,
-				opId: previous.opId,
-				ordinal: previous.ordinal,
-				state,
-				kind: previous.kind,
-				path: previous.path,
-				sourceArtifact: previous.sourceArtifact,
-				targetArtifact: previous.targetArtifact,
-				sourceFingerprint: previous.sourceFingerprint,
-				targetFingerprint: previous.targetFingerprint,
-				previousChecksum: tail?.checksum ?? null,
-			};
-			const record = assertMutationRecord({ ...content, checksum: checksum(canonicalJson(content)) });
-			records.push(record);
-			latest[ordinal - 1] = record;
-			tail = record;
 		}
 		await this.append(records, current);
 		return records;

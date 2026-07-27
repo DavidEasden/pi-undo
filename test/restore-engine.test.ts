@@ -634,12 +634,13 @@ describe("RestoreEngine", () => {
 	it("rollback pending 无法终结时即使 current 可验证也返回 recovery_required", async () => {
 		const workspace = await temporaryRoot("pi-undo-restore-workspace-");
 		await writeFile(workspace, "a.txt", "target-a\n");
-		await writeFile(workspace, "b.txt", "target-b\n");
+		await symlink("a.txt", join(workspace, "b.txt"));
 		const storeRoot = await temporaryRoot("pi-undo-restore-store-");
 		const discovery = new RootDiscovery();
 		const store = new SnapshotStore({ storeRoot });
 		const target = await store.capture(await discovery.discover(workspace));
 		await writeFile(workspace, "a.txt", "current-a\n");
+		await rm(join(workspace, "b.txt"));
 		await writeFile(workspace, "b.txt", "current-b\n");
 		const current = await store.capture(await discovery.discover(workspace));
 		const journal = new FailingSecondRollbackCleanJournal(
@@ -652,7 +653,7 @@ describe("RestoreEngine", () => {
 			discovery,
 			beforeMutation: (mutation) => {
 				if (
-					(mutation.phase === "apply" && mutation.path === "b.txt") ||
+					(mutation.phase === "apply" && mutation.kind === "symlink" && mutation.path === "b.txt") ||
 					(mutation.phase === "rollback" && mutation.path === "a.txt")
 				) {
 					throw new Error("注入 mutation 失败");
@@ -666,9 +667,20 @@ describe("RestoreEngine", () => {
 		});
 
 		expect(result.code).toBe("recovery_required");
-		expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("target-a\n");
-		expect(await readFile(join(workspace, "b.txt"), "utf8")).toBe("current-b\n");
-		expect((await journal.activeArtifacts()).size).toBeGreaterThan(0);
+		await expect(access(join(workspace, "a.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(access(join(workspace, "b.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+		const active = await journal.activeArtifacts();
+		expect(active.size).toBeGreaterThan(0);
+		const preserved = (await Promise.all([...active].map((artifact) =>
+			readFile(join(workspace, artifact), "utf8").catch(() => null)
+		))).filter((content): content is string => content !== null);
+		expect(preserved).toContain("target-a\n");
+		expect(preserved).toContain("current-a\n");
+		const currentB = (await store.listTree(current.manifestId, "."))
+			.find((entry) => entry.relativePath === "b.txt");
+		expect(currentB?.blobId).not.toBeNull();
+		expect(Buffer.from(await store.readBlob(current.manifestId, ".", currentB!.blobId!, "b.txt")).toString())
+			.toBe("current-b\n");
 	});
 
 	it("相同 plan 重复兼容 apply 使用不同 journal 身份", async () => {
@@ -683,19 +695,19 @@ describe("RestoreEngine", () => {
 		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
 		const plan = await engine.plan(current, target);
 		const journals = new Set<MutationJournal>();
-		const originalBegin = MutationJournal.prototype.begin;
-		const begin = vi.spyOn(MutationJournal.prototype, "begin").mockImplementation(function (
+		const originalBeginMany = MutationJournal.prototype.beginMany;
+		const beginMany = vi.spyOn(MutationJournal.prototype, "beginMany").mockImplementation(function (
 			this: MutationJournal,
-			intent,
+			intents,
 		) {
 			journals.add(this);
-			return originalBegin.call(this, intent);
+			return originalBeginMany.call(this, intents);
 		});
 
 		expect((await engine.apply(plan, target)).code).toBe("ok");
 		await writeFile(workspace, "a.txt", "current\n");
 		expect((await engine.apply(plan, target)).code).toBe("ok");
-		begin.mockRestore();
+		beginMany.mockRestore();
 
 		expect(journals.size).toBe(2);
 		expect(new Set([...journals].map((journal) => journal.operationId)).size).toBe(2);
@@ -731,12 +743,13 @@ describe("RestoreEngine", () => {
 	it("rollback 再失败时返回 partial/recovery 并保留 recovery pin", async () => {
 		const workspace = await temporaryRoot("pi-undo-restore-workspace-");
 		await writeFile(workspace, "a.txt", "target-a\n");
-		await writeFile(workspace, "b.txt", "target-b\n");
+		await symlink("a.txt", join(workspace, "b.txt"));
 		const storeRoot = await temporaryRoot("pi-undo-restore-store-");
 		const discovery = new RootDiscovery();
 		const store = new SnapshotStore({ storeRoot });
 		const target = await store.capture(await discovery.discover(workspace));
 		await writeFile(workspace, "a.txt", "current-a\n");
+		await rm(join(workspace, "b.txt"));
 		await writeFile(workspace, "b.txt", "current-b\n");
 		const current = await store.capture(await discovery.discover(workspace));
 		const engine = new RestoreEngine({
@@ -745,7 +758,7 @@ describe("RestoreEngine", () => {
 			discovery,
 			beforeMutation: (mutation) => {
 				if (
-					(mutation.phase === "apply" && mutation.ordinal === 2) ||
+					(mutation.phase === "apply" && mutation.kind === "symlink" && mutation.path === "b.txt") ||
 					(mutation.phase === "rollback" && mutation.ordinal === 1)
 				) {
 					throw new Error("注入双重 mutation 失败");

@@ -19,10 +19,13 @@ import {
 	fingerprintAbsent,
 	fingerprintBytes,
 	fingerprintSymlink,
+	type ReplaceFileRequest,
 } from "./quarantine.ts";
 import { SnapshotStoreError, type SnapshotStore } from "./snapshot-store.ts";
 
 const PREPARED_PLAN_CACHE_LIMIT = 16;
+const RESTORE_FILE_BATCH_MAX_ENTRIES = 128;
+const RESTORE_FILE_BATCH_MAX_BYTES = 32 * 1024 * 1024;
 
 export interface RestorePlan {
 	currentManifestId: ManifestId;
@@ -800,24 +803,89 @@ export class RestoreEngine {
 		writePaths: readonly string[],
 		context: MutationContext,
 	): Promise<void> {
+		let fileBatch: OwnedPath[] = [];
+		let fileBatchBytes = 0;
+		let fileBatchRoot: string | undefined;
+		const flushFiles = async (): Promise<void> => {
+			if (fileBatch.length === 0) return;
+			const requests: ReplaceFileRequest[] = [];
+			for (const target of fileBatch) {
+				requests.push(await this.prepareFileReplacement(manifestId, target, context));
+			}
+			await context.quarantine.replaceFiles(requests);
+			fileBatch = [];
+			fileBatchBytes = 0;
+			fileBatchRoot = undefined;
+		};
 		for (const kind of ["directory", "leaf"] as const) {
 			for (const path of writePaths) {
 				const target = targetPaths.get(path);
 				if (target === undefined) {
 					throw new Error(`${context.phase} plan 引用了 manifest 外路径：${path}`);
 				}
-				if ((target.entry.kind === "directory") !== (kind === "directory")) {
-					continue;
-				}
+				if ((target.entry.kind === "directory") !== (kind === "directory")) continue;
 				if (context.sourceIgnoredPaths.has(path)) {
-					if (await this.entryMatches(manifestId, target)) {
-						continue;
-					}
+					await flushFiles();
+					if (await this.entryMatches(manifestId, target)) continue;
 					throw new Error(`${context.phase} 的 ignored-present 路径与目标内容冲突：${path}`);
 				}
-				await this.writePath(manifestId, target, context);
+				if (target.entry.kind !== "file") {
+					await flushFiles();
+					await this.writePath(manifestId, target, context);
+					continue;
+				}
+				if (
+					fileBatch.length > 0 &&
+					(fileBatchRoot !== target.root.relativeRoot ||
+						fileBatch.length >= RESTORE_FILE_BATCH_MAX_ENTRIES ||
+						fileBatchBytes + target.entry.size > RESTORE_FILE_BATCH_MAX_BYTES)
+				) {
+					await flushFiles();
+				}
+				fileBatch.push(target);
+				fileBatchBytes += target.entry.size;
+				fileBatchRoot = target.root.relativeRoot;
 			}
+			await flushFiles();
 		}
+	}
+
+	private async prepareFileReplacement(
+		manifestId: ManifestId,
+		target: OwnedPath,
+		context: MutationContext,
+	): Promise<ReplaceFileRequest> {
+		if (target.entry.kind !== "file" || target.entry.blobId === null) {
+			throw new Error(`批量普通文件缺少 blob：${target.absolutePath}`);
+		}
+		const bytes = await this.store.readBlob(
+			manifestId,
+			target.root.relativeRoot,
+			target.entry.blobId,
+			target.entry.relativePath,
+		);
+		if (bytes.byteLength !== target.entry.size) {
+			throw new Error(`普通文件 blob 大小不匹配：${target.absolutePath}`);
+		}
+		context.ordinal += 1;
+		const ordinal = context.ordinal;
+		await this.assertMutationPath(target.absolutePath);
+		await this.assertMutationState(context, "write", target.absolutePath);
+		return {
+			path: target.absolutePath,
+			targetBytes: bytes,
+			targetMode: target.entry.mode & 0o777,
+			sourceFingerprint: await this.expectedMutationFingerprint(context, target.absolutePath),
+			targetFingerprint: fingerprintBytes(target.absolutePath, bytes, target.entry.mode),
+			beforeInstall: async () => {
+				await this.beforeMutation?.({
+					phase: context.phase,
+					ordinal,
+					kind: "write",
+					path: target.absolutePath,
+				});
+			},
+		};
 	}
 
 	private async assertMutationState(
