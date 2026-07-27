@@ -327,6 +327,28 @@ describe("SnapshotStore", () => {
 		expect(await store.listVisibleLeafPaths(topology)).toEqual(["untracked.txt"]);
 	});
 
+	it("scoped tree 与 blob 读取严格绑定 manifest 内特殊路径", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		const scopedPath = "line\nfirst.txt";
+		await writeFixtureFile(workspace, scopedPath, "first\n");
+		await writeFixtureFile(workspace, "second.txt", "second\n");
+		const topology = await new RootDiscovery().discover(workspace);
+		const store = new SnapshotStore({ storeRoot });
+		const manifest = await store.capture(topology);
+
+		const entries = await store.listTree(manifest.manifestId, ".", [scopedPath]);
+		const first = entries.find((entry) => entry.relativePath === scopedPath);
+		expect(entries.map((entry) => entry.relativePath)).toEqual([scopedPath]);
+		expect(first?.blobId).not.toBeNull();
+		await expect(store.readBlob(manifest.manifestId, ".", first!.blobId!, scopedPath))
+			.resolves.toEqual(new Uint8Array(Buffer.from("first\n")));
+		await expect(store.readBlob(manifest.manifestId, ".", first!.blobId!, "second.txt"))
+			.rejects.toMatchObject({ code: "object_missing" });
+		await expect(store.assertComplete(manifest.manifestId, [scopedPath]))
+			.resolves.toBeUndefined();
+	});
+
 	it("assertComplete 对每个 root 使用一次 batch-check", async () => {
 		const workspace = await temporaryRoot("pi-undo-snapshot-");
 		const storeRoot = await temporaryRoot("pi-undo-store-");
@@ -1203,6 +1225,11 @@ describe("SnapshotStore", () => {
 		const scopedManifest = await scopedStore.capture(updated, ["missing.txt"]);
 		expect(await scopedStore.listTree(scopedManifest.manifestId, ".")).toEqual([]);
 		await expect(scopedStore.assertComplete(scopedManifest.manifestId)).resolves.toBeUndefined();
+
+		const emptyScopeManifest = await scopedStore.capture(updated, []);
+		expect(emptyScopeManifest.coverage).toBe(`paths:${checksum(canonicalJson([]))}`);
+		expect(await scopedStore.listTree(emptyScopeManifest.manifestId, ".")).toEqual([]);
+		await expect(scopedStore.assertComplete(emptyScopeManifest.manifestId, [])).resolves.toBeUndefined();
 	});
 
 	it("GC 仅清理取消全部 pin 且超过七天的 store", async () => {

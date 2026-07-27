@@ -56,6 +56,13 @@ describe("undo/redo restore performance", () => {
 			expect(countCommand(git.calls, "write-tree")).toBe(1);
 			expect(countCommand(git.calls, "cat-file")).toBe(1);
 			expect(git.calls.length).toBeLessThanOrEqual(52);
+
+			await writeFile(join(workspace, "src", "file-00000.txt"), "changed\n");
+			git.calls.length = 0;
+			await store.capture(topology, ["src/file-00000.txt"]);
+			expect(countCommand(git.calls, "hash-object")).toBe(1);
+			expect(countCommand(git.calls, "update-index")).toBe(1);
+			expect(git.calls.length).toBeLessThanOrEqual(14);
 		} finally {
 			await rm(workspace, { recursive: true, force: true });
 			await rm(storeRoot, { recursive: true, force: true });
@@ -88,7 +95,7 @@ describe("undo/redo restore performance", () => {
 			expect(countCommand(git.calls, "hash-object")).toBe(0);
 			expect(countCommand(git.calls, "update-index")).toBe(0);
 			expect(countCommand(git.calls, "write-tree")).toBe(0);
-			expect(countCommand(git.calls, "ls-tree")).toBe(0);
+			expect(countCommand(git.calls, "ls-tree")).toBeLessThanOrEqual(2);
 			expect(countCommand(git.calls, "cat-file")).toBeLessThanOrEqual(12);
 			expect(git.calls.length).toBeLessThanOrEqual(24);
 		} finally {

@@ -28,22 +28,26 @@ class FailingUnpinSnapshotStore extends SnapshotStore {
 class ToggleIncompleteSnapshotStore extends SnapshotStore {
 	failCompleteness = false;
 
-	override assertComplete(id: ManifestId): Promise<void> {
+	override assertComplete(id: ManifestId, scopePaths?: readonly string[]): Promise<void> {
 		if (this.failCompleteness) {
 			return Promise.reject(new SnapshotStoreError("object_missing", `注入对象闭包损坏：${id}`));
 		}
-		return super.assertComplete(id);
+		return super.assertComplete(id, scopePaths);
 	}
 }
 
 class ToggleListTreeFailureSnapshotStore extends SnapshotStore {
 	failListTree = false;
 
-	override listTree(id: ManifestId, root: string): Promise<readonly RestorePath[]> {
+	override listTree(
+		id: ManifestId,
+		root: string,
+		rootScopePaths?: readonly string[],
+	): Promise<readonly RestorePath[]> {
 		if (this.failListTree) {
 			return Promise.reject(new Error(`注入 listTree 契约错误：${id}:${root}`));
 		}
-		return super.listTree(id, root);
+		return super.listTree(id, root, rootScopePaths);
 	}
 }
 
@@ -51,8 +55,12 @@ class GitMetadataTreeSnapshotStore extends SnapshotStore {
 	injectGitMetadata = false;
 	gitMetadataPath = ".git";
 
-	override async listTree(id: ManifestId, root: string): Promise<readonly RestorePath[]> {
-		const entries = await super.listTree(id, root);
+	override async listTree(
+		id: ManifestId,
+		root: string,
+		rootScopePaths?: readonly string[],
+	): Promise<readonly RestorePath[]> {
+		const entries = await super.listTree(id, root, rootScopePaths);
 		if (!this.injectGitMetadata || root !== ".") {
 			return entries;
 		}
@@ -1087,7 +1095,38 @@ describe("RestoreEngine", () => {
 		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
 
 		await expect(engine.plan(current, target)).rejects.toThrow("coverage 不一致");
+		await expect(engine.plan(current, target, ["outside.txt"])).rejects.toThrow("coverage 不一致");
 		expect(await readFile(join(workspace, "outside.txt"), "utf8")).toBe("outside\n");
+	});
+
+	it("显式 scope 允许 partial/full 双向恢复并保留 scope 外最新内容", async () => {
+		const workspace = await temporaryRoot("pi-undo-restore-workspace-");
+		await writeFile(workspace, "scoped.txt", "before\n");
+		await writeFile(workspace, "outside.txt", "outside-before\n");
+		const storeRoot = await temporaryRoot("pi-undo-restore-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot });
+		const topology = await discovery.discover(workspace);
+		const before = await store.capture(topology);
+		await writeFile(workspace, "scoped.txt", "after\n");
+		await writeFile(workspace, "outside.txt", "outside-latest\n");
+		const scope = ["scoped.txt"];
+		const safety = await store.capture(topology, scope);
+		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+
+		expect((await engine.apply(await engine.plan(safety, before, scope), before)).code).toBe("ok");
+		expect(await readFile(join(workspace, "scoped.txt"), "utf8")).toBe("before\n");
+		expect(await readFile(join(workspace, "outside.txt"), "utf8")).toBe("outside-latest\n");
+
+		expect((await engine.apply(await engine.plan(before, safety, scope), safety)).code).toBe("ok");
+		expect(await readFile(join(workspace, "scoped.txt"), "utf8")).toBe("after\n");
+		expect(await readFile(join(workspace, "outside.txt"), "utf8")).toBe("outside-latest\n");
+
+		const emptySafety = await store.capture(topology, []);
+		const emptyPlan = await engine.plan(emptySafety, before, []);
+		expect(emptyPlan).toMatchObject({ deletePaths: [], writePaths: [], scopePaths: [] });
+		expect((await engine.apply(emptyPlan, before)).code).toBe("ok");
+		expect(await readFile(join(workspace, "scoped.txt"), "utf8")).toBe("after\n");
 	});
 
 	it("partial coverage 恢复时保留 scope 外与 ignored 文件的最新内容", async () => {

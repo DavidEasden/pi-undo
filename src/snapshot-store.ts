@@ -110,9 +110,9 @@ export interface SnapshotStore {
 	capture(topology: RootTopology, scope?: readonly string[], options?: CaptureOptions): Promise<SnapshotManifest>;
 	listVisibleLeafPaths(topology: RootTopology, options?: CaptureOptions): Promise<readonly string[]>;
 	loadManifest(id: ManifestId): Promise<SnapshotManifest>;
-	assertComplete(id: ManifestId): Promise<void>;
-	listTree(id: ManifestId, root: string): Promise<readonly RestorePath[]>;
-	readBlob(id: ManifestId, root: string, blobId: string): Promise<Uint8Array>;
+	assertComplete(id: ManifestId, scopePaths?: readonly string[]): Promise<void>;
+	listTree(id: ManifestId, root: string, rootScopePaths?: readonly string[]): Promise<readonly RestorePath[]>;
+	readBlob(id: ManifestId, root: string, blobId: string, relativePath?: string): Promise<Uint8Array>;
 	pin(id: ManifestId, reason: string): Promise<void>;
 	unpin(id: ManifestId, reason: string): Promise<void>;
 	collectGarbage(): Promise<number>;
@@ -306,7 +306,7 @@ export class SnapshotStore {
 		}
 	}
 
-	async assertComplete(id: ManifestId): Promise<void> {
+	async assertComplete(id: ManifestId, scopePaths?: readonly string[]): Promise<void> {
 		const manifestPath = await this.findManifestPath(id);
 		const manifest = await this.loadManifest(id);
 		const storeDirectory = dirname(dirname(manifestPath));
@@ -325,9 +325,11 @@ export class SnapshotStore {
 					}
 					continue;
 				}
+				const rootScope = rootRelativeScope(root.relativeRoot, scopePaths);
+				if (rootScope !== undefined && rootScope.length === 0) continue;
 				const gitDirectory = this.rootGitDirectory(storeDirectory, root);
 				await this.assertNoAlternates(gitDirectory);
-				const entries = await this.readTreeEntries(gitDirectory, root.treeId);
+				const entries = await this.readTreeEntries(gitDirectory, root.treeId, rootScope);
 				if (root.ignoredPresentPaths.some((ignoredPath) => entries.some(
 					(entry) => isPathAtOrBelow(ignoredPath, entry.relativePath) ||
 						isPathAtOrBelow(entry.relativePath, ignoredPath),
@@ -335,7 +337,7 @@ export class SnapshotStore {
 					throw new SnapshotStoreError("object_missing", "ignored-present proof 与 root tree 冲突");
 				}
 				await this.assertObjectsComplete(gitDirectory, root.treeId, entries);
-				if (root.objectClosure !== treeObjectClosure(root.treeId, entries)) {
+				if (rootScope === undefined && root.objectClosure !== treeObjectClosure(root.treeId, entries)) {
 					throw new SnapshotStoreError("object_missing", "root tree 对象闭包校验失败");
 				}
 			}
@@ -347,7 +349,11 @@ export class SnapshotStore {
 		}
 	}
 
-	async listTree(id: ManifestId, rootPath: string): Promise<readonly RestorePath[]> {
+	async listTree(
+		id: ManifestId,
+		rootPath: string,
+		rootScopePaths?: readonly string[],
+	): Promise<readonly RestorePath[]> {
 		relativeSafePath("/", rootPath);
 		const manifestPath = await this.findManifestPath(id);
 		const manifest = await this.loadManifest(id);
@@ -362,7 +368,7 @@ export class SnapshotStore {
 		const storeDirectory = dirname(dirname(manifestPath));
 		const gitDirectory = this.rootGitDirectory(storeDirectory, root);
 		try {
-			const treeEntries = await this.readTreeEntries(gitDirectory, root.treeId);
+			const treeEntries = await this.readTreeEntries(gitDirectory, root.treeId, rootScopePaths);
 			const directories = new Set<string>();
 			for (const entry of treeEntries) {
 				const parts = entry.relativePath.split("/");
@@ -400,7 +406,12 @@ export class SnapshotStore {
 		}
 	}
 
-	async readBlob(id: ManifestId, rootPath: string, blobId: string): Promise<Uint8Array> {
+	async readBlob(
+		id: ManifestId,
+		rootPath: string,
+		blobId: string,
+		relativePath?: string,
+	): Promise<Uint8Array> {
 		relativeSafePath("/", rootPath);
 		if (!isObjectId(blobId)) {
 			throw new SnapshotStoreError("object_missing", "blob ID 无效");
@@ -418,8 +429,14 @@ export class SnapshotStore {
 		const storeDirectory = dirname(dirname(manifestPath));
 		const gitDirectory = this.rootGitDirectory(storeDirectory, root);
 		try {
-			const entries = await this.readTreeEntries(gitDirectory, root.treeId);
-			if (!entries.some((entry) => entry.objectId === blobId)) {
+			const entries = await this.readTreeEntries(
+				gitDirectory,
+				root.treeId,
+				relativePath === undefined ? undefined : [relativeSafePath("/", relativePath)],
+			);
+			if (!entries.some((entry) => entry.objectId === blobId && (
+				relativePath === undefined || entry.relativePath === relativePath
+			))) {
 				throw new SnapshotStoreError("object_missing", "blob 不属于指定 root tree");
 			}
 			return await this.readBlobBytes(gitDirectory, blobId);
@@ -851,12 +868,25 @@ export class SnapshotStore {
 		}
 	}
 
-	private async readTreeEntries(gitDirectory: string, treeId: string): Promise<CapturedTreeEntry[]> {
-		const key = `${gitDirectory}\0${treeId}`;
+	private async readTreeEntries(
+		gitDirectory: string,
+		treeId: string,
+		rootScopePaths?: readonly string[],
+	): Promise<CapturedTreeEntry[]> {
+		const scope = rootScopePaths === undefined
+			? undefined
+			: [...new Set(rootScopePaths.map((path) => relativeSafePath("/", path)))].sort(comparePaths);
+		const key = `${gitDirectory}\0${treeId}\0${scope === undefined ? "*" : checksum(canonicalJson(scope))}`;
 		const cached = this.treeEntriesCache.get(key);
 		if (cached !== undefined) return cached;
-		const pending = this.runPrivateGitBytes(gitDirectory, ["ls-tree", "-r", "-l", "-z", treeId])
-			.then(parseTreeEntries);
+		const pending = this.runPrivateGitBytes(gitDirectory, [
+			"ls-tree",
+			"-r",
+			"-l",
+			"-z",
+			treeId,
+			...(scope === undefined ? [] : ["--", ...scope.map(literalPathspec)]),
+		]).then(parseTreeEntries);
 		this.treeEntriesCache.set(key, pending);
 		while (this.treeEntriesCache.size > TREE_CACHE_LIMIT) {
 			const oldest = this.treeEntriesCache.keys().next().value as string | undefined;
@@ -1030,7 +1060,7 @@ export class SnapshotStore {
 }
 
 function captureCoverage(workspaceIdentity: string, scope: readonly string[] | undefined): string {
-	if (scope === undefined || scope.length === 0) {
+	if (scope === undefined) {
 		return COMPLETE_COVERAGE;
 	}
 	const paths = [...new Set(scope.map((path) => relativeSafePath(workspaceIdentity, path)))].sort(comparePaths);
@@ -1080,10 +1110,15 @@ function ownedArtifactExclusions(
 	return result;
 }
 
+function rootRelativeScope(rootPath: string, scope: readonly string[] | undefined): string[] | undefined {
+	const inclusions = rootScopePathspecs(rootPath, scope);
+	if (inclusions === null) return [];
+	return inclusions.length === 0 ? undefined : inclusions;
+}
+
 function rootScopePathspecs(rootPath: string, scope: readonly string[] | undefined): string[] | null {
-	if (scope === undefined || scope.length === 0) {
-		return [];
-	}
+	if (scope === undefined) return [];
+	if (scope.length === 0) return null;
 	const result = new Set<string>();
 	for (const path of scope) {
 		if (path === "." || path === rootPath || isStrictRootAncestor(path, rootPath)) {

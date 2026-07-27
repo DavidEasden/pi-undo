@@ -38,12 +38,12 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 	const workspaceLock = new WorkspaceLock();
 	let commandContext: ExtensionCommandContext | undefined;
 	let internalNavigation = false;
-	const capture = async () => {
+	const capture = async (scopePaths?: readonly string[]) => {
 		const topology = await discovery.discover(context.cwd);
 		if (topology.workspaceIdentity !== initialTopology.workspaceIdentity) {
 			throw new Error("workspace identity 已变化");
 		}
-		return store.capture(topology);
+		return store.capture(topology, scopePaths);
 	};
 	const recovery = new JournalRecovery({
 		sessionIdentity,

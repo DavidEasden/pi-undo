@@ -323,9 +323,17 @@ describe("UndoController", () => {
 		expect(deps.calls.at(-1)).toBe("unlock");
 	});
 
-	it("undo restore plan 只使用 checkpoint changedPaths", async () => {
+	it("undo safety capture、restore plan 与 descriptor 都绑定 checkpoint changedPaths", async () => {
+		const capturedScopes: Array<readonly string[] | undefined> = [];
+		let captures = 0;
 		let observedScope: readonly string[] | undefined;
+		let descriptorScope: readonly string[] | undefined;
 		const deps = dependencies({
+			capture: async (scopePaths?: readonly string[]) => {
+				capturedScopes.push(scopePaths);
+				captures += 1;
+				return manifest(["a", "c", "d"][captures - 1] ?? "e");
+			},
 			planRestore: async (current: SnapshotManifest, target: SnapshotManifest, scopePaths: readonly string[] | undefined) => {
 				observedScope = scopePaths;
 				return {
@@ -333,10 +341,16 @@ describe("UndoController", () => {
 					targetManifestId: target.manifestId,
 					boundaryRoots: ["."],
 					deletePaths: [],
-					writePaths: ["file.txt"],
+					writePaths: [],
 					scopePaths: scopePaths === undefined ? undefined : [...scopePaths],
 					planDigest: checksum(canonicalJson({ current: current.manifestId, target: target.manifestId })),
 				};
+			},
+			journal: {
+				prepare: async (descriptor: { scopePaths: readonly string[] }) => { descriptorScope = descriptor.scopePaths; },
+				setPhase: async () => {},
+				markCommitted: async () => {},
+				loadPending: async () => [],
 			},
 		} as any);
 		const controller = new UndoControllerImpl(deps);
@@ -345,7 +359,9 @@ describe("UndoController", () => {
 		await controller.agentSettled();
 
 		expect((await controller.undo()).code).toBe("ok");
+		expect(capturedScopes).toEqual([undefined, undefined, ["file.txt"]]);
 		expect(observedScope).toEqual(["file.txt"]);
+		expect(descriptorScope).toEqual(["file.txt"]);
 	});
 
 	it("session 导航取消或 observed logical leaf 不匹配时不恢复文件", async () => {

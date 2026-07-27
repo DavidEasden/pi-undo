@@ -128,17 +128,18 @@ export class RestoreEngine {
 	): Promise<RestorePlan> {
 		assertManifest(current);
 		assertManifest(target);
-		assertCompatibleManifests(current, target);
 		const scope = scopePaths === undefined ? undefined : this.canonicalScope(scopePaths);
+		const canonicalScopePaths = scope === undefined ? undefined : [...scope];
+		assertCompatibleManifests(current, target, scope);
 		const isScopedPath = (path: string): boolean => scope === undefined || scope.has(path);
 		await Promise.all([
-			this.store.assertComplete(current.manifestId),
-			this.store.assertComplete(target.manifestId),
+			this.store.assertComplete(current.manifestId, canonicalScopePaths),
+			this.store.assertComplete(target.manifestId, canonicalScopePaths),
 		]);
 
 		const [currentPaths, targetPaths] = await Promise.all([
-			this.readOwnedPaths(current),
-			this.readOwnedPaths(target),
+			this.readOwnedPaths(current, canonicalScopePaths),
+			this.readOwnedPaths(target, canonicalScopePaths),
 		]);
 		const targetIgnoredPaths = ignoredWorkspacePaths(target);
 		const deleteByRoot = new Map<string, string[]>();
@@ -315,7 +316,11 @@ export class RestoreEngine {
 		if (canonicalJson(storedTarget) !== canonicalJson(target)) {
 			throw new Error("target manifest 与 store 内容不一致");
 		}
-		assertCompatibleManifests(current, target);
+		assertCompatibleManifests(
+			current,
+			target,
+			plan.scopePaths === undefined ? undefined : this.canonicalScope(plan.scopePaths),
+		);
 		let expectedPlan: RestorePlan;
 		let prepared: PreparedRestorePlan | undefined;
 		try {
@@ -342,7 +347,10 @@ export class RestoreEngine {
 			return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
 		}
 		const [currentPaths, targetPaths] = prepared === undefined
-			? await Promise.all([this.readOwnedPaths(current), this.readOwnedPaths(target)])
+			? await Promise.all([
+				this.readOwnedPaths(current, plan.scopePaths),
+				this.readOwnedPaths(target, plan.scopePaths),
+			])
 			: [prepared.currentPaths, prepared.targetPaths];
 		const quarantine = new QuarantineManager({
 			workspaceRoot: this.requestedWorkspaceRoot,
@@ -425,11 +433,16 @@ export class RestoreEngine {
 		}
 	}
 
-	private async readOwnedPaths(manifest: SnapshotManifest): Promise<Map<string, OwnedPath>> {
+	private async readOwnedPaths(
+		manifest: SnapshotManifest,
+		scopePaths?: readonly string[],
+	): Promise<Map<string, OwnedPath>> {
 		const result = new Map<string, OwnedPath>();
 		for (const root of manifest.roots) {
 			assertNotGitMetadata(root.relativeRoot);
-			const entries = await this.store.listTree(manifest.manifestId, root.relativeRoot);
+			const rootScope = rootRelativeScopePaths(root.relativeRoot, scopePaths);
+			if (rootScope !== undefined && rootScope.length === 0) continue;
+			const entries = await this.store.listTree(manifest.manifestId, root.relativeRoot, rootScope);
 			if (entries.length > 0) {
 				for (const boundaryPath of rootBoundaryDirectories(root.relativeRoot)) {
 					if (!result.has(boundaryPath)) {
@@ -619,7 +632,12 @@ export class RestoreEngine {
 		if (target.entry.blobId === null) {
 			throw new Error(`普通文件缺少 blob：${path}`);
 		}
-		const bytes = await this.store.readBlob(manifestId, target.root.relativeRoot, target.entry.blobId);
+		const bytes = await this.store.readBlob(
+			manifestId,
+			target.root.relativeRoot,
+			target.entry.blobId,
+			target.entry.relativePath,
+		);
 		if (bytes.byteLength !== target.entry.size) {
 			throw new Error(`普通文件 blob 大小不匹配：${path}`);
 		}
@@ -933,7 +951,12 @@ export class RestoreEngine {
 				return fingerprintSymlink(path, owned.entry.linkText!);
 			}
 			if (owned.entry.blobId === null) throw new Error(`普通文件缺少 blob：${path}`);
-			const bytes = await this.store.readBlob(manifestId, owned.root.relativeRoot, owned.entry.blobId);
+			const bytes = await this.store.readBlob(
+				manifestId,
+				owned.root.relativeRoot,
+				owned.entry.blobId,
+				owned.entry.relativePath,
+			);
 			return fingerprintBytes(path, bytes, owned.entry.mode);
 		}
 		if (await this.pathIsAbsent(path)) return fingerprintAbsent(path);
@@ -1012,7 +1035,12 @@ export class RestoreEngine {
 		}
 		const [actual, expected] = await Promise.all([
 			readFile(this.absolutePath(path)),
-			this.store.readBlob(manifestId, owned.root.relativeRoot, owned.entry.blobId),
+			this.store.readBlob(
+				manifestId,
+				owned.root.relativeRoot,
+				owned.entry.blobId,
+				owned.entry.relativePath,
+			),
 		]);
 		if (!actual.equals(Buffer.from(expected))) {
 			throw new Error(`普通文件内容校验失败：${path}`);
@@ -1081,15 +1109,36 @@ function sameEntry(left: RestorePath, right: RestorePath): boolean {
 		left.linkText === right.linkText;
 }
 
-function assertCompatibleManifests(current: SnapshotManifest, target: SnapshotManifest): void {
+function assertCompatibleManifests(
+	current: SnapshotManifest,
+	target: SnapshotManifest,
+	scope?: ReadonlySet<string>,
+): void {
 	if (current.workspaceIdentity !== target.workspaceIdentity) {
 		throw new Error("restore manifest 不属于同一 workspace");
 	}
-	if (current.coverage !== target.coverage) {
-		throw new Error("restore manifest coverage 不一致，不能推断缺失路径");
-	}
 	if (current.roots.some((root) => root.state === "broken") || target.roots.some((root) => root.state === "broken")) {
 		throw new Error("broken root 不能用于 restore");
+	}
+	const scopedCoverage = scope === undefined
+		? undefined
+		: `paths:${checksum(canonicalJson([...scope]))}`;
+	if (current.coverage === target.coverage) {
+		if (
+			scopedCoverage !== undefined && current.coverage !== "complete" &&
+			current.coverage !== scopedCoverage
+		) {
+			throw new Error("restore manifest coverage 与 scope 不匹配");
+		}
+		return;
+	}
+	if (
+		scopedCoverage === undefined ||
+		![current.coverage, target.coverage].every(
+			(coverage) => coverage === "complete" || coverage === scopedCoverage,
+		)
+	) {
+		throw new Error("restore manifest coverage 不一致，不能推断缺失路径");
 	}
 }
 
@@ -1118,6 +1167,26 @@ function appendPath(paths: Map<string, string[]>, root: string, path: string): v
 		return;
 	}
 	owned.push(path);
+}
+
+function rootRelativeScopePaths(
+	root: string,
+	scopePaths: readonly string[] | undefined,
+): string[] | undefined {
+	if (scopePaths === undefined) return undefined;
+	if (scopePaths.length === 0) return [];
+	const result = new Set<string>();
+	for (const path of scopePaths) {
+		if (path === "." || path === root || isStrictWorkspaceAncestor(path, root)) return undefined;
+		if (isStrictWorkspaceAncestor(root, path)) {
+			result.add(root === "." ? path : path.slice(root.length + 1));
+		}
+	}
+	return [...result].sort(comparePaths);
+}
+
+function isStrictWorkspaceAncestor(parent: string, child: string): boolean {
+	return parent === "." ? child !== "." : child.startsWith(`${parent}/`);
 }
 
 function workspacePath(root: string, path: string): string {

@@ -35,7 +35,7 @@ export interface ControllerDependencies {
 	}>;
 	readonly appendControl: (customType: string, data?: unknown) => Promise<string | null>;
 	readonly appendCursor: (cursor: CursorState) => Promise<CursorAppendResult>;
-	readonly capture: () => Promise<SnapshotManifest>;
+	readonly capture: (scopePaths?: readonly string[]) => Promise<SnapshotManifest>;
 	readonly changedPaths: (before: SnapshotManifest, after: SnapshotManifest) => Promise<readonly string[]>;
 	readonly loadManifest: (id: ManifestId) => Promise<SnapshotManifest>;
 	readonly planRestore: (
@@ -397,7 +397,7 @@ export class UndoControllerImpl implements UndoController {
 			}
 			let rollback: SnapshotManifest;
 			try {
-				rollback = await this.dependencies.capture();
+				rollback = await this.dependencies.capture(checkpoint.changedPaths);
 			} catch {
 				return { code: "capture_failed", changedFiles: 0 };
 			}
@@ -541,7 +541,7 @@ export class UndoControllerImpl implements UndoController {
 		plan: RestorePlan,
 		targetLogicalLeaf: string | null,
 	): OperationDescriptor {
-		const scopePaths = [...plan.deletePaths, ...plan.writePaths].sort();
+		const scopePaths = [...(plan.scopePaths ?? [...plan.deletePaths, ...plan.writePaths])].sort();
 		const payload = {
 			schemaVersion: 1 as const,
 			opId: `op-${randomUUID()}`,
