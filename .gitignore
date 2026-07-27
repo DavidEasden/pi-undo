@@ -4,3 +4,4 @@ node_modules
 .opencode-trace/
 *.trace/
 resources/
+*.tgz
