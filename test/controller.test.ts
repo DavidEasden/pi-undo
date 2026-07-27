@@ -4,7 +4,15 @@ import { describe, expect, it, vi } from "vitest";
 
 import { UndoControllerImpl, type ControllerDependencies } from "../src/controller.ts";
 import { canonicalJson, checksum } from "../src/encoding.ts";
-import type { CheckpointRecord, CursorState, ManifestId, SessionFileIdentity, SnapshotManifest } from "../src/model.ts";
+import type {
+	CheckpointRecord,
+	CursorState,
+	ManifestId,
+	OperationDescriptor,
+	SessionFileIdentity,
+	SnapshotManifest,
+} from "../src/model.ts";
+import type { RestorePlan } from "../src/restore-engine.ts";
 
 const identity: SessionFileIdentity = { path: "/sessions/pi.jsonl", headerChecksum: "a".repeat(64) };
 
@@ -35,6 +43,13 @@ function restoredCheckpoint(checkpointId = "restored-checkpoint"): CheckpointRec
 		changedPaths: ["file.txt"],
 	};
 	return { ...payload, checksum: checksum(canonicalJson(payload)) };
+}
+
+function checkpointWithPaths(changedPaths: readonly string[]): CheckpointRecord {
+	const checkpoint = restoredCheckpoint();
+	const payload = { ...checkpoint, changedPaths: [...changedPaths] };
+	const { checksum: _checksum, ...unsigned } = payload;
+	return { ...unsigned, checksum: checksum(canonicalJson(unsigned)) };
 }
 
 function dependencies(overrides: Partial<ControllerDependencies> = {}): ControllerDependencies & { calls: string[] } {
@@ -124,6 +139,72 @@ describe("UndoController", () => {
 		expect(await controller.undo()).toMatchObject({ code: "noop" });
 		expect(await controller.redo()).toMatchObject({ code: "noop" });
 		expect(deps.calls).toEqual([]);
+	});
+
+	it("空 changedPaths 的 undo/redo 只提交 session 事务且不访问 workspace", async () => {
+		const prepared: Array<{ descriptor: OperationDescriptor; plan: RestorePlan }> = [];
+		const failWorkspaceCall = vi.fn(async () => { throw new Error("workspace fast path 不应调用"); });
+		const base = dependencies();
+		const deps = dependencies({
+			capture: failWorkspaceCall,
+			loadManifest: failWorkspaceCall,
+			planRestore: failWorkspaceCall,
+			applyRestore: failWorkspaceCall,
+			journal: {
+				...base.journal,
+				prepare: async (descriptor, plan) => {
+					prepared.push({ descriptor, plan: plan as RestorePlan });
+				},
+			},
+		});
+		const controller = new UndoControllerImpl(deps, {
+			undoStack: [checkpointWithPaths([])],
+		});
+
+		expect(await controller.undo()).toMatchObject({ code: "ok", changedFiles: 0 });
+		expect(controller.history()).toEqual({ undoCount: 0, redoCount: 1, locked: false });
+		expect(await controller.redo()).toMatchObject({ code: "ok", changedFiles: 0 });
+		expect(controller.history()).toEqual({ undoCount: 1, redoCount: 0, locked: false });
+		expect(failWorkspaceCall).not.toHaveBeenCalled();
+		expect(prepared).toHaveLength(2);
+		expect(prepared.map(({ descriptor }) => ({
+			target: descriptor.targetManifestId[0],
+			rollback: descriptor.rollbackManifestId[0],
+			scopePaths: descriptor.scopePaths,
+		}))).toEqual([
+			{ target: "a", rollback: "b", scopePaths: [] },
+			{ target: "b", rollback: "a", scopePaths: [] },
+		]);
+		for (const { descriptor, plan } of prepared) {
+			expect(plan).toMatchObject({
+				currentManifestId: descriptor.rollbackManifestId,
+				targetManifestId: descriptor.targetManifestId,
+				boundaryRoots: [],
+				deletePaths: [],
+				writePaths: [],
+				scopePaths: [],
+			});
+			expect(descriptor.planDigest).toBe(plan.planDigest);
+		}
+	});
+
+	it("空 changedPaths 的 cursor volatile 只补偿 session leaf", async () => {
+		const failWorkspaceCall = vi.fn(async () => { throw new Error("workspace fast path 不应调用"); });
+		const deps = dependencies({
+			capture: failWorkspaceCall,
+			loadManifest: failWorkspaceCall,
+			planRestore: failWorkspaceCall,
+			applyRestore: failWorkspaceCall,
+			appendCursor: async () => ({ kind: "volatile", reason: "no durable session" }),
+		});
+		const controller = new UndoControllerImpl(deps, {
+			undoStack: [checkpointWithPaths([])],
+		});
+
+		expect(await controller.undo()).toMatchObject({ code: "restore_failed_safe", changedFiles: 0 });
+		expect(failWorkspaceCall).not.toHaveBeenCalled();
+		expect(deps.calls).toContain("session-rollback");
+		expect(controller.history()).toEqual({ undoCount: 1, redoCount: 0, locked: false });
 	});
 
 	it("undo/redo 事务期间将新输入标记为 defer，事务完成后恢复正常", async () => {

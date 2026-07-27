@@ -406,6 +406,9 @@ export class UndoControllerImpl implements UndoController {
 			} catch {
 				return done({ code: "busy", changedFiles: 0 });
 			}
+			if (checkpoint.changedPaths.length === 0) {
+				return done(await this.runSessionOnlyOperation(action, checkpoint, targetManifestId, profile));
+			}
 			let rollback: SnapshotManifest;
 			try {
 				rollback = await profile.measure("capture", () =>
@@ -492,6 +495,84 @@ export class UndoControllerImpl implements UndoController {
 		}
 	}
 
+	private async runSessionOnlyOperation(
+		action: "undo" | "redo",
+		checkpoint: CheckpointRecord,
+		targetManifestId: ManifestId | undefined,
+		profile: OperationProfiler,
+	): Promise<OperationResult> {
+		const rollbackManifestId = action === "undo"
+			? checkpoint.afterManifestId
+			: checkpoint.beforeManifestId;
+		const targetId = targetManifestId ?? (
+			action === "undo" ? checkpoint.beforeManifestId : checkpoint.afterManifestId
+		);
+		const plan = emptyRestorePlan(rollbackManifestId, targetId);
+		const targetLogicalLeaf = this.dependencies.resolveSessionTarget(action, checkpoint);
+		const descriptor = this.createDescriptorFromManifestIds(
+			action,
+			rollbackManifestId,
+			targetId,
+			plan,
+			targetLogicalLeaf,
+		);
+		await profile.measure("journal", () => this.dependencies.journal.prepare(descriptor, plan));
+		const navigation = await profile.measure("navigate", () =>
+			this.dependencies.navigateSession(action, checkpoint));
+		if (navigation.cancelled) {
+			await profile.measure("journal", async () => {
+				await this.dependencies.journal.setPhase(descriptor.opId, "ABORTING");
+				await this.dependencies.journal.setPhase(descriptor.opId, "ABORTED");
+			});
+			return { code: "restore_failed_safe", changedFiles: 0 };
+		}
+		if (navigation.logicalLeafId !== descriptor.toLogicalLeaf) {
+			this.locked = true;
+			await profile.measure("journal", () =>
+				this.dependencies.journal.setPhase(descriptor.opId, "RECOVERY_REQUIRED"));
+			return { code: "recovery_required", changedFiles: 0 };
+		}
+		await profile.measure("journal", async () => {
+			await this.dependencies.journal.setPhase(descriptor.opId, "SESSION_MOVED", {
+				observedLogicalLeaf: navigation.logicalLeafId,
+			});
+			await this.dependencies.journal.setPhase(descriptor.opId, "APPLYING");
+			await this.dependencies.journal.setPhase(descriptor.opId, "FILES_VERIFIED");
+		});
+		const cursorResult = await profile.measure("cursor", () =>
+			this.dependencies.appendCursor(this.createCursor(descriptor, action, checkpoint)));
+		if (cursorResult.kind === "recovery_required") {
+			this.locked = true;
+			await profile.measure("journal", () =>
+				this.dependencies.journal.setPhase(descriptor.opId, "RECOVERY_REQUIRED").catch(() => {}));
+			return { code: "recovery_required", changedFiles: 0 };
+		}
+		if (cursorResult.kind === "volatile") {
+			return profile.measure("compensate", () => this.compensateSessionOnly(descriptor));
+		}
+		await profile.measure("commit", async () => {
+			await this.dependencies.journal.setPhase(descriptor.opId, "CURSOR_COMMITTED");
+			await this.dependencies.journal.markCommitted(descriptor.opId);
+		});
+		this.lastSafetyManifestId = rollbackManifestId;
+		return { code: "ok", changedFiles: 0 };
+	}
+
+	private async compensateSessionOnly(descriptor: OperationDescriptor): Promise<OperationResult> {
+		try {
+			await this.dependencies.journal.setPhase(descriptor.opId, "ABORTING");
+			if (!await this.dependencies.restoreSessionLeaf(descriptor.fromLogicalLeaf)) {
+				throw new Error("session rollback failed");
+			}
+			await this.dependencies.journal.setPhase(descriptor.opId, "ABORTED");
+			return { code: "restore_failed_safe", changedFiles: 0 };
+		} catch {
+			this.locked = true;
+			await this.dependencies.journal.setPhase(descriptor.opId, "RECOVERY_REQUIRED").catch(() => {});
+			return { code: "recovery_required", changedFiles: 0 };
+		}
+	}
+
 	private async ensureIdle(): Promise<boolean> {
 		if (this.dependencies.isAgentIdle()) return true;
 		try {
@@ -570,6 +651,22 @@ export class UndoControllerImpl implements UndoController {
 		plan: RestorePlan,
 		targetLogicalLeaf: string | null,
 	): OperationDescriptor {
+		return this.createDescriptorFromManifestIds(
+			action,
+			rollback.manifestId,
+			target.manifestId,
+			plan,
+			targetLogicalLeaf,
+		);
+	}
+
+	private createDescriptorFromManifestIds(
+		action: "undo" | "redo" | "tree",
+		rollbackManifestId: ManifestId,
+		targetManifestId: ManifestId,
+		plan: RestorePlan,
+		targetLogicalLeaf: string | null,
+	): OperationDescriptor {
 		const scopePaths = [...(plan.scopePaths ?? [...plan.deletePaths, ...plan.writePaths])].sort();
 		const payload = {
 			schemaVersion: 1 as const,
@@ -579,8 +676,8 @@ export class UndoControllerImpl implements UndoController {
 			action,
 			fromLogicalLeaf: this.dependencies.getLogicalLeafId(),
 			toLogicalLeaf: targetLogicalLeaf,
-			targetManifestId: target.manifestId,
-			rollbackManifestId: rollback.manifestId,
+			targetManifestId,
+			rollbackManifestId,
 			coverage: `paths:${checksum(canonicalJson(scopePaths))}`,
 			scopePaths,
 			planDigest: plan.planDigest,
@@ -631,6 +728,18 @@ export class UndoControllerImpl implements UndoController {
 		};
 		return { ...payload, checksum: checksum(canonicalJson(payload)) };
 	}
+}
+
+function emptyRestorePlan(currentManifestId: ManifestId, targetManifestId: ManifestId): RestorePlan {
+	const payload = {
+		currentManifestId,
+		targetManifestId,
+		boundaryRoots: [],
+		deletePaths: [],
+		writePaths: [],
+		scopePaths: [],
+	};
+	return { ...payload, planDigest: checksum(canonicalJson(payload)) };
 }
 
 class OperationProfiler {

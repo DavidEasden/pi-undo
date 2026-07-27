@@ -59,8 +59,15 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 		recoverMutations: async (pending, decision) => {
 			const mutationJournal = journal.mutationJournal(pending.descriptor.opId);
 			const quarantine = new QuarantineManager({ workspaceRoot: context.cwd, journal: mutationJournal });
-			try {
-				const records = (await mutationJournal.load()).filter((record) => record.state !== "CLEANED");
+				try {
+				const loaded = await mutationJournal.load();
+				const scopePaths = pending.descriptor.scopePaths;
+				if (loaded.some((record) => !scopePaths.some((scope) =>
+					scope === "." || record.path === scope || record.path.startsWith(`${scope}/`)
+				))) {
+					throw new Error("mutation journal path 超出 descriptor scope");
+				}
+				const records = loaded.filter((record) => record.state !== "CLEANED");
 				if (decision === "rollback") records.reverse();
 				for (const record of records) {
 					if (decision === "rollback") {

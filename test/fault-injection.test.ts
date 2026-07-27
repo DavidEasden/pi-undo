@@ -38,7 +38,7 @@ function manifest(seed: string): SnapshotManifest {
 	};
 }
 
-function pending(): PendingJournal {
+function pending(scopePaths: readonly string[] = ["file.txt"]): PendingJournal {
 	const descriptorPayload = {
 		schemaVersion: 1 as const,
 		opId: "operation-1",
@@ -49,8 +49,8 @@ function pending(): PendingJournal {
 		toLogicalLeaf: "before",
 		targetManifestId: "a".repeat(64) as ManifestId,
 		rollbackManifestId: "b".repeat(64) as ManifestId,
-		coverage: `paths:${checksum(canonicalJson(["file.txt"]))}`,
-		scopePaths: ["file.txt"],
+		coverage: `paths:${checksum(canonicalJson(scopePaths))}`,
+		scopePaths: [...scopePaths],
 		planDigest: "d".repeat(64),
 	};
 	const descriptor: OperationDescriptor = {
@@ -77,8 +77,9 @@ function fixture(
 	marker: "absent" | "match" | "conflict",
 	leaf: string | null,
 	mutationResult: "clean" | "conflict" = "clean",
+	scopePaths: readonly string[] = ["file.txt"],
 ) {
-	let journals: PendingJournal[] = [pending()];
+	let journals: PendingJournal[] = [pending(scopePaths)];
 	const calls: string[] = [];
 	const recovery = new JournalRecovery({
 		sessionIdentity: identity,
@@ -137,6 +138,20 @@ describe("JournalRecovery fault injection", () => {
 		expect(calls).toEqual([
 			"mutations:roll_forward", "capture", "load:a", "plan:a", "restore:a", "cursor-finalized", "settle:COMMITTED",
 		]);
+	});
+
+	it("空 scope rollback recovery 在 mutation 收敛后不访问 workspace", async () => {
+		const { recovery, calls } = fixture("absent", "after", "clean", []);
+
+		expect(await recovery.recover()).toEqual({ kind: "recovered", operations: 1 });
+		expect(calls).toEqual(["mutations:rollback", "settle:ABORTED"]);
+	});
+
+	it("空 scope roll-forward recovery 不访问 workspace 但补完 cursor", async () => {
+		const { recovery, calls } = fixture("match", "before", "clean", []);
+
+		expect(await recovery.recover()).toEqual({ kind: "recovered", operations: 1 });
+		expect(calls).toEqual(["mutations:roll_forward", "cursor-finalized", "settle:COMMITTED"]);
 	});
 
 	it("mutation 现场冲突时在 capture 前锁定", async () => {
