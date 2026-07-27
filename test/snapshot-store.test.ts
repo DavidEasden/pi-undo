@@ -315,6 +315,18 @@ describe("SnapshotStore", () => {
 		expect(visible).not.toContain("owned-artifact");
 	});
 
+	it("Git-backed 轻量枚举排除 index 中已删除叶子并保留 untracked 叶子", async () => {
+		const repository = await createGitRepo();
+		temporaryRoots.push(repository.root);
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await rm(join(repository.root, "README.md"));
+		await writeFixtureFile(repository.root, "untracked.txt", "visible\n");
+		const topology = await new RootDiscovery().discover(repository.root);
+		const store = new SnapshotStore({ storeRoot });
+
+		expect(await store.listVisibleLeafPaths(topology)).toEqual(["untracked.txt"]);
+	});
+
 	it("assertComplete 对每个 root 使用一次 batch-check", async () => {
 		const workspace = await temporaryRoot("pi-undo-snapshot-");
 		const storeRoot = await temporaryRoot("pi-undo-store-");

@@ -32,8 +32,10 @@ const GC_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 const IGNORE_POLICY = "git-check-ignore-v1";
 const NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
 const TREE_CACHE_LIMIT = 256;
-const HASH_BATCH_MAX_PATHS = 128;
-const HASH_BATCH_MAX_ARGUMENT_BYTES = 24 * 1024;
+const HASH_BATCH_MAX_PATHS = process.platform === "win32" ? 128 : 2_048;
+const HASH_BATCH_MAX_ARGUMENT_BYTES = process.platform === "win32" ? 24 * 1024 : 128 * 1024;
+const HASH_BATCH_CONCURRENCY = 4;
+const FILE_SYSTEM_INSPECTION_CONCURRENCY = 32;
 const INDEX_BATCH_MAX_ENTRIES = 4_096;
 const INDEX_BATCH_MAX_BYTES = 8 * 1024 * 1024;
 
@@ -263,15 +265,16 @@ export class SnapshotStore {
 					.filter((candidate) => isStrictRootAncestor(root.relativeRoot, candidate.relativeRoot))
 					.map((candidate) => rootRelativePath(root.relativeRoot, candidate.relativeRoot));
 				const exactExclusions = ownedArtifactExclusions(topology.roots, root.relativeRoot, artifactExclusions);
-				for (const leaf of await this.collectVisibleLeaves(
+				for (const relativePath of await this.queryVisibleLeafPaths(
 					absoluteRoot,
 					environment,
 					root.gitBacked,
 					[],
 					exclusions,
 					exactExclusions,
+					true,
 				)) {
-					result.add(workspaceRelativePath(root.relativeRoot, leaf.relativePath));
+					result.add(workspaceRelativePath(root.relativeRoot, relativePath));
 				}
 			}
 			await this.assertTopology(topology, "可见路径枚举期间 topology 已变化");
@@ -650,8 +653,10 @@ export class SnapshotStore {
 			exactExclusions,
 		);
 		const objectIds = new Map<string, string>();
-		for (const batch of hashPathBatches(leaves.filter((leaf) => leaf.kind === "file"))) {
-			for (const leaf of batch) await this.assertVisibleLeafUnchanged(cwd, leaf);
+		const hashBatches = hashPathBatches(leaves.filter((leaf) => leaf.kind === "file"));
+		const hashedBatches = await mapConcurrentOrdered(hashBatches, HASH_BATCH_CONCURRENCY, async (batch) => {
+			await mapConcurrentOrdered(batch, FILE_SYSTEM_INSPECTION_CONCURRENCY, (leaf) =>
+				this.assertVisibleLeafUnchanged(cwd, leaf));
 			const output = await this.runGit([
 				"hash-object",
 				"-w",
@@ -660,10 +665,12 @@ export class SnapshotStore {
 				...batch.map((leaf) => leaf.relativePath),
 			], { cwd, env: environment });
 			const hashes = parseObjectIdLines(output, batch.length);
-			for (const leaf of batch) await this.assertVisibleLeafUnchanged(cwd, leaf);
-			for (let index = 0; index < batch.length; index += 1) {
-				objectIds.set(batch[index]!.relativePath, hashes[index]!);
-			}
+			await mapConcurrentOrdered(batch, FILE_SYSTEM_INSPECTION_CONCURRENCY, (leaf) =>
+				this.assertVisibleLeafUnchanged(cwd, leaf));
+			return batch.map((leaf, index) => [leaf.relativePath, hashes[index]!] as const);
+		});
+		for (const batch of hashedBatches) {
+			for (const [relativePath, objectId] of batch) objectIds.set(relativePath, objectId);
 		}
 		for (const leaf of leaves) {
 			if (leaf.kind !== "symlink") continue;
@@ -701,6 +708,49 @@ export class SnapshotStore {
 		}
 	}
 
+	private async queryVisibleLeafPaths(
+		cwd: string,
+		environment: Readonly<Record<string, string | undefined>>,
+		gitBacked: boolean,
+		inclusions: readonly string[] | null,
+		exclusions: readonly string[],
+		exactExclusions: readonly string[],
+		excludeDeleted = false,
+	): Promise<string[]> {
+		if (inclusions === null) return [];
+		const pathspecs = inclusions.length === 0 ? ["."] : inclusions.map(literalPathspec);
+		for (const excluded of exclusions) pathspecs.push(excludeLiteralPathspec(excluded));
+		const queryEnvironment = gitBacked ? sourceGitEnvironment() : environment;
+		const [output, deletedOutput] = await Promise.all([
+			this.runGitBytes([
+				...(gitBacked ? ["-c", "core.fsmonitor=false"] : []),
+				"ls-files",
+				...(gitBacked ? ["--cached"] : []),
+				"--others",
+				"--exclude-standard",
+				"-z",
+				"--",
+				...pathspecs,
+			], { cwd, env: queryEnvironment }),
+			gitBacked && excludeDeleted
+				? this.runGitBytes([
+					"-c",
+					"core.fsmonitor=false",
+					"ls-files",
+					"--deleted",
+					"-z",
+					"--",
+					...pathspecs,
+				], { cwd, env: queryEnvironment })
+				: Promise.resolve(new Uint8Array()),
+		]);
+		const deletedPaths = new Set(parseNulPaths(deletedOutput));
+		return parseNulPaths(output).filter((relativePath) =>
+			!deletedPaths.has(relativePath) &&
+			!exclusions.some((excluded) => isPathAtOrBelow(excluded, relativePath)) &&
+			!exactExclusions.includes(relativePath));
+	}
+
 	private async collectVisibleLeaves(
 		cwd: string,
 		environment: Readonly<Record<string, string | undefined>>,
@@ -709,52 +759,41 @@ export class SnapshotStore {
 		exclusions: readonly string[],
 		exactExclusions: readonly string[],
 	): Promise<VisibleLeaf[]> {
-		if (inclusions === null) return [];
-		const pathspecs = inclusions.length === 0 ? ["."] : inclusions.map(literalPathspec);
-		for (const excluded of exclusions) pathspecs.push(excludeLiteralPathspec(excluded));
-		const queryEnvironment = gitBacked ? sourceGitEnvironment() : environment;
-		const output = await this.runGitBytes([
-			...(gitBacked ? ["-c", "core.fsmonitor=false"] : []),
-			"ls-files",
-			...(gitBacked ? ["--cached"] : []),
-			"--others",
-			"--exclude-standard",
-			"-z",
-			"--",
-			...pathspecs,
-		], { cwd, env: queryEnvironment });
-		const result: VisibleLeaf[] = [];
-		for (const relativePath of parseNulPaths(output)) {
-			if (
-				exclusions.some((excluded) => isPathAtOrBelow(excluded, relativePath)) ||
-				exactExclusions.includes(relativePath)
-			) continue;
+		const paths = await this.queryVisibleLeafPaths(
+			cwd,
+			environment,
+			gitBacked,
+			inclusions,
+			exclusions,
+			exactExclusions,
+		);
+		const leaves = await mapConcurrentOrdered(paths, FILE_SYSTEM_INSPECTION_CONCURRENCY, async (relativePath) => {
 			relativeSafePath(cwd, relativePath);
 			await assertNoSymlinkEscape(cwd, relativePath);
 			const metadata = await lstat(join(cwd, ...relativePath.split("/"))).catch((error) => {
 				if (hasErrorCode(error, "ENOENT")) return null;
 				throw error;
 			});
-			if (metadata === null) continue;
+			if (metadata === null) return null;
 			if (metadata.isSymbolicLink()) {
-				result.push({
+				return {
 					relativePath,
-					kind: "symlink",
+					kind: "symlink" as const,
 					mode: 0o120000,
 					fingerprint: visibleLeafFingerprint(metadata),
-				});
-			} else if (metadata.isFile()) {
-				result.push({
+				};
+			}
+			if (metadata.isFile()) {
+				return {
 					relativePath,
-					kind: "file",
+					kind: "file" as const,
 					mode: (metadata.mode & 0o111) === 0 ? 0o100644 : 0o100755,
 					fingerprint: visibleLeafFingerprint(metadata),
-				});
-			} else {
-				throw new SnapshotStoreError("capture_failed", `不支持的工作区文件类型：${relativePath}`);
+				};
 			}
-		}
-		return result;
+			throw new SnapshotStoreError("capture_failed", `不支持的工作区文件类型：${relativePath}`);
+		});
+		return leaves.filter((leaf): leaf is VisibleLeaf => leaf !== null);
 	}
 
 	private async validateIgnoreQuery(
@@ -1273,6 +1312,32 @@ function visibleLeafFingerprint(metadata: Stats): string {
 		mtimeMs: metadata.mtimeMs,
 		ctimeMs: metadata.ctimeMs,
 	}));
+}
+
+async function mapConcurrentOrdered<T, R>(
+	values: readonly T[],
+	concurrency: number,
+	operation: (value: T) => Promise<R>,
+): Promise<R[]> {
+	const result = new Array<R>(values.length);
+	let nextIndex = 0;
+	let failed = false;
+	let failure: unknown;
+	async function worker(): Promise<void> {
+		while (!failed && nextIndex < values.length) {
+			const index = nextIndex;
+			nextIndex += 1;
+			try {
+				result[index] = await operation(values[index]!);
+			} catch (error) {
+				if (!failed) failure = error;
+				failed = true;
+			}
+		}
+	}
+	await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, () => worker()));
+	if (failed) throw failure;
+	return result;
 }
 
 function hashPathBatches(leaves: readonly VisibleLeaf[]): VisibleLeaf[][] {

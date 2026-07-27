@@ -11,10 +11,21 @@ import { SnapshotStore } from "../src/snapshot-store.ts";
 
 class CountingGitRunner extends GitRunner {
 	readonly calls: string[][] = [];
+	activeHashCalls = 0;
+	maxActiveHashCalls = 0;
 
 	override async run(args: readonly string[], options: GitRunOptions = {}): Promise<GitRunResult> {
 		this.calls.push([...args]);
-		return super.run(args, options);
+		const isHash = args.includes("hash-object");
+		if (isHash) {
+			this.activeHashCalls += 1;
+			this.maxActiveHashCalls = Math.max(this.maxActiveHashCalls, this.activeHashCalls);
+		}
+		try {
+			return await super.run(args, options);
+		} finally {
+			if (isHash) this.activeHashCalls -= 1;
+		}
 	}
 }
 
@@ -36,7 +47,11 @@ describe("undo/redo restore performance", () => {
 
 			await store.capture(topology);
 
-			expect(countCommand(git.calls, "hash-object")).toBeLessThanOrEqual(33);
+			expect(countCommand(git.calls, "hash-object")).toBeLessThanOrEqual(
+				process.platform === "win32" ? 33 : 3,
+			);
+			expect(git.maxActiveHashCalls).toBeGreaterThanOrEqual(2);
+			expect(git.maxActiveHashCalls).toBeLessThanOrEqual(4);
 			expect(countCommand(git.calls, "update-index")).toBe(2);
 			expect(countCommand(git.calls, "write-tree")).toBe(1);
 			expect(countCommand(git.calls, "cat-file")).toBe(1);
