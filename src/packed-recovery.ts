@@ -44,20 +44,28 @@ export async function recoverPackedMutations(options: {
 		const pack = await loadDurablePack(options.journal, options.planDigest, true);
 		const records = await ensurePackedIntents(options.journal, pack, await options.journal.load());
 		await mapConcurrent(records, PACKED_RECOVERY_CONCURRENCY, async (record) => {
-			if (record.kind !== "write" || record.targetArtifact === null) throw new Error("packed recovery 只支持普通文件 write");
+			if (record.state === "CLEANED" && record.kind === "delete") {
+				if (options.decision === "rollback") {
+					throw new Error(`CLEANED delete mutation 不能 rollback：${record.path}`);
+				}
+				return;
+			}
 			const source = pack.leaf(record.path, record.sourceFingerprint);
 			const target = pack.leaf(record.path, record.targetFingerprint);
-			if (source === undefined || target === undefined || target.kind !== "file") {
+			if (source === undefined || target === undefined) {
 				throw new Error(`packed recovery variant 缺失：${record.path}`);
 			}
-			await normalizeRecord(
-				workspaceRoot,
-				record,
-				source,
-				target,
-				options.decision,
-				options.retainArtifacts === true,
-			);
+			if (record.kind === "delete") {
+				if (record.targetArtifact !== null || source.kind !== "file" || target.kind !== "absent") {
+					throw new Error(`packed recovery delete variant 无效：${record.path}`);
+				}
+				await normalizeDeletedRecord(workspaceRoot, record, source, options.decision, options.retainArtifacts === true);
+				return;
+			}
+			if (record.kind !== "write" || record.targetArtifact === null || target.kind !== "file") {
+				throw new Error(`packed recovery write variant 无效：${record.path}`);
+			}
+			await normalizeRecord(workspaceRoot, record, source, target, options.decision, options.retainArtifacts === true);
 		});
 		const terminalState: MutationState = options.retainArtifacts === true ? "TARGET_VERIFIED" : "CLEANED";
 		const terminalIndex = stateOrder.indexOf(terminalState);
@@ -87,20 +95,29 @@ export async function cleanupPackedMutations(options: {
 	const records = [...await options.journal.load()];
 	const cleanupDirectories = new Set<string>();
 	await mapConcurrent(records, PACKED_RECOVERY_CONCURRENCY, async (record) => {
-		if (
-			(record.state !== "TARGET_VERIFIED" && record.state !== "CLEANED") ||
-			record.kind !== "write" ||
-			record.targetArtifact === null
-		) {
+		if (record.state !== "TARGET_VERIFIED" && record.state !== "CLEANED") {
 			throw new Error(`packed cleanup mutation 状态无效：${record.path}`);
 		}
 		relativeSafePath(workspaceRoot, record.path);
 		await assertNoSymlinkEscape(workspaceRoot, record.path);
 		const original = join(workspaceRoot, ...record.path.split("/"));
 		const sourceArtifact = join(workspaceRoot, ...record.sourceArtifact.split("/"));
-		const targetArtifact = join(workspaceRoot, ...record.targetArtifact.split("/"));
 		const source = pack.leaf(record.path, record.sourceFingerprint);
 		if (source === undefined) throw new Error(`packed cleanup source variant 缺失：${record.path}`);
+		if (record.kind === "delete") {
+			if (record.targetArtifact !== null || pack.targetFingerprint(record.path) !== fingerprintAbsent(record.path)) {
+				throw new Error(`packed cleanup delete mutation 无效：${record.path}`);
+			}
+			if (await fingerprintLeaf(original, record.path) !== fingerprintAbsent(record.path)) {
+				throw new Error(`packed cleanup delete original 不是 absent：${record.path}`);
+			}
+			await cleanupArtifact(sourceArtifact, record.path, record.sourceFingerprint, cleanupDirectories);
+			return;
+		}
+		if (record.kind !== "write" || record.targetArtifact === null) {
+			throw new Error(`packed cleanup write mutation 无效：${record.path}`);
+		}
+		const targetArtifact = join(workspaceRoot, ...record.targetArtifact.split("/"));
 		if (await pathExists(targetArtifact)) {
 			await assertSameFileIdentity(original, targetArtifact, record.path);
 		} else if (record.state !== "CLEANED") {
@@ -140,22 +157,18 @@ function packedIntent(pack: DurablePack, path: string) {
 	const artifacts = pack.artifacts(path);
 	const sourceFingerprint = pack.sourceFingerprint(path);
 	const targetFingerprint = pack.targetFingerprint(path);
-	if (
-		artifacts === undefined ||
-		artifacts.target === null ||
-		sourceFingerprint === undefined ||
-		targetFingerprint === undefined ||
-		targetFingerprint === null
-	) {
+	if (artifacts === undefined || sourceFingerprint === undefined || targetFingerprint === undefined) {
 		throw new Error(`packed recovery intent 缺失：${path}`);
 	}
 	return {
-		kind: "write" as const,
+		kind: artifacts.target === null && (targetFingerprint === null || targetFingerprint === fingerprintAbsent(path))
+			? "delete" as const
+			: "write" as const,
 		path,
 		sourceArtifact: artifacts.source,
 		targetArtifact: artifacts.target,
 		sourceFingerprint,
-		targetFingerprint,
+		targetFingerprint: targetFingerprint ?? fingerprintAbsent(path),
 	};
 }
 
@@ -171,6 +184,35 @@ function assertPackedRecord(pack: DurablePack, path: string, record: MutationRec
 	) {
 		throw new Error(`packed mutation journal 与 pack 不匹配：${path}`);
 	}
+}
+
+async function normalizeDeletedRecord(
+	workspaceRoot: string,
+	record: MutationRecord,
+	source: DurableLeaf,
+	decision: "rollback" | "roll_forward",
+	retainArtifacts: boolean,
+): Promise<void> {
+	if (source.kind !== "file" || record.targetArtifact !== null) {
+		throw new Error(`delete mutation variant 无效：${record.path}`);
+	}
+	relativeSafePath(workspaceRoot, record.path);
+	await assertNoSymlinkEscape(workspaceRoot, record.path);
+	const original = join(workspaceRoot, ...record.path.split("/"));
+	const sourceArtifact = join(workspaceRoot, ...record.sourceArtifact.split("/"));
+	const absent = fingerprintAbsent(record.path);
+	const observed = await fingerprintLeaf(original, record.path);
+	if (observed !== absent && observed !== record.sourceFingerprint) {
+		throw new Error(`delete mutation original 冲突：${record.path}`);
+	}
+	await assertArtifact(sourceArtifact, record.path, record.sourceFingerprint, false);
+	if (decision === "rollback") {
+		if (observed === absent) await materialize(original, record.path, source);
+		if (!retainArtifacts) await cleanupArtifact(sourceArtifact, record.path, record.sourceFingerprint);
+		return;
+	}
+	if (observed !== absent) throw new Error(`delete mutation roll-forward original 未删除：${record.path}`);
+	if (!retainArtifacts) await cleanupArtifact(sourceArtifact, record.path, record.sourceFingerprint);
 }
 
 async function normalizeRecord(

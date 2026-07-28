@@ -48,10 +48,8 @@ export async function createNativeFileBatch(options: {
 				const targetFingerprint = pack.targetFingerprint(path);
 				if (
 					artifacts === undefined ||
-					artifacts.target === null ||
 					sourceFingerprint === undefined ||
-					targetFingerprint === undefined ||
-					targetFingerprint === null
+					targetFingerprint === undefined
 				) {
 					throw new Error(`native file batch pack entry 无效：${path}`);
 				}
