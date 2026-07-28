@@ -84,10 +84,12 @@ export async function createNativeFileBatch(options: {
 function nativeExecutable(): string | undefined {
 	const platform = process.platform === "darwin"
 		? "darwin"
-		: process.platform === "linux" ? "linux" : undefined;
+		: process.platform === "linux" ? "linux"
+		: process.platform === "win32" ? "win32" : undefined;
 	const architecture = process.arch === "arm64" ? "arm64" : process.arch === "x64" ? "x64" : undefined;
 	if (platform === undefined || architecture === undefined) return undefined;
-	return fileURLToPath(new URL(`../native/bin/pi-undo-fs-${platform}-${architecture}`, import.meta.url));
+	const extension = process.platform === "win32" ? ".exe" : "";
+	return fileURLToPath(new URL(`../native/bin/pi-undo-fs-${platform}-${architecture}${extension}`, import.meta.url));
 }
 
 function runNative(executable: string, requestPath: string, expected: number): Promise<void> {

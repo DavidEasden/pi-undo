@@ -3,6 +3,8 @@ name: Native binaries
 on:
   workflow_dispatch:
   push:
+    tags:
+      - "v*"
     paths:
       - "native/pi-undo-fs/**"
       - "src/durable-pack.ts"
@@ -21,6 +23,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   build-macos:
@@ -82,8 +85,35 @@ jobs:
           name: ${{ matrix.output }}
           path: native-artifact/${{ matrix.output }}
 
+  build-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            output: pi-undo-fs-win32-x64.exe
+          - target: aarch64-pc-windows-msvc
+            output: pi-undo-fs-win32-arm64.exe
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build helper
+        run: cargo build --release --locked --manifest-path native/pi-undo-fs/Cargo.toml --target "${{ matrix.target }}"
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p native-artifact
+          cp "native/pi-undo-fs/target/${{ matrix.target }}/release/pi-undo-fs.exe" "native-artifact/${{ matrix.output }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.output }}
+          path: native-artifact/${{ matrix.output }}
+
   package:
-    needs: [build-macos, build-linux]
+    needs: [build-macos, build-linux, build-windows]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -91,11 +121,26 @@ jobs:
         with:
           node-version: 22
           cache: npm
+          registry-url: https://registry.npmjs.org
       - uses: actions/download-artifact@v4
         with:
           pattern: pi-undo-fs-*
           path: native/bin
           merge-multiple: true
+      - name: Verify native binary matrix
+        run: |
+          expected=(
+            pi-undo-fs-darwin-arm64
+            pi-undo-fs-darwin-x64
+            pi-undo-fs-linux-arm64
+            pi-undo-fs-linux-x64
+            pi-undo-fs-win32-arm64.exe
+            pi-undo-fs-win32-x64.exe
+          )
+          for binary in "${expected[@]}"; do
+            test -f "native/bin/$binary" || { echo "Missing native binary: $binary"; exit 1; }
+          done
+          test "$(find native/bin -maxdepth 1 -type f -name 'pi-undo-fs-*' | wc -l)" -eq "${#expected[@]}"
       - run: chmod +x native/bin/pi-undo-fs-*
       - run: npm ci
       - run: npm test
@@ -104,7 +149,17 @@ jobs:
           output="$(npx tsc --noEmit 2>&1 || true)"
           filtered="$(printf '%s\n' "$output" | grep -vE 'undici-types|@modelcontextprotocol|ReadonlySessionManager|@google/genai' || true)"
           test -z "$filtered" || { printf '%s\n' "$filtered"; exit 1; }
-      - run: npm pack
+      - name: Pack npm package
+        run: npm pack
+      - name: Publish npm package
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          package_tag="v$(node -p "require('./package.json').version")"
+          test "$GITHUB_REF_NAME" = "$package_tag" || {
+            echo "Tag $GITHUB_REF_NAME does not match package version $package_tag"
+            exit 1
+          }
+          npm publish ./*.tgz --access public --provenance
       - uses: actions/upload-artifact@v4
         with:
           name: npm-package

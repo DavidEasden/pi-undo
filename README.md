@@ -15,7 +15,7 @@ Each completed agent run creates a checkpoint that captures both the Pi session 
 - **External concurrency detection** — file fingerprint and inode checks detect external modification. Conflicting changes are never silently overwritten; the system fails closed or enters `recovery required`.
 - **No Git workflow** — snapshots use a private object database. No `git commit`, `git stash`, `git reset`, branches, or forges are required.
 - **Nested repositories** and **initialized submodules** are handled as independent roots. Their `.git` metadata is never modified.
-- **Performance** — batch WAL operations (up to 1,024 files per batch), scoped safety snapshots, prebuilt durable transaction packs, native Rust no-clobber file helper for macOS arm64, indexed WAL record and conflict lookups, and parallel manifest blob reads keep restore fast at scale. Unsupported platforms and failed integrity checks automatically use the TypeScript path.
+- **Performance** — batch WAL operations (up to 1,024 files per batch), scoped safety snapshots, prebuilt durable transaction packs, native Rust no-clobber file helper (macOS/Linux, arm64/x64), indexed WAL record and conflict lookups, and parallel manifest blob reads keep restore fast at scale. Unsupported platforms and failed integrity checks automatically use the TypeScript fallback.
 
 ## Requirements
 
@@ -23,27 +23,46 @@ Each completed agent run creates a checkpoint that captures both the Pi session 
 - Node.js `22.19.0` or later.
 - Git available on `PATH` (used internally for content-addressed snapshots).
 
+### Rust 原生加速
+
+pi-undo 包含跨平台 Rust 原生 helper（`pi-undo-fs`），用于加速文件系统操作。发布包会同时包含以下六个预编译二进制：
+
+| 平台 | 架构 | 二进制名称 |
+|---|---|---|
+| macOS | arm64 | `pi-undo-fs-darwin-arm64` |
+| macOS | x64 | `pi-undo-fs-darwin-x64` |
+| Linux | arm64 | `pi-undo-fs-linux-arm64` |
+| Linux | x64 | `pi-undo-fs-linux-x64` |
+| Windows | arm64 | `pi-undo-fs-win32-arm64.exe` |
+| Windows | x64 | `pi-undo-fs-win32-x64.exe` |
+
+扩展会根据当前运行环境自动选择对应二进制，因此用户无需安装 Rust，也无需手动选择平台。Windows 二进制带有 `.exe` 后缀。对于尚未提供预编译二进制的平台，扩展会自动回退到 TypeScript 路径，功能仍然可用。
+
 ## Installation
 
-Install the published package from npm:
+### 从 npm 安装（推荐）
+
+所有受支持的平台使用同一个安装命令；npm 包会包含 macOS/Linux/Windows 的 arm64/x64 预编译 Rust helper，扩展启动时自动选择当前平台的版本：
 
 ```bash
 pi install npm:@davideasden/pi-undo
 ```
 
-Restart Pi if the extension is not already loaded.
+重启 Pi 即可加载扩展。用户不需要安装 Rust，也不需要手动选择或安装平台专用包。
 
-To install from a local checkout:
+### 从本地源码安装
 
 ```bash
 pi install /path/to/pi-undo
 ```
 
-During development, load the extension directly:
+### 开发模式直接加载
 
 ```bash
 pi -e /absolute/path/to/pi-undo/extensions/pi-undo.ts
 ```
+
+> **注意**：`pi install` 会将整个包（包括 `native/bin/` 下的预编译二进制）复制到 Pi 的扩展目录。如果你从源码构建后想要包含新编译的原生二进制，确保运行 `npm run build:native` 后再执行 `pi install`。
 
 ## Usage
 
@@ -227,6 +246,8 @@ A transaction directory may contain `descriptor.json`, `restore-plan.json`, `sta
 
 ## Development
 
+### 依赖
+
 Clone the repository and install dependencies:
 
 ```bash
@@ -234,6 +255,25 @@ git clone https://github.com/DavidEasden/pi-undo.git
 cd pi-undo
 npm install
 ```
+
+### 构建 Rust 原生 helper
+
+如果需要构建或更新原生二进制，确保已安装 [Rust 工具链](https://rustup.rs/)：
+
+```bash
+npm run build:native
+```
+
+`npm run build:native` 会在 `native/pi-undo-fs/target/release/` 下生成当前构建平台的 `pi-undo-fs`。发布流程会在 macOS、Linux 和 Windows runner 上分别构建 arm64/x64 版本，统一重命名后放入 `native/bin/`，再打包成包含六个二进制的 npm 包。
+
+本地开发时，如果只需要验证当前平台，可以将生成的文件复制到 `native/bin/` 并按平台重命名，例如：Windows 生成的文件应使用对应的 `.exe` 文件名。
+
+```bash
+cp native/pi-undo-fs/target/release/pi-undo-fs native/bin/pi-undo-fs-darwin-arm64
+chmod +x native/bin/pi-undo-fs-darwin-arm64
+```
+
+发布包必须包含 Requirements 中列出的六个平台二进制；CI 会在打包前检查这一点，并在推送 `v*` tag 时发布该 CI 构建的完整 npm 包。npm 仓库需要为此 GitHub Actions workflow 配置 npm Trusted Publishing（OIDC）。如果当前平台没有对应二进制，扩展会自动使用 TypeScript 回退路径。
 
 ### Project Layout
 
