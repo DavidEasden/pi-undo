@@ -52,7 +52,7 @@
 		"proper-lockfile": "4.1.2"
 	},
 	"devDependencies": {
-		"@earendil-works/pi-coding-agent": "file:resources/pi-0.80.10/packages/coding-agent",
+		"@earendil-works/pi-coding-agent": "0.80.10",
 		"@types/node": "24.12.4",
 		"@types/proper-lockfile": "4.1.4",
 		"typescript": "5.9.3",
