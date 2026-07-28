@@ -15,7 +15,7 @@ Each completed agent run creates a checkpoint that captures both the Pi session 
 - **External concurrency detection** — file fingerprint and inode checks detect external modification. Conflicting changes are never silently overwritten; the system fails closed or enters `recovery required`.
 - **No Git workflow** — snapshots use a private object database. No `git commit`, `git stash`, `git reset`, branches, or forges are required.
 - **Nested repositories** and **initialized submodules** are handled as independent roots. Their `.git` metadata is never modified.
-- **Performance** — batch WAL operations (up to 1,024 files per batch), scoped safety snapshots, prebuilt durable transaction packs, and an optional precompiled native regular-file helper keep restore fast at scale. Unsupported platforms and failed integrity checks automatically use the TypeScript path.
+- **Performance** — batch WAL operations (up to 1,024 files per batch), scoped safety snapshots, prebuilt durable transaction packs, native Rust no-clobber file helper for macOS arm64, indexed WAL record and conflict lookups, and parallel manifest blob reads keep restore fast at scale. Unsupported platforms and failed integrity checks automatically use the TypeScript path.
 
 ## Requirements
 
@@ -115,10 +115,16 @@ Real-world measurements from a 104-file undo operation before optimizations:
 ok files:104 total:8797ms apply:8591ms capture:89ms journal:64ms commit:27ms plan:11ms
 ```
 
-After batch WAL, scoped safety snapshots, parallel restore I/O, and batch file deletes:
+After batch WAL, scoped safety snapshots, parallel restore I/O, batch file deletes, and prebuilt durable transaction packs:
 
 ```text
 ok files:104 total:~1050ms apply:~850ms capture:~90ms journal:~65ms
+```
+
+After native Rust helper, durable pack caching, parallel durable finalization, batch validated blob reads, and indexed mutation/path lookups:
+
+```text
+ok files:104 total:~850ms apply:~650ms capture:~90ms journal:~65ms plan:~10ms
 ```
 
 Performance gains come from:
@@ -132,6 +138,11 @@ Performance gains come from:
 - **Concurrent request preparation** — blob reads, live-state checks, and fingerprint computation run at 32-wide concurrency.
 - **Batch file deletes** — delete operations share the same WAL batch and directory fsync merging.
 - **Directory fsync merging** — barriers are applied once per unique directory per phase, not once per file.
+- **Native Rust no-clobber helper** — packaged macOS arm64 binary uses platform renameat2 with EEXIST guard for regular-file batches; missing binaries or platform mismatch fall back to the TypeScript path before mutation.
+- **Durable pack caching** — completed agent runs build and cache reverse/forward durable packs; the undo/redo hot path reuses the cached pack with manifest pin, avoiding redundant snapshot reads.
+- **Indexed WAL record lookups** — mutation records are indexed by ordinal for O(1) direct access instead of linear scan.
+- **Indexed path conflict resolution** — `exactExclusions` are stored as a Set for O(1) membership checks instead of O(n) `Array.includes`.
+- **Batch validated manifest blob reads** — durable pack reads coalesce blob fetches into a single batch per manifest with combined Git validation.
 
 ## How It Works
 
@@ -259,7 +270,7 @@ test/                        Unit, integration, recovery, and fault-injection te
 ### Testing
 
 ```bash
-npm test                  # Full test suite (400+ tests)
+npm test                  # Full test suite (425+ tests)
 npm run test:native       # Rust helper and durable-pack recovery tests
 npm run test:watch        # Watch mode
 npm run test:integration  # Pi runtime and extension integration tests
@@ -279,7 +290,7 @@ Benchmark tests assert Git call counts and WAL record counts, not wall-clock thr
 | 100-file restore (delete) — batch deletes | ≤12 | 600 | ~0.6s |
 | 4,000-file rollback snapshot — batch Git | ≤24 (4 x `mktree`, 4 x `commit-tree`) | — | ~7s |
 
-The 104-file standalone apply probe (10 warmup iterations + 10 measured) completes in approximately 3.9s post-optimization, down from 14.3s before batching.
+The 104-file standalone apply probe (10 warmup iterations + 10 measured) completes in approximately 3.9s post-optimization on the TypeScript path (down from 14.3s before batching), and approximately 2.8s on the native Rust path with durable pack caching and indexed blob reads.
 
 ## License
 
