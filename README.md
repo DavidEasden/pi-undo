@@ -290,7 +290,54 @@ Benchmark tests assert Git call counts and WAL record counts, not wall-clock thr
 | 100-file restore (delete) — batch deletes | ≤12 | 600 | ~0.6s |
 | 4,000-file rollback snapshot — batch Git | ≤24 (4 x `mktree`, 4 x `commit-tree`) | — | ~7s |
 
-The 104-file standalone apply probe (10 warmup iterations + 10 measured) completes in approximately 3.9s post-optimization on the TypeScript path (down from 14.3s before batching), and approximately 2.8s on the native Rust path with durable pack caching and indexed blob reads.
+The 104-file standalone apply probe (10 warmup iterations + 10 measured) completes in approximately 3.9s post-optimization on the TypeScript path, and approximately 2.8s on the native Rust path.
+
+### Performance Optimizations
+
+Several hot paths were profiled and corrected from quadratic (n doubled ≈ 4× cost) to near-linear scaling. Each change was verified against the existing test suite (425+ tests) plus fault-injection and adversarial-diff tests. Optimization order was guided by real profile data rather than static code review alone. After this phase, attention shifted to the native Rust helper path, which dominates production workloads.
+
+#### Wall-clock comparison (n changed files + n ignored files)
+
+**Plan phase** — undo diff derivation and workspace topology check:
+
+| n | Before | After | Improvement |
+|---|---|---|---|
+| 1,000 | ~178ms | ~131ms | 1.4× |
+| 2,000 | ~399ms | ~259ms | 1.5× |
+| 5,000 | ~2.5s | ~699ms | ~3.6× |
+
+**Bidirectional durable pack prepare** — agent-settled caching for undo/redo:
+
+| n | Before (no batch) | After (batched) | Improvement |
+|---|---|---|---|
+| 500 | ~949ms | ~249ms | 3.8× |
+| 1,000 | ~2,940ms | ~386ms | 7.6× |
+| 2,000 | ~10,512ms | ~677ms | 15.5× |
+
+**Native apply** — the production hot path:
+
+| n | TypeScript fallback | Native Rust helper | Improvement |
+|---|---|---|---|
+| 500 | ~2,572ms | ~253ms | 10.2× |
+| 1,000 | ~5,726ms | ~374ms | 15.3× |
+| 2,000 | ~10,521ms | ~646ms | 16.3× |
+
+#### Algorithm microbenchmarks
+
+| Scenario | Before | After | Improvement |
+|---|---|---|---|
+| 8,000×8,000 path overlap check | ~1,352ms | ~7ms | **193×** |
+| 4,000-directory ignored prefix scan (plan) | ~544ms | ~161ms | **3.4×** |
+| 5,000×5,000 manifest integrity verify | ~610ms | ~7ms | **87×** |
+
+#### Key enablers
+
+- **Manifest context batching** (`SnapshotStore.readBlobs`): one manifest read and full revalidation serves all blob fetches per operation instead of one manifest load per blob. 2,000-file pack creation dropped from 10.5s to 796ms.
+- **Blob read batch sizing** (`BLOB_BATCH_MAX_ENTRIES`: 256 → 2,048): 40 `cat-file --batch` processes collapsed to 6 for 5,000 files by letting the 16MiB byte budget drive batch boundaries.
+- **Path overlap indexing** (`pathSetsOverlap` in `path-safety.ts`): sorted binary search plus ancestor enumeration replaces a nested `some()` pattern. 8,000×8,000 path pairs from 1.35s to 7ms.
+- **Ignored-proof prefix index** (`IgnoredProofIndex` in `restore-engine.ts`): lazily sorted binary lower-bound search for directory prefix lookups replaces a full-set spread per candidate. 4,000 directories from 544ms to 161ms.
+- **WAL ordinal indexing** (`loadOrdinal` in `mutation-journal.ts`): direct array access by contiguous ordinal replaces linear `.find()` throughout quarantine and legacy recovery.
+- **Native Rust no-clobber helper** (`native/pi-undo-fs`): platform native hardlink operations with EEXIST guard. Processes in ~0.3ms per file vs ~5.3ms for the TypeScript fallback, with WAL materialized from the durable pack.
 
 ## License
 
