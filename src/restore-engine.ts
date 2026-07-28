@@ -32,7 +32,7 @@ import {
 	type DeleteLeafRequest,
 	type ReplaceFileRequest,
 } from "./quarantine.ts";
-import { SnapshotStoreError, type SnapshotStore } from "./snapshot-store.ts";
+import { SnapshotStore, SnapshotStoreError } from "./snapshot-store.ts";
 
 const PREPARED_PLAN_CACHE_LIMIT = 16;
 const RESTORE_FILE_BATCH_MAX_ENTRIES = 1_024;
@@ -730,14 +730,25 @@ export class RestoreEngine {
 		opId: string,
 	): Promise<DurablePackEntryInput[]> {
 		const paths = [...new Set([...plan.deletePaths, ...plan.writePaths])].sort(comparePaths);
+		const useValidatedBatch = SnapshotStore.supportsValidatedBlobBatch(this.store);
+		const [currentBlobBytes, targetBlobBytes] = useValidatedBatch
+			? await Promise.all([
+				this.readDurableBlobBytes(current.manifestId, paths, currentPaths),
+				this.readDurableBlobBytes(target.manifestId, paths, targetPaths),
+			])
+			: [new Map<string, Uint8Array>(), new Map<string, Uint8Array>()];
 		const result: DurablePackEntryInput[] = [];
 		for (const path of paths) {
 			const variants = new Map<string, DurableLeafInput>();
 			const absent: DurableLeafInput = { kind: "absent", fingerprint: fingerprintAbsent(path) };
 			variants.set(absent.fingerprint, absent);
-			const currentLeaf = await this.durableLeaf(current.manifestId, currentPaths.get(path));
+			const currentLeaf = useValidatedBatch
+				? this.durableLeaf(currentPaths.get(path), currentBlobBytes.get(path))
+				: await this.durableLeafCompatible(current.manifestId, currentPaths.get(path));
 			if (currentLeaf !== undefined) variants.set(currentLeaf.fingerprint, currentLeaf);
-			const targetLeaf = await this.durableLeaf(target.manifestId, targetPaths.get(path));
+			const targetLeaf = useValidatedBatch
+				? this.durableLeaf(targetPaths.get(path), targetBlobBytes.get(path))
+				: await this.durableLeafCompatible(target.manifestId, targetPaths.get(path));
 			if (targetLeaf !== undefined) variants.set(targetLeaf.fingerprint, targetLeaf);
 			if (currentLeaf === undefined && targetLeaf === undefined) continue;
 			const artifactId = checksum(canonicalJson({ opId, path })).slice(0, 32);
@@ -757,10 +768,50 @@ export class RestoreEngine {
 		return result;
 	}
 
-	private async durableLeaf(
+	private async readDurableBlobBytes(
+		manifestId: ManifestId,
+		paths: readonly string[],
+		ownedPaths: ReadonlyMap<string, OwnedPath>,
+	): Promise<ReadonlyMap<string, Uint8Array>> {
+		const files = paths.flatMap((path) => {
+			const owned = ownedPaths.get(path);
+			if (owned?.entry.kind !== "file") return [];
+			if (owned.entry.blobId === null) {
+				throw new Error(`durable pack 普通文件缺少 blob：${owned.absolutePath}`);
+			}
+			return [{ path, owned, blobId: owned.entry.blobId }];
+		});
+		if (files.length === 0) return new Map();
+		const requests = files.map(({ owned, blobId }) => ({
+			rootPath: owned.root.relativeRoot,
+			blobId,
+			relativePath: owned.entry.relativePath,
+		}));
+		const blobs = await SnapshotStore.readBlobs(this.store, manifestId, requests);
+		if (blobs.length !== files.length) throw new Error("durable pack blob batch 数量不匹配");
+		return new Map(files.map(({ path }, index) => [path, blobs[index]!]));
+	}
+
+	private async durableLeafCompatible(
 		manifestId: ManifestId,
 		owned: OwnedPath | undefined,
 	): Promise<DurableLeafInput | undefined> {
+		if (owned?.entry.kind !== "file") return this.durableLeaf(owned, undefined);
+		if (owned.entry.blobId === null) {
+			throw new Error(`durable pack 普通文件缺少 blob：${owned.absolutePath}`);
+		}
+		return this.durableLeaf(owned, await this.store.readBlob(
+			manifestId,
+			owned.root.relativeRoot,
+			owned.entry.blobId,
+			owned.entry.relativePath,
+		));
+	}
+
+	private durableLeaf(
+		owned: OwnedPath | undefined,
+		bytes: Uint8Array | undefined,
+	): DurableLeafInput | undefined {
 		if (owned === undefined || owned.entry.kind === "directory") return undefined;
 		if (owned.entry.kind === "symlink") {
 			return {
@@ -769,13 +820,9 @@ export class RestoreEngine {
 				linkText: owned.entry.linkText!,
 			};
 		}
-		if (owned.entry.blobId === null) throw new Error(`durable pack 普通文件缺少 blob：${owned.absolutePath}`);
-		const bytes = await this.store.readBlob(
-			manifestId,
-			owned.root.relativeRoot,
-			owned.entry.blobId,
-			owned.entry.relativePath,
-		);
+		if (owned.entry.blobId === null || bytes === undefined) {
+			throw new Error(`durable pack 普通文件缺少 blob：${owned.absolutePath}`);
+		}
 		const mode = owned.entry.mode & 0o777;
 		return {
 			kind: "file",

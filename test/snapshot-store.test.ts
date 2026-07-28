@@ -62,6 +62,15 @@ class RecordingGitRunner extends GitRunner {
 	}
 }
 
+class OverridingManifestSnapshotStore extends SnapshotStore {
+	loadManifestCalls = 0;
+
+	override async loadManifest(id: ManifestId): Promise<SnapshotManifest> {
+		this.loadManifestCalls += 1;
+		return super.loadManifest(id);
+	}
+}
+
 class ToggleMissingBatchGitRunner extends GitRunner {
 	missing = false;
 
@@ -73,6 +82,20 @@ class ToggleMissingBatchGitRunner extends GitRunner {
 			)));
 		}
 		return super.run(args, options);
+	}
+}
+
+class MutatingManifestAfterBlobReadGitRunner extends GitRunner {
+	manifestPath: string | undefined;
+	private mutated = false;
+
+	override async run(args: readonly string[], options?: GitRunOptions): Promise<GitRunResult> {
+		const result = await super.run(args, options);
+		if (!this.mutated && this.manifestPath !== undefined && args[0] === "cat-file" && args[1] === "blob") {
+			this.mutated = true;
+			await writeFile(this.manifestPath, "{}\n");
+		}
+		return result;
 	}
 }
 
@@ -347,6 +370,114 @@ describe("SnapshotStore", () => {
 			.rejects.toMatchObject({ code: "object_missing" });
 		await expect(store.assertComplete(manifest.manifestId, [scopedPath]))
 			.resolves.toBeUndefined();
+	});
+
+	it("批量 blob 读取与逐项读取保持内容和 path ownership 等价", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, "first.txt", "first\n");
+		await writeFixtureFile(workspace, "second.txt", "second\n");
+		const topology = await new RootDiscovery().discover(workspace);
+		const store = new SnapshotStore({ storeRoot });
+		const manifest = await store.capture(topology);
+		const entries = (await store.listTree(manifest.manifestId, "."))
+			.filter((entry) => entry.kind === "file");
+		const requests = entries.map((entry) => ({
+			rootPath: ".",
+			blobId: entry.blobId!,
+			relativePath: entry.relativePath,
+		}));
+
+		const expected = await Promise.all(requests.map((request) => store.readBlob(
+			manifest.manifestId,
+			request.rootPath,
+			request.blobId,
+			request.relativePath,
+		)));
+		expect(await SnapshotStore.readBlobs(store, manifest.manifestId, requests)).toEqual(expected);
+		await expect(SnapshotStore.readBlobs(store, manifest.manifestId, [{
+			...requests[0]!,
+			relativePath: "second.txt",
+		}])).rejects.toMatchObject({ code: "object_missing" });
+	});
+
+	it("批量适配器对自定义 store 保留逐项串行 readBlob fallback", async () => {
+		const calls: string[] = [];
+		let active = 0;
+		let maximumActive = 0;
+		const customStore = {
+			readBlob: async (_id: ManifestId, rootPath: string, blobId: string, relativePath?: string) => {
+				active += 1;
+				maximumActive = Math.max(maximumActive, active);
+				calls.push(`${rootPath}:${blobId}:${relativePath ?? ""}`);
+				await Promise.resolve();
+				active -= 1;
+				return new Uint8Array(Buffer.from(relativePath ?? blobId));
+			},
+		} as SnapshotStore;
+		const requests = [
+			{ rootPath: ".", blobId: "a".repeat(40), relativePath: "first.txt" },
+			{ rootPath: "nested", blobId: "b".repeat(40), relativePath: "second.txt" },
+			{ rootPath: ".", blobId: "a".repeat(40), relativePath: "first.txt" },
+		];
+
+		expect(await SnapshotStore.readBlobs(customStore, "c".repeat(64) as ManifestId, requests))
+			.toEqual([
+				new Uint8Array(Buffer.from("first.txt")),
+				new Uint8Array(Buffer.from("second.txt")),
+				new Uint8Array(Buffer.from("first.txt")),
+			]);
+		expect(calls).toEqual([
+			`.:${"a".repeat(40)}:first.txt`,
+			`nested:${"b".repeat(40)}:second.txt`,
+			`.:${"a".repeat(40)}:first.txt`,
+		]);
+		expect(maximumActive).toBe(1);
+		expect(await SnapshotStore.readBlobs(customStore, "invalid" as ManifestId, [])).toEqual([]);
+		expect(calls).toHaveLength(3);
+	});
+
+	it("覆写 loadManifest 的 SnapshotStore 子类回退原 readBlob 校验路径", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, "first.txt", "first\n");
+		await writeFixtureFile(workspace, "second.txt", "second\n");
+		const topology = await new RootDiscovery().discover(workspace);
+		const store = new OverridingManifestSnapshotStore({ storeRoot });
+		const manifest = await store.capture(topology);
+		const entries = (await store.listTree(manifest.manifestId, "."))
+			.filter((entry) => entry.kind === "file");
+		store.loadManifestCalls = 0;
+
+		expect(SnapshotStore.supportsValidatedBlobBatch(store)).toBe(false);
+		expect(await SnapshotStore.readBlobs(store, manifest.manifestId, entries.map((entry) => ({
+			rootPath: ".",
+			blobId: entry.blobId!,
+			relativePath: entry.relativePath,
+		})))).toHaveLength(2);
+		expect(store.loadManifestCalls).toBe(2);
+	});
+
+	it("批量 blob 读取在返回前完整复验同一路径 manifest", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, "first.txt", "first\n");
+		await writeFixtureFile(workspace, "second.txt", "second\n");
+		const git = new MutatingManifestAfterBlobReadGitRunner();
+		const discovery = new RootDiscovery(git);
+		const topology = await discovery.discover(workspace);
+		const store = new SnapshotStore({ storeRoot, git, discovery });
+		const manifest = await store.capture(topology);
+		const entries = (await store.listTree(manifest.manifestId, "."))
+			.filter((entry) => entry.kind === "file");
+		git.manifestPath = join(storeRoot, (await filesBelow(storeRoot)).find((path) =>
+			path.endsWith(`/manifests/${manifest.manifestId}.json`))!);
+
+		await expect(SnapshotStore.readBlobs(store, manifest.manifestId, entries.map((entry) => ({
+			rootPath: ".",
+			blobId: entry.blobId!,
+			relativePath: entry.relativePath,
+		})))).rejects.toMatchObject({ code: "manifest_invalid" });
 	});
 
 	it("assertComplete 对每个 root 使用一次 batch-check", async () => {

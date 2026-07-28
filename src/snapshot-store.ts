@@ -96,6 +96,12 @@ export interface CaptureOptions {
 	readonly excludePaths?: readonly string[];
 }
 
+export interface SnapshotBlobRequest {
+	readonly rootPath: string;
+	readonly blobId: string;
+	readonly relativePath?: string;
+}
+
 export type SnapshotStoreErrorCode =
 	| "capture_failed"
 	| "invalid_manifest_id"
@@ -149,6 +155,33 @@ export class SnapshotStore {
 		this.discovery = options.discovery ?? new RootDiscovery(this.git);
 		this.lock = options.lock ?? new WorkspaceLock();
 		this.clock = options.clock ?? Date.now;
+	}
+
+	static supportsValidatedBlobBatch(store: SnapshotStore): boolean {
+		return store instanceof SnapshotStore &&
+			store.readBlob === SnapshotStore.prototype.readBlob &&
+			store.loadManifest === SnapshotStore.prototype.loadManifest;
+	}
+
+	static async readBlobs(
+		store: SnapshotStore,
+		id: ManifestId,
+		requests: readonly SnapshotBlobRequest[],
+	): Promise<readonly Uint8Array[]> {
+		if (requests.length === 0) return [];
+		if (SnapshotStore.supportsValidatedBlobBatch(store)) {
+			return (store as SnapshotStore).readBlobsValidated(id, requests);
+		}
+		const result: Uint8Array[] = [];
+		for (const request of requests) {
+			result.push(await store.readBlob(
+				id,
+				request.rootPath,
+				request.blobId,
+				request.relativePath,
+			));
+		}
+		return result;
 	}
 
 	async durableCacheDirectory(): Promise<string> {
@@ -309,7 +342,10 @@ export class SnapshotStore {
 	}
 
 	async loadManifest(id: ManifestId): Promise<SnapshotManifest> {
-		const manifestPath = await this.findManifestPath(id);
+		return this.loadManifestFromPath(id, await this.findManifestPath(id));
+	}
+
+	private async loadManifestFromPath(id: ManifestId, manifestPath: string): Promise<SnapshotManifest> {
 		try {
 			const value: unknown = JSON.parse(await readFile(manifestPath, "utf8"));
 			const manifest = assertManifest(value);
@@ -432,41 +468,67 @@ export class SnapshotStore {
 		blobId: string,
 		relativePath?: string,
 	): Promise<Uint8Array> {
-		relativeSafePath("/", rootPath);
-		if (!isObjectId(blobId)) {
-			throw new SnapshotStoreError("object_missing", "blob ID 无效");
+		return (await this.readBlobOperation(id, [{ rootPath, blobId, relativePath }], false))[0]!;
+	}
+
+	private readBlobsValidated(
+		id: ManifestId,
+		requests: readonly SnapshotBlobRequest[],
+	): Promise<readonly Uint8Array[]> {
+		return this.readBlobOperation(id, requests, true);
+	}
+
+	private async readBlobOperation(
+		id: ManifestId,
+		requests: readonly SnapshotBlobRequest[],
+		revalidateManifest: boolean,
+	): Promise<readonly Uint8Array[]> {
+		for (const request of requests) {
+			relativeSafePath("/", request.rootPath);
+			if (!isObjectId(request.blobId)) {
+				throw new SnapshotStoreError("object_missing", "blob ID 无效");
+			}
 		}
 		const manifestPath = await this.findManifestPath(id);
-		const manifest = await this.loadManifest(id);
-		const root = manifest.roots.find((candidate) => candidate.relativeRoot === rootPath);
-		if (root === undefined) {
-			throw new SnapshotStoreError("root_not_found", "manifest 中不存在指定 root");
-		}
-		if (root.state !== "active" || root.treeId === null) {
-			throw new SnapshotStoreError("object_missing", "指定 root 没有可读取的 tree");
-		}
-
+		const manifest = revalidateManifest
+			? await this.loadManifestFromPath(id, manifestPath)
+			: await this.loadManifest(id);
+		const roots = new Map(manifest.roots.map((root) => [root.relativeRoot, root]));
 		const storeDirectory = dirname(dirname(manifestPath));
-		const gitDirectory = this.rootGitDirectory(storeDirectory, root);
 		try {
-			const safeRelativePath = relativePath === undefined ? undefined : relativeSafePath("/", relativePath);
-			if (safeRelativePath === undefined) {
-				const entries = await this.readTreeEntries(gitDirectory, root.treeId);
-				if (!entries.some((entry) => entry.objectId === blobId)) {
-					throw new SnapshotStoreError("object_missing", "blob 不属于指定 root tree");
+			const result: Uint8Array[] = [];
+			for (const request of requests) {
+				const root = roots.get(request.rootPath);
+				if (root === undefined) {
+					throw new SnapshotStoreError("root_not_found", "manifest 中不存在指定 root");
 				}
-			} else {
-				const membershipKey = treeBlobMembershipKey(gitDirectory, root.treeId, safeRelativePath);
-				let ownedBlobId = this.treeBlobMembership.get(membershipKey);
-				if (ownedBlobId === undefined) {
-					await this.readTreeEntries(gitDirectory, root.treeId, [safeRelativePath]);
-					ownedBlobId = this.treeBlobMembership.get(membershipKey);
+				if (root.state !== "active" || root.treeId === null) {
+					throw new SnapshotStoreError("object_missing", "指定 root 没有可读取的 tree");
 				}
-				if (ownedBlobId !== blobId) {
-					throw new SnapshotStoreError("object_missing", "blob 不属于指定 root tree path");
+				const gitDirectory = this.rootGitDirectory(storeDirectory, root);
+				const safeRelativePath = request.relativePath === undefined
+					? undefined
+					: relativeSafePath("/", request.relativePath);
+				if (safeRelativePath === undefined) {
+					const entries = await this.readTreeEntries(gitDirectory, root.treeId);
+					if (!entries.some((entry) => entry.objectId === request.blobId)) {
+						throw new SnapshotStoreError("object_missing", "blob 不属于指定 root tree");
+					}
+				} else {
+					const membershipKey = treeBlobMembershipKey(gitDirectory, root.treeId, safeRelativePath);
+					let ownedBlobId = this.treeBlobMembership.get(membershipKey);
+					if (ownedBlobId === undefined) {
+						await this.readTreeEntries(gitDirectory, root.treeId, [safeRelativePath]);
+						ownedBlobId = this.treeBlobMembership.get(membershipKey);
+					}
+					if (ownedBlobId !== request.blobId) {
+						throw new SnapshotStoreError("object_missing", "blob 不属于指定 root tree path");
+					}
 				}
+				result.push(new Uint8Array(await this.readBlobBytes(gitDirectory, request.blobId)));
 			}
-			return new Uint8Array(await this.readBlobBytes(gitDirectory, blobId));
+			if (revalidateManifest) await this.loadManifestFromPath(id, manifestPath);
+			return result;
 		} catch (error) {
 			if (error instanceof SnapshotStoreError) {
 				throw error;
