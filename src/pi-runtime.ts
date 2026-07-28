@@ -99,7 +99,7 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 						continue;
 					}
 					await quarantine.rollForwardMutation(record);
-					const latest = (await mutationJournal.load()).find((candidate) => candidate.ordinal === record.ordinal);
+					const latest = await mutationJournal.loadOrdinal(record.ordinal);
 					if (latest === undefined) throw new Error("mutation ordinal 在恢复期间丢失");
 					await quarantine.cleanupMutation(latest);
 				}

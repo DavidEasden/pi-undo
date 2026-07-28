@@ -771,7 +771,7 @@ export class QuarantineManager {
 
 	private async assertOwnedRecord(record: MutationRecord): Promise<MutationRecord> {
 		await this.assertWorkspaceIdentity();
-		const owned = (await this.journal.load()).find((candidate) => candidate.ordinal === record.ordinal);
+		const owned = await this.journal.loadOrdinal(record.ordinal);
 		if (owned === undefined || immutableMutation(owned) !== immutableMutation(record)) {
 			throw new QuarantineError("unsafe_artifact", "mutation record 未被当前 journal 精确登记");
 		}

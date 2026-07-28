@@ -64,6 +64,12 @@ export class MutationJournal {
 		return (await this.readRecords()).latest;
 	}
 
+	async loadOrdinal(ordinal: number): Promise<MutationRecord | undefined> {
+		if (!Number.isSafeInteger(ordinal) || ordinal < 1) return undefined;
+		const record = (await this.readRecords()).latest[ordinal - 1];
+		return record?.ordinal === ordinal ? record : undefined;
+	}
+
 	begin(intent: MutationIntent): Promise<MutationRecord> {
 		return this.enqueueMutation(async () => (await this.beginManyMutation([intent]))[0]!);
 	}

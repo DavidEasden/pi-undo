@@ -109,6 +109,24 @@ describe("MutationJournal", () => {
 		expect(await readFile(file, "utf8")).toBe(`${canonicalJson(begun)}\n${canonicalJson(advanced)}\n`);
 	});
 
+	it("按连续 ordinal 直接读取最新 durable record", async () => {
+		const { journal } = await journalFixture();
+		const begun = await journal.beginMany([
+			intent(),
+			intent("b.txt", {
+				sourceArtifact: ".b.txt.pi-undo-source",
+				targetArtifact: ".b.txt.pi-undo-target",
+			}),
+		]);
+		const advanced = await journal.advance(2, "SOURCE_QUARANTINED");
+
+		expect(await journal.loadOrdinal(1)).toEqual(begun[0]);
+		expect(await journal.loadOrdinal(2)).toEqual(advanced);
+		expect(await journal.loadOrdinal(0)).toBeUndefined();
+		expect(await journal.loadOrdinal(3)).toBeUndefined();
+		expect(await journal.loadOrdinal(1.5)).toBeUndefined();
+	});
+
 	it("advanceMany 单次提交多个连续状态并保持逐记录 hash chain", async () => {
 		const { journal, file } = await journalFixture();
 		const begun = await journal.begin(intent());
