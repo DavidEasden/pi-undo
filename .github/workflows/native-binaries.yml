@@ -7,12 +7,16 @@ on:
       - "native/pi-undo-fs/**"
       - "src/durable-pack.ts"
       - "src/native-restore.ts"
+      - "package.json"
+      - "package-lock.json"
       - ".github/workflows/native-binaries.yml"
   pull_request:
     paths:
       - "native/pi-undo-fs/**"
       - "src/durable-pack.ts"
       - "src/native-restore.ts"
+      - "package.json"
+      - "package-lock.json"
       - ".github/workflows/native-binaries.yml"
 
 permissions:
