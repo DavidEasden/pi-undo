@@ -456,6 +456,49 @@ describe("RestoreEngine", () => {
 		await expect(access(join(workspace, "removed.txt"))).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
+	it("ignored 前缀判定在排序相邻的兄弟路径边界上保持精确", async () => {
+		// `-`(0x2d) < `.`(0x2e) < `/`(0x2f)，因此 cache-x/、cache.txt 与 cache/ 在排序中紧邻，
+		// 可暴露前缀判定的边界错误：既不能因相邻兄弟而误判保护，也不能漏掉真实 ignored 子路径。
+		const workspace = await temporaryRoot("pi-undo-restore-workspace-");
+		await writeFile(workspace, ".gitignore", "cache/volatile.txt\ndataz/keep.txt\n");
+		await writeFile(workspace, "cache/volatile.txt", "target-ignored\n");
+		await writeFile(workspace, "dataz/keep.txt", "neighbor-ignored\n");
+		const storeRoot = await temporaryRoot("pi-undo-restore-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, ".gitignore", "");
+		await writeFile(workspace, "cache/volatile.txt", "preserve-current\n");
+		// 排序上紧邻 `cache/` 的兄弟叶子，均无 ignored 证明，必须照常删除。
+		await writeFile(workspace, "cache-x/leaf.txt", "remove-sibling-dir\n");
+		await writeFile(workspace, "cache.txt", "remove-sibling-file\n");
+		// `data/` 自身无 ignored 证明，但 `dataz/keep.txt` 以 `data` 为严格前缀且排序在
+		// `data/` 之后。若前缀判定错用 `startsWith(path)` 而非 `startsWith(path + "/")`，
+		// 就会把 `dataz/keep.txt` 当成 `data/` 的证明而错误保留它。
+		await writeFile(workspace, "data/leaf.txt", "remove-prefix-neighbor\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+
+		const plan = await engine.plan(current, target);
+
+		expect(plan.deletePaths).not.toContain("cache");
+		expect(plan.deletePaths).not.toContain("cache/volatile.txt");
+		expect(plan.deletePaths).not.toContain("dataz");
+		expect(plan.deletePaths).not.toContain("dataz/keep.txt");
+		expect(plan.deletePaths).toContain("cache-x/leaf.txt");
+		expect(plan.deletePaths).toContain("cache.txt");
+		expect(plan.deletePaths).toContain("data/leaf.txt");
+		expect(plan.deletePaths).toContain("data");
+		expect((await engine.apply(plan, target)).code).toBe("ok");
+		expect(await readFile(join(workspace, "cache/volatile.txt"), "utf8")).toBe("preserve-current\n");
+		expect(await readFile(join(workspace, "dataz/keep.txt"), "utf8")).toBe("neighbor-ignored\n");
+		await expect(access(join(workspace, "cache.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(access(join(workspace, "cache-x/leaf.txt"))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+		await expect(access(join(workspace, "data"))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
 	it("相同 partial coverage 下 ownership 迁移仍以全局缺失为准", async () => {
 		const outer = await createGitRepo();
 		temporaryRoots.push(outer.root);

@@ -169,7 +169,7 @@ export class RestoreEngine {
 			this.readOwnedPaths(current, canonicalScopePaths),
 			this.readOwnedPaths(target, canonicalScopePaths),
 		]);
-		const targetIgnoredPaths = ignoredWorkspacePaths(target);
+		const targetIgnoredProof = new IgnoredProofIndex(ignoredWorkspacePaths(target));
 		const deleteByRoot = new Map<string, string[]>();
 		const writeByRoot = new Map<string, string[]>();
 
@@ -183,7 +183,7 @@ export class RestoreEngine {
 				continue;
 			}
 			if (targetOwned === undefined) {
-				if (isProtectedByIgnoredProof(path, owned.entry.kind, targetIgnoredPaths)) {
+				if (targetIgnoredProof.isProtected(path, owned.entry.kind)) {
 					continue;
 				}
 				appendPath(deleteByRoot, owned.root.relativeRoot, path);
@@ -1728,15 +1728,42 @@ function ignoredWorkspacePaths(manifest: SnapshotManifest): Set<string> {
 	));
 }
 
-function isProtectedByIgnoredProof(
-	path: string,
-	kind: RestorePath["kind"],
-	ignoredPaths: ReadonlySet<string>,
-): boolean {
-	if (kind !== "directory") {
-		return ignoredPaths.has(path);
+/**
+ * ignored 证明的前缀索引。
+ *
+ * 目录判定需要回答"是否存在以 `${path}/` 开头的 ignored 路径"。逐次线性扫描
+ * 整个 set 会让"目录数 × ignored 数"变成平方项，因此这里预排序一次，
+ * 之后每次判定用二分下界定位第一个不小于前缀的元素。
+ *
+ * 语义与线性扫描完全一致：只回答存在性，不改变 fail-closed 行为，也不放宽
+ * 任何 ignored 保护。非目录仍走精确 `has()`。
+ */
+class IgnoredProofIndex {
+	private readonly exact: ReadonlySet<string>;
+	private sortedPaths: readonly string[] | undefined;
+
+	constructor(paths: ReadonlySet<string>) {
+		this.exact = paths;
 	}
-	return [...ignoredPaths].some((ignoredPath) => ignoredPath.startsWith(`${path}/`));
+
+	isProtected(path: string, kind: RestorePath["kind"]): boolean {
+		if (kind !== "directory") {
+			return this.exact.has(path);
+		}
+		if (this.exact.size === 0) return false;
+		// 排序成本只在第一次目录判定时付出，纯文件计划完全不触发。
+		this.sortedPaths ??= [...this.exact].sort();
+		const sorted = this.sortedPaths;
+		const prefix = `${path}/`;
+		let low = 0;
+		let high = sorted.length;
+		while (low < high) {
+			const middle = (low + high) >>> 1;
+			if (sorted[middle]! < prefix) low = middle + 1;
+			else high = middle;
+		}
+		return low < sorted.length && sorted[low]!.startsWith(prefix);
+	}
 }
 
 function rootBoundaryDirectories(root: string): string[] {
