@@ -70,6 +70,44 @@ describe("undo/redo restore performance", () => {
 		}
 	}, 120_000);
 
+	it("两千五百文件 plan 按字节上限而非固定条数切分 blob 批次", async () => {
+		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-plan-batch-"));
+		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-plan-batch-store-"));
+		try {
+			await mkdir(join(workspace, "src"));
+			const scope = Array.from(
+				{ length: 2_500 },
+				(_, index) => `src/file-${String(index).padStart(5, "0")}.txt`,
+			);
+			await Promise.all(scope.map((path, index) => writeFile(join(workspace, path), `before ${index}\n`)));
+			const git = new CountingGitRunner();
+			const discovery = new RootDiscovery(git);
+			const store = new SnapshotStore({ storeRoot, git, discovery });
+			const restore = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+			const topology = await discovery.discover(workspace);
+			const target = await store.capture(topology);
+			await Promise.all(scope.map((path, index) => writeFile(join(workspace, path), `after ${index}\n`)));
+			const current = await store.capture(topology, scope);
+			git.calls.length = 0;
+
+			const plan = await restore.plan(current, target, scope);
+
+			expect(plan.writePaths).toHaveLength(2_500);
+			// 5000 个小 blob（current + target 两侧）远未触及 16MB 字节上限，
+			// 因此批次数应由字节预算决定，不应退化成每 256 条切一批。
+			const blobBatches = git.calls.filter(
+				(args) => args.includes("cat-file") && args.includes("--batch"),
+			).length;
+			expect(blobBatches).toBeLessThanOrEqual(process.platform === "win32" ? 20 : 4);
+			expect(countCommand(git.calls, "cat-file")).toBeLessThanOrEqual(
+				process.platform === "win32" ? 24 : 8,
+			);
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+		}
+	}, 180_000);
+
 	it("一百零四文件 apply 批量读取 blob 且保留完整逻辑 WAL", async () => {
 		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-apply-perf-"));
 		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-apply-perf-store-"));

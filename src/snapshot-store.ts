@@ -41,7 +41,7 @@ const INDEX_BATCH_MAX_ENTRIES = 4_096;
 const INDEX_BATCH_MAX_BYTES = 8 * 1024 * 1024;
 const BLOB_CACHE_MAX_BYTES = 128 * 1024 * 1024;
 const BLOB_BATCH_MAX_BYTES = 16 * 1024 * 1024;
-const BLOB_BATCH_MAX_ENTRIES = 256;
+const BLOB_BATCH_MAX_ENTRIES = process.platform === "win32" ? 256 : 2_048;
 
 interface PinRecord {
 	readonly schemaVersion: 1;
