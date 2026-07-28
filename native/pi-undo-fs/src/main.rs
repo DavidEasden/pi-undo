@@ -11,6 +11,8 @@ use std::thread;
 #[cfg(unix)]
 use std::ffi::CString;
 #[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -38,7 +40,7 @@ struct Request {
 struct RequestEntry {
     path: String,
     source_artifact: String,
-    target_artifact: String,
+    target_artifact: Option<String>,
     source_fingerprint: String,
     target_fingerprint: String,
 }
@@ -89,13 +91,24 @@ struct Pack {
     entries: BTreeMap<String, PackedOperation>,
 }
 
+#[cfg(unix)]
+struct ParentDirectory {
+    file: fs::File,
+}
+
 struct OperationEntry {
     path: String,
     original: PathBuf,
     source: PathBuf,
-    target: PathBuf,
+    target: Option<PathBuf>,
     source_variant: PackVariant,
     target_variant: PackVariant,
+    #[cfg(unix)]
+    parent: Option<Arc<ParentDirectory>>,
+    #[cfg(unix)]
+    original_name: Option<String>,
+    #[cfg(unix)]
+    source_name: Option<String>,
 }
 
 fn main() {
@@ -127,6 +140,8 @@ fn run() -> Result<(), String> {
     if request.entries.len() != pack.entries.len() {
         return Err("request 与 pack 路径数量不匹配".into());
     }
+    #[cfg(unix)]
+    let workspace_parent = Arc::new(open_parent_directory(&workspace)?);
     let mut operations = Vec::with_capacity(request.entries.len());
     let mut requested_paths = BTreeMap::new();
     for entry in request.entries {
@@ -138,7 +153,7 @@ fn run() -> Result<(), String> {
             .get(&entry.path)
             .ok_or_else(|| format!("pack 缺少路径：{}", entry.path))?;
         if packed.source_artifact != entry.source_artifact
-            || packed.target_artifact.as_deref() != Some(entry.target_artifact.as_str())
+            || packed.target_artifact.as_deref() != entry.target_artifact.as_deref()
             || packed.source_fingerprint != entry.source_fingerprint
             || packed.target_fingerprint.as_deref() != Some(entry.target_fingerprint.as_str())
         {
@@ -146,7 +161,42 @@ fn run() -> Result<(), String> {
         }
         let original = safe_path(&workspace, &entry.path)?;
         let source = safe_artifact(&workspace, &entry.path, &entry.source_artifact, "source")?;
-        let target = safe_artifact(&workspace, &entry.path, &entry.target_artifact, "target")?;
+        let target = entry
+            .target_artifact
+            .as_ref()
+            .map(|artifact| safe_artifact(&workspace, &entry.path, artifact, "target"))
+            .transpose()?;
+        #[cfg(unix)]
+        let (parent, original_name, source_name) = if target.is_none() {
+            let original_parent = original
+                .parent()
+                .ok_or_else(|| format!("路径缺少 parent：{}", entry.path))?;
+            if original_parent != workspace {
+                return Err(format!(
+                    "native delete 只允许 workspace 直属普通文件：{}",
+                    entry.path
+                ));
+            }
+            let original_name = original
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| format!("文件名无效：{}", entry.path))?;
+            let source_name = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| format!("source 文件名无效：{}", entry.path))?;
+            (
+                Some(Arc::clone(&workspace_parent)),
+                Some(original_name.to_owned()),
+                Some(source_name.to_owned()),
+            )
+        } else {
+            (None, None, None)
+        };
+        #[cfg(not(unix))]
+        if target.is_none() {
+            return Err("当前平台 native delete 不支持，回退 TypeScript restore".into());
+        }
         let source_variant = packed
             .variants
             .get(&entry.source_fingerprint)
@@ -160,7 +210,13 @@ fn run() -> Result<(), String> {
         if source_variant.kind != "absent" && source_variant.kind != "file" {
             return Err(format!("native batch source 不是普通文件：{}", entry.path));
         }
-        if target_variant.kind != "file" {
+        if target.is_none() && source_variant.kind != "file" {
+            return Err(format!("native delete source 不是普通文件：{}", entry.path));
+        }
+        if target.is_none() && target_variant.kind != "absent" {
+            return Err(format!("native delete target 不是 absent：{}", entry.path));
+        }
+        if target.is_some() && target_variant.kind != "file" {
             return Err(format!("native batch target 不是普通文件：{}", entry.path));
         }
         operations.push(OperationEntry {
@@ -170,6 +226,12 @@ fn run() -> Result<(), String> {
             target,
             source_variant,
             target_variant,
+            #[cfg(unix)]
+            parent,
+            #[cfg(unix)]
+            original_name,
+            #[cfg(unix)]
+            source_name,
         });
     }
     let operations = Arc::new(operations);
@@ -270,7 +332,10 @@ fn verify_source(pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
 }
 
 fn create_target(pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
-    assert_absent(&entry.target, &entry.path)?;
+    let Some(target) = entry.target.as_ref() else {
+        return Ok(());
+    };
+    assert_absent(target, &entry.path)?;
     let bytes = read_variant(pack, &entry.target_variant)?;
     let mode = entry
         .target_variant
@@ -281,17 +346,43 @@ fn create_target(pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
     #[cfg(unix)]
     options.mode(mode);
     let mut file = options
-        .open(&entry.target)
+        .open(target)
         .map_err(error_path("创建 target artifact 失败", &entry.path))?;
     file.write_all(&bytes)
         .map_err(error_path("写入 target artifact 失败", &entry.path))?;
     #[cfg(unix)]
     file.set_permissions(fs::Permissions::from_mode(mode))
         .map_err(error_path("设置 target mode 失败", &entry.path))?;
-    verify_file(pack, &entry.target, &entry.target_variant, &entry.path)
+    verify_file(pack, target, &entry.target_variant, &entry.path)
 }
 
 fn capture_source(pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
+    if entry.target.is_none() {
+        #[cfg(unix)]
+        {
+            let parent = entry.parent.as_ref().ok_or("delete parent handle 缺失")?;
+            let original_name = entry
+                .original_name
+                .as_deref()
+                .ok_or("delete original name 缺失")?;
+            let source_name = entry
+                .source_name
+                .as_deref()
+                .ok_or("delete source name 缺失")?;
+            verify_file(pack, &entry.original, &entry.source_variant, &entry.path)?;
+            assert_absent(&entry.source, &entry.path)?;
+            link_no_replace_at(parent, original_name, source_name, &entry.path)?;
+            verify_file(pack, &entry.original, &entry.source_variant, &entry.path)?;
+            verify_file(pack, &entry.source, &entry.source_variant, &entry.path)?;
+            assert_same_file_identity(&entry.original, &entry.source, &entry.path)?;
+            unlink_at(parent, original_name, &entry.path)?;
+            assert_absent(&entry.original, &entry.path)?;
+            verify_file(pack, &entry.source, &entry.source_variant, &entry.path)?;
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        return Err("当前平台 native delete 不支持，回退 TypeScript restore".into());
+    }
     if entry.source_variant.kind == "absent" {
         assert_absent(&entry.original, &entry.path)?;
         assert_absent(&entry.source, &entry.path)?;
@@ -304,23 +395,87 @@ fn capture_source(pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
 }
 
 fn install_target(pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
+    if entry.target.is_none() {
+        return Ok(());
+    }
     assert_absent(&entry.original, &entry.path)?;
-    verify_file(pack, &entry.target, &entry.target_variant, &entry.path)?;
-    fs::hard_link(&entry.target, &entry.original).map_err(error_path(
+    let target = entry.target.as_ref().ok_or("target artifact 缺失")?;
+    verify_file(pack, target, &entry.target_variant, &entry.path)?;
+    fs::hard_link(target, &entry.original).map_err(error_path(
         "原子 no-clobber target install 失败",
         &entry.path,
     ))
 }
 
 fn verify_installed(pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
+    if entry.target.is_none() {
+        assert_absent(&entry.original, &entry.path)?;
+        verify_file(pack, &entry.source, &entry.source_variant, &entry.path)?;
+        return Ok(());
+    }
     verify_file(pack, &entry.original, &entry.target_variant, &entry.path)?;
-    assert_same_file_identity(&entry.original, &entry.target, &entry.path)?;
+    assert_same_file_identity(&entry.original, entry.target.as_ref().unwrap(), &entry.path)?;
     if entry.source_variant.kind == "file" {
         verify_file(pack, &entry.source, &entry.source_variant, &entry.path)?;
     } else {
         assert_absent(&entry.source, &entry.path)?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn open_parent_directory(path: &Path) -> Result<ParentDirectory, String> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    let file = options
+        .open(path)
+        .map_err(error("打开 native delete parent 失败"))?;
+    Ok(ParentDirectory { file })
+}
+
+#[cfg(unix)]
+fn link_no_replace_at(
+    parent: &ParentDirectory,
+    original_name: &str,
+    source_name: &str,
+    logical: &str,
+) -> Result<(), String> {
+    let original = CString::new(original_name).map_err(|_| format!("文件名包含 NUL：{logical}"))?;
+    let source =
+        CString::new(source_name).map_err(|_| format!("source 文件名包含 NUL：{logical}"))?;
+    let result = unsafe {
+        libc::linkat(
+            parent.file.as_raw_fd(),
+            original.as_ptr(),
+            parent.file.as_raw_fd(),
+            source.as_ptr(),
+            0,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "建立 source hard link 失败：{logical}: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn unlink_at(parent: &ParentDirectory, name: &str, logical: &str) -> Result<(), String> {
+    let name = CString::new(name).map_err(|_| format!("文件名包含 NUL：{logical}"))?;
+    let result = unsafe { libc::unlinkat(parent.file.as_raw_fd(), name.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "删除原路径失败：{logical}: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
 }
 
 #[cfg(unix)]

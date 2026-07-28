@@ -6,7 +6,7 @@ import { fsyncDirectory, fsyncFile } from "./atomic-fs.ts";
 import { canonicalJson, checksum } from "./encoding.ts";
 import type { MutationJournal } from "./mutation-journal.ts";
 import { assertNoSymlinkEscape, relativeSafePath } from "./path-safety.ts";
-import { fingerprintAbsent, fingerprintBytes, fingerprintFile, fingerprintSymlink } from "./quarantine.ts";
+import { fingerprintAbsent, fingerprintBytes, fingerprintFile, fingerprintLeaf, fingerprintSymlink } from "./quarantine.ts";
 
 const PACK_FILE = "durable-pack-v1.bin";
 const MAGIC = Buffer.from("PIUNDO-PACK-V1\0", "ascii");
@@ -315,13 +315,36 @@ export async function finalizeDurablePack(
 	const directories = new Set<string>();
 	await mapConcurrent(pack.paths(), FINALIZE_CONCURRENCY, async (path) => {
 		const targetFingerprint = pack.targetFingerprint(path);
-		if (targetFingerprint === undefined || targetFingerprint === null) return;
-		const leaf = pack.leaf(path, targetFingerprint);
-		if (leaf === undefined || leaf.kind === "absent") throw new Error(`durable pack target leaf 缺失：${path}`);
+		const targetLeaf = targetFingerprint === undefined || targetFingerprint === null
+			? undefined
+			: pack.leaf(path, targetFingerprint);
 		relativeSafePath(canonicalRoot, path);
 		await assertNoSymlinkEscape(canonicalRoot, path);
 		const absolute = join(canonicalRoot, ...path.split("/"));
 		directories.add(dirname(absolute));
+		if (targetLeaf?.kind === "absent") {
+			if (await fingerprintLeaf(absolute, path) !== fingerprintAbsent(path)) {
+				throw new Error(`durable finalization delete 原路径不是 absent：${path}`);
+			}
+			const sourceFingerprint = pack.sourceFingerprint(path);
+			const sourceArtifact = pack.artifacts(path)?.source;
+			if (sourceFingerprint === undefined || sourceArtifact === undefined) {
+				throw new Error(`durable finalization delete source 缺失：${path}`);
+			}
+			const sourcePath = join(canonicalRoot, ...sourceArtifact.split("/"));
+			try {
+				if (await fingerprintFile(sourcePath, path) !== sourceFingerprint) {
+					throw new Error(`durable finalization delete source fingerprint 冲突：${path}`);
+				}
+				await fsyncFile(sourcePath);
+				directories.add(dirname(sourcePath));
+			} catch (error) {
+				if (!hasErrorCode(error, "ENOENT") || mutationStates?.get(path) !== "CLEANED") throw error;
+			}
+			return;
+		}
+		const leaf = targetLeaf;
+		if (leaf === undefined) throw new Error(`durable pack target leaf 缺失：${path}`);
 		if (leaf.kind === "file") {
 			const artifacts = pack.artifacts(path);
 			if (artifacts?.target === null || artifacts?.target === undefined) {

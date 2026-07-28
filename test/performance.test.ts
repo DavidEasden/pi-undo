@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -186,6 +186,44 @@ describe("undo/redo restore performance", () => {
 			await rm(journalRoot, { recursive: true, force: true });
 		}
 	}, 120_000);
+
+	it("五千普通文件 delete-only restore 使用 native batch", async () => {
+		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-delete-native-perf-"));
+		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-delete-native-perf-store-"));
+		const journalRoot = await mkdtemp(join(tmpdir(), "pi-undo-delete-native-perf-journal-"));
+		try {
+			const files = Array.from(
+				{ length: 5_000 },
+				(_, index) => `file-${String(index).padStart(5, "0")}.txt`,
+			);
+			await Promise.all(files.map((path, index) => writeFile(join(workspace, path), `content ${index}\n`)));
+			const discovery = new RootDiscovery();
+			const store = new SnapshotStore({ storeRoot, discovery });
+			const restore = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+			const topology = await discovery.discover(workspace);
+			const before = await store.capture(topology);
+			await Promise.all(files.map((path) => unlink(join(workspace, path))));
+			const target = await store.capture(topology, files);
+			await Promise.all(files.map((path, index) => writeFile(join(workspace, path), `content ${index}\n`)));
+			const plan = await restore.plan(before, target, files);
+			await restore.prepareDurableRestore(before, target, files);
+			const result = await restore.apply(plan, target, {
+				opId: "delete-native-performance",
+				mutationJournal: new MutationJournal(
+					join(journalRoot, "mutations.jsonl"),
+					"delete-native-performance",
+				),
+				deferDurability: true,
+			});
+			expect(plan.deletePaths).toHaveLength(5_000);
+			expect(plan.writePaths).toHaveLength(0);
+			expect(result).toMatchObject({ code: "ok", verifiedPaths: 5_000, totalPaths: 5_000 });
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+			await rm(journalRoot, { recursive: true, force: true });
+		}
+	}, 180_000);
 
 	it("scoped restore 的 Git 调用数不随未改动文件线性增长", async () => {
 		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-perf-"));

@@ -253,7 +253,7 @@ export class RestoreEngine {
 	): Promise<void> {
 		const plan = await this.plan(current, target, scopePaths);
 		const prepared = this.takePreparedPlan(plan);
-		if (prepared === undefined || !this.canUseNativeFilePlan(plan, prepared.targetPaths)) return;
+		if (prepared === undefined || !this.canUseNativeFilePlan(plan, prepared.currentPaths, prepared.targetPaths)) return;
 		const cacheRoot = await this.store.durableCacheDirectory();
 		const cacheOpId = `cache-${plan.planDigest}`;
 		const cacheJournal = new MutationJournal(
@@ -528,7 +528,7 @@ export class RestoreEngine {
 			!compatibilityMode &&
 			options.deferDurability === true &&
 			options.forceTargetArtifactSync !== true &&
-			this.canUseNativeFilePlan(plan, targetPaths)
+			this.canUseNativeFilePlan(plan, currentPaths, targetPaths)
 		) {
 			try {
 				const cached = this.durablePackCache.get(plan.planDigest);
@@ -574,7 +574,7 @@ export class RestoreEngine {
 			);
 		}
 		const durablePackEnabled = durablePack !== undefined;
-		if (nativeFileBatch !== undefined && durablePack !== undefined && this.canUseNativeFilePlan(plan, targetPaths)) {
+		if (nativeFileBatch !== undefined && durablePack !== undefined && this.canUseNativeFilePlan(plan, currentPaths, targetPaths)) {
 			const result = await this.applyNativeFilePlan(
 				plan,
 				current,
@@ -661,11 +661,20 @@ export class RestoreEngine {
 
 	private canUseNativeFilePlan(
 		plan: RestorePlan,
+		currentPaths: ReadonlyMap<string, OwnedPath>,
 		targetPaths: ReadonlyMap<string, OwnedPath>,
 	): boolean {
-		return plan.deletePaths.length === 0 &&
+		const writeOnly = plan.deletePaths.length === 0 &&
 			plan.writePaths.length > 0 &&
 			plan.writePaths.every((path) => targetPaths.get(path)?.entry.kind === "file");
+		const deleteOnly = process.platform !== "win32" &&
+			plan.writePaths.length === 0 &&
+			plan.deletePaths.length > 0 &&
+			plan.deletePaths.every((path) =>
+				currentPaths.get(path)?.entry.kind === "file" &&
+				targetPaths.get(path) === undefined &&
+				!path.includes("/"));
+		return writeOnly || deleteOnly;
 	}
 
 	private async applyNativeFilePlan(
@@ -694,10 +703,11 @@ export class RestoreEngine {
 						: [artifacts.source, ...(artifacts.target === null ? [] : [artifacts.target])];
 				}),
 			);
+			const totalPaths = plan.deletePaths.length + plan.writePaths.length;
 			if ((await options.mutationJournal.load()).length !== 0) {
-				return { code: "recovery_required", verifiedPaths: 0, totalPaths: plan.writePaths.length };
+				return { code: "recovery_required", verifiedPaths: 0, totalPaths };
 			}
-			return { code: "ok", verifiedPaths: plan.writePaths.length, totalPaths: plan.writePaths.length };
+			return { code: "ok", verifiedPaths: totalPaths, totalPaths };
 		} catch {
 			const packedRecovery = await recoverPackedMutations({
 				workspaceRoot: this.workspaceRoot,
@@ -706,7 +716,11 @@ export class RestoreEngine {
 				decision: "rollback",
 			});
 			if (packedRecovery.kind !== "clean") {
-				return { code: "recovery_required", verifiedPaths: 0, totalPaths: plan.writePaths.length };
+				return {
+					code: "recovery_required",
+					verifiedPaths: 0,
+					totalPaths: plan.deletePaths.length + plan.writePaths.length,
+				};
 			}
 			return this.rollback(
 				current,
@@ -761,7 +775,7 @@ export class RestoreEngine {
 				sourceArtifact: artifact("source"),
 				targetArtifact: targetLeaf?.kind === "file" ? artifact("target") : null,
 				sourceFingerprint: currentLeaf?.fingerprint ?? absent.fingerprint,
-				targetFingerprint: targetLeaf?.fingerprint ?? null,
+				targetFingerprint: targetLeaf?.fingerprint ?? absent.fingerprint,
 				variants: [...variants.values()],
 			});
 		}

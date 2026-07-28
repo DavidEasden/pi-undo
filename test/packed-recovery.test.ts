@@ -11,7 +11,7 @@ import {
 	materializePackedMutationJournal,
 	recoverPackedMutations,
 } from "../src/packed-recovery.ts";
-import { fingerprintBytes } from "../src/quarantine.ts";
+import { fingerprintAbsent, fingerprintBytes } from "../src/quarantine.ts";
 
 const roots: string[] = [];
 
@@ -59,6 +59,113 @@ async function fixture(live: "source" | "target" | "external") {
 }
 
 describe("packed mutation recovery", () => {
+	it("delete mutation rollback 恢复 source，外部原路径冲突时 fail closed", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-undo-packed-delete-"));
+		roots.push(root);
+		const transaction = join(root, "transaction");
+		await mkdir(transaction);
+		const source = Buffer.from("source-delete\n");
+		const sourceFingerprint = fingerprintBytes("a.txt", source, 0o644);
+		const absent = fingerprintAbsent("a.txt");
+		const journal = new MutationJournal(join(transaction, "mutations.jsonl"), "operation-delete");
+		const planDigest = "d".repeat(64);
+		await createDurablePack(journal, {
+			opId: journal.operationId,
+			planDigest,
+			entries: [{
+				path: "a.txt",
+				sourceArtifact: ".pi-undo-q2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-source",
+				targetArtifact: null,
+				sourceFingerprint,
+				targetFingerprint: absent,
+				variants: [
+					{ kind: "file", fingerprint: sourceFingerprint, mode: 0o644, bytes: source },
+					{ kind: "absent", fingerprint: absent },
+				],
+			}],
+		});
+		const sourceArtifact = join(root, ".pi-undo-q2-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-source");
+		await writeFile(sourceArtifact, source);
+		const rollback = await recoverPackedMutations({
+			workspaceRoot: root,
+			journal,
+			planDigest,
+			decision: "rollback",
+		});
+		expect(rollback).toEqual({ kind: "clean" });
+		expect(await readFile(join(root, "a.txt"))).toEqual(source);
+
+		const conflictRoot = await mkdtemp(join(tmpdir(), "pi-undo-packed-delete-conflict-"));
+		roots.push(conflictRoot);
+		const conflictTransaction = join(conflictRoot, "transaction");
+		await mkdir(conflictTransaction);
+		const conflictJournal = new MutationJournal(join(conflictTransaction, "mutations.jsonl"), "operation-delete-conflict");
+		const conflictDigest = "e".repeat(64);
+		await createDurablePack(conflictJournal, {
+			opId: conflictJournal.operationId,
+			planDigest: conflictDigest,
+			entries: [{
+				path: "a.txt",
+				sourceArtifact: ".pi-undo-q2-cccccccccccccccccccccccccccccccc-source",
+				targetArtifact: null,
+				sourceFingerprint,
+				targetFingerprint: absent,
+				variants: [
+					{ kind: "file", fingerprint: sourceFingerprint, mode: 0o644, bytes: source },
+					{ kind: "absent", fingerprint: absent },
+				],
+			}],
+		});
+		await writeFile(join(conflictRoot, "a.txt"), "external\n");
+		await expect(recoverPackedMutations({
+			workspaceRoot: conflictRoot,
+			journal: conflictJournal,
+			planDigest: conflictDigest,
+			decision: "rollback",
+		})).resolves.toEqual({ kind: "conflict", paths: 1 });
+	});
+
+	it("CLEANED delete rollback fail closed，不复活 source", async () => {
+		const value = await fixture("source");
+		const path = "a.txt";
+		const sourceFingerprint = fingerprintBytes(path, value.source, 0o644);
+		const absent = fingerprintAbsent(path);
+		const sourceArtifact = ".pi-undo-q2-11111111111111111111111111111111-source";
+		await createDurablePack(value.journal, {
+			opId: value.journal.operationId,
+			planDigest: value.planDigest,
+			entries: [{
+				path,
+				sourceArtifact,
+				targetArtifact: null,
+				sourceFingerprint,
+				targetFingerprint: absent,
+				variants: [
+					{ kind: "file", fingerprint: sourceFingerprint, mode: 0o644, bytes: value.source },
+					{ kind: "absent", fingerprint: absent },
+				],
+			}],
+		});
+		await value.journal.beginMany([{
+			kind: "delete",
+			path,
+			sourceArtifact,
+			targetArtifact: null,
+			sourceFingerprint,
+			targetFingerprint: absent,
+		}]);
+		await value.journal.advanceMany(1, ["SOURCE_QUARANTINED", "SOURCE_VERIFIED", "TARGET_INSTALLED", "TARGET_VERIFIED", "CLEANED"]);
+		await unlink(join(value.root, path));
+
+		expect(await recoverPackedMutations({
+			workspaceRoot: value.root,
+			journal: value.journal,
+			planDigest: value.planDigest,
+			decision: "rollback",
+		})).toEqual({ kind: "conflict", paths: 1 });
+		await expect(readFile(join(value.root, path))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
 	it("pack durable 但 mutation 尚未开始时 rollback 幂等收敛", async () => {
 		const fixtureValue = await fixture("source");
 		await unlink(join(fixtureValue.root, ".pi-undo-q2-11111111111111111111111111111111-source"));

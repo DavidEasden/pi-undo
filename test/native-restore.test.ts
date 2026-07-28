@@ -8,7 +8,7 @@ import { createDurablePack } from "../src/durable-pack.ts";
 import { MutationJournal } from "../src/mutation-journal.ts";
 import { createNativeFileBatch } from "../src/native-restore.ts";
 import { recoverPackedMutations } from "../src/packed-recovery.ts";
-import { fingerprintBytes } from "../src/quarantine.ts";
+import { fingerprintAbsent, fingerprintBytes } from "../src/quarantine.ts";
 
 const roots: string[] = [];
 
@@ -86,6 +86,49 @@ describe("native restore helper", () => {
 		expect(await value.native.verifySource(value.pack)).toBe(true);
 		expect(await readFile(join(value.root, "a.txt"))).toEqual(value.source);
 		await expect(lstat(join(value.root, ".pi-undo-q2-11111111111111111111111111111111-source")))
+			.rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("delete-only native batch 原子隔离 source 并可 roll-forward 清理", async () => {
+		const root = await realpath(await mkdtemp(join(tmpdir(), "pi-undo-native-delete-")));
+		roots.push(root);
+		const transaction = join(root, "transaction");
+		await mkdir(transaction);
+		const source = Buffer.from("source\n");
+		const sourceFingerprint = fingerprintBytes("a.txt", source, 0o644);
+		const targetFingerprint = fingerprintAbsent("a.txt");
+		const journal = new MutationJournal(join(transaction, "mutations.jsonl"), "operation-delete");
+		const planDigest = "b".repeat(64);
+		const pack = await createDurablePack(journal, {
+			opId: journal.operationId,
+			planDigest,
+			entries: [{
+				path: "a.txt",
+				sourceArtifact: ".pi-undo-q2-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-source",
+				targetArtifact: null,
+				sourceFingerprint,
+				targetFingerprint,
+				variants: [
+					{ kind: "file", fingerprint: sourceFingerprint, mode: 0o644, bytes: source },
+					{ kind: "absent", fingerprint: targetFingerprint },
+				],
+			}],
+		});
+		await writeFile(join(root, "a.txt"), source);
+		const native = await createNativeFileBatch({ workspaceRoot: root, planDigest, journal });
+		if (native === undefined) return;
+
+		await native.run(pack);
+		expect(await lstat(join(root, "a.txt")).catch(() => undefined)).toBeUndefined();
+		expect(await readFile(join(root, ".pi-undo-q2-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-source")))
+			.toEqual(source);
+		await expect(recoverPackedMutations({
+			workspaceRoot: root,
+			journal,
+			planDigest,
+			decision: "roll_forward",
+		})).resolves.toEqual({ kind: "clean" });
+		await expect(lstat(join(root, ".pi-undo-q2-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-source")))
 			.rejects.toMatchObject({ code: "ENOENT" });
 	});
 });
