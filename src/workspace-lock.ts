@@ -116,7 +116,7 @@ export class WorkspaceLock {
 				await rename(candidateDirectory, lockDirectory);
 				published = true;
 			} catch (error) {
-				if (!await pathExists(lockDirectory)) {
+				if (!isPublishCollision(error) && !await pathExists(lockDirectory)) {
 					throw error;
 				}
 			} finally {
@@ -400,6 +400,10 @@ function assertPositive(value: number, name: string): void {
 	if (!Number.isFinite(value) || value <= 0) {
 		throw new RangeError(`${name} 必须是正数`);
 	}
+}
+
+function isPublishCollision(error: unknown): boolean {
+	return hasErrorCode(error, "EEXIST") || hasErrorCode(error, "ENOTEMPTY");
 }
 
 function hasErrorCode(error: unknown, code: string): error is NodeJS.ErrnoException {
