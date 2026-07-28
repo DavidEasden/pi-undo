@@ -64,6 +64,23 @@ export async function assertNoSymlinkEscape(root: string, relativePath: string):
 	}
 }
 
+export function pathSetsOverlap(leftPaths: readonly string[], rightPaths: readonly string[]): boolean {
+	for (const path of leftPaths) assertRelativeCandidate(path);
+	for (const path of rightPaths) assertRelativeCandidate(path);
+	const rightSet = new Set(rightPaths);
+	const sortedRight = [...rightSet].sort(comparePaths);
+	for (const path of leftPaths) {
+		if (rightSet.has(path)) return true;
+		for (let separator = path.lastIndexOf("/"); separator >= 0; separator = path.lastIndexOf("/", separator - 1)) {
+			if (rightSet.has(path.slice(0, separator))) return true;
+		}
+		const descendantPrefix = `${path}/`;
+		const candidate = sortedRight[lowerBound(sortedRight, descendantPrefix)];
+		if (candidate?.startsWith(descendantPrefix)) return true;
+	}
+	return false;
+}
+
 export function sortDeletePaths(paths: readonly string[]): string[] {
 	return sortPaths(paths, -1);
 }
@@ -106,6 +123,20 @@ function assertRelativeCandidate(candidate: string): void {
 
 function pathDepth(path: string): number {
 	return path === "." ? 0 : path.split("/").length;
+}
+
+function lowerBound(paths: readonly string[], target: string): number {
+	let low = 0;
+	let high = paths.length;
+	while (low < high) {
+		const middle = low + Math.floor((high - low) / 2);
+		if (comparePaths(paths[middle]!, target) < 0) {
+			low = middle + 1;
+		} else {
+			high = middle;
+		}
+	}
+	return low;
 }
 
 function comparePaths(left: string, right: string): number {

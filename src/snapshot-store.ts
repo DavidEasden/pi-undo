@@ -20,7 +20,7 @@ import type {
 	SnapshotManifest,
 	SnapshotRoot,
 } from "./model.ts";
-import { assertNoSymlinkEscape, relativeSafePath } from "./path-safety.ts";
+import { assertNoSymlinkEscape, pathSetsOverlap, relativeSafePath } from "./path-safety.ts";
 import { RootDiscovery, type RootTopology } from "./root-discovery.ts";
 import { WorkspaceLock } from "./workspace-lock.ts";
 
@@ -349,10 +349,10 @@ export class SnapshotStore {
 				const gitDirectory = this.rootGitDirectory(storeDirectory, root);
 				await this.assertNoAlternates(gitDirectory);
 				const entries = await this.readTreeEntries(gitDirectory, root.treeId, rootScope);
-				if (root.ignoredPresentPaths.some((ignoredPath) => entries.some(
-					(entry) => isPathAtOrBelow(ignoredPath, entry.relativePath) ||
-						isPathAtOrBelow(entry.relativePath, ignoredPath),
-				))) {
+				if (pathSetsOverlap(
+					root.ignoredPresentPaths,
+					entries.map((entry) => entry.relativePath),
+				)) {
 					throw new SnapshotStoreError("object_missing", "ignored-present proof 与 root tree 冲突");
 				}
 				await this.assertObjectsComplete(gitDirectory, root.treeId, entries);
@@ -634,7 +634,7 @@ export class SnapshotStore {
 		gitBacked: boolean,
 		inclusions: readonly string[] | null,
 		exclusions: readonly string[],
-		exactExclusions: readonly string[],
+		exactExclusions: ReadonlySet<string>,
 	): Promise<string[]> {
 		if (inclusions === null) {
 			return [];
@@ -657,7 +657,7 @@ export class SnapshotStore {
 		for (const relativePath of parseNulPaths(output)) {
 			if (
 				exclusions.some((excluded) => isPathAtOrBelow(excluded, relativePath)) ||
-				exactExclusions.includes(relativePath)
+				exactExclusions.has(relativePath)
 			) {
 				continue;
 			}
@@ -686,7 +686,7 @@ export class SnapshotStore {
 		gitBacked: boolean,
 		inclusions: readonly string[] | null,
 		exclusions: readonly string[],
-		exactExclusions: readonly string[],
+		exactExclusions: ReadonlySet<string>,
 	): Promise<void> {
 		const leaves = await this.collectVisibleLeaves(
 			cwd,
@@ -758,7 +758,7 @@ export class SnapshotStore {
 		gitBacked: boolean,
 		inclusions: readonly string[] | null,
 		exclusions: readonly string[],
-		exactExclusions: readonly string[],
+		exactExclusions: ReadonlySet<string>,
 		excludeDeleted = false,
 	): Promise<string[]> {
 		if (inclusions === null) return [];
@@ -792,7 +792,7 @@ export class SnapshotStore {
 		return parseNulPaths(output).filter((relativePath) =>
 			!deletedPaths.has(relativePath) &&
 			!exclusions.some((excluded) => isPathAtOrBelow(excluded, relativePath)) &&
-			!exactExclusions.includes(relativePath));
+			!exactExclusions.has(relativePath));
 	}
 
 	private async collectVisibleLeaves(
@@ -801,7 +801,7 @@ export class SnapshotStore {
 		gitBacked: boolean,
 		inclusions: readonly string[] | null,
 		exclusions: readonly string[],
-		exactExclusions: readonly string[],
+		exactExclusions: ReadonlySet<string>,
 	): Promise<VisibleLeaf[]> {
 		const paths = await this.queryVisibleLeafPaths(
 			cwd,
@@ -1196,7 +1196,7 @@ function ownedArtifactExclusions(
 	roots: readonly DiscoveryRoot[],
 	rootPath: string,
 	exclusions: readonly string[],
-): string[] {
+): ReadonlySet<string> {
 	const result: string[] = [];
 	for (const exclusion of exclusions) {
 		const owner = roots
@@ -1211,7 +1211,7 @@ function ownedArtifactExclusions(
 		}
 		result.push(rootRelativePath(rootPath, exclusion));
 	}
-	return result;
+	return new Set(result);
 }
 
 function rootRelativeScope(rootPath: string, scope: readonly string[] | undefined): string[] | undefined {
