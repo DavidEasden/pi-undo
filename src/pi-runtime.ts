@@ -4,7 +4,6 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
-	ReadonlySessionManager,
 } from "@earendil-works/pi-coding-agent";
 
 import {
@@ -29,6 +28,8 @@ import { DurableCursorWriter, SessionState, type SessionEntrySource } from "./se
 import { SnapshotStore } from "./snapshot-store.ts";
 import { StatusReporter } from "./status-reporter.ts";
 import { WorkspaceLock } from "./workspace-lock.ts";
+
+type ReadonlySessionManager = ExtensionContext["sessionManager"];
 
 export async function createPiUndoRuntime(context: ExtensionContext, pi: ExtensionAPI) {
 	const manager = context.sessionManager;
