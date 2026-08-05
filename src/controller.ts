@@ -188,6 +188,8 @@ export class UndoControllerImpl implements UndoController {
 	private locked = false;
 	private historyPaused = false;
 	private operationInFlight = false;
+	private operationAction: "undo" | "redo" | undefined;
+	private operationProfiler: OperationProfiler | undefined;
 	private promptDeferralInFlight = false;
 	private lastSafetyManifestId: ManifestId | null = null;
 
@@ -261,18 +263,30 @@ export class UndoControllerImpl implements UndoController {
 			await this.dependencies.appendControl("pi-undo:barrier", { reason: "user_entry_missing" }).catch(() => {});
 			return;
 		}
+		const profiler = this.operationProfiler;
+		const measure = <T>(phase: string, operation: () => Promise<T>): Promise<T> =>
+			profiler === undefined ? operation() : profiler.measure(phase, operation);
 		try {
-			const after = await this.captureWithWorkspaceLock();
-			const changedPaths = await this.dependencies.changedPaths(staged.before, after);
+			const after = await measure("settled.capture", () => this.captureWithWorkspaceLock());
+			const changedPaths = await measure("settled.changedPaths", () =>
+				this.dependencies.changedPaths(staged.before, after));
 			if (changedPaths.length > 0 && this.dependencies.prepareDurableRestore !== undefined) {
-				await Promise.all([
-					this.dependencies.prepareDurableRestore(staged.before, after, changedPaths),
-					this.dependencies.prepareDurableRestore(after, staged.before, changedPaths),
-				]).catch(() => {});
+				// /undo 在流式中断后正等待本次 settled；关键路径只预制立即使用的 after → before。
+				const preparations = this.operationAction === "undo"
+					? [measure("settled.prepareUndo", () =>
+						this.dependencies.prepareDurableRestore!(after, staged.before, changedPaths))]
+					: [
+						measure("settled.prepareRedo", () =>
+							this.dependencies.prepareDurableRestore!(staged.before, after, changedPaths)),
+						measure("settled.prepareUndo", () =>
+							this.dependencies.prepareDurableRestore!(after, staged.before, changedPaths)),
+					];
+				await Promise.allSettled(preparations);
 			}
 			const endLeafId = this.dependencies.getLogicalLeafId() ?? staged.startEntryId;
 			const checkpoint = this.createCheckpoint(staged, after, changedPaths, userEntryId, endLeafId);
-			const checkpointEntryId = await this.dependencies.appendControl("pi-undo:checkpoint", checkpoint);
+			const checkpointEntryId = await measure("settled.checkpoint", () =>
+				this.dependencies.appendControl("pi-undo:checkpoint", checkpoint));
 			if (checkpointEntryId === null) {
 				this.locked = true;
 				await this.dependencies.appendControl("pi-undo:barrier", { reason: "checkpoint_entry_missing" }).catch(() => {});
@@ -289,27 +303,14 @@ export class UndoControllerImpl implements UndoController {
 
 	async undo(): Promise<OperationResult> {
 		if (this.historyPaused) return { code: "history_paused", changedFiles: 0 };
-		const checkpoint = this.undoStack.at(-1);
-		if (checkpoint === undefined) return noop();
-		const result = await this.runOperation("undo", checkpoint);
-		if (result.code === "ok" && this.lastSafetyManifestId !== null) {
-			this.undoStack.pop();
-			this.redoStack.push({ checkpoint, targetManifestId: this.lastSafetyManifestId });
-			return { ...result, refillPrompt: checkpoint.rawPrompt };
-		}
-		return result;
+		return this.runOperation("undo");
 	}
 
 	async redo(): Promise<OperationResult> {
 		if (this.historyPaused) return { code: "history_paused", changedFiles: 0 };
-		const redo = this.redoStack.at(-1);
-		if (redo === undefined) return noop();
-		const result = await this.runOperation("redo", redo.checkpoint, redo.targetManifestId);
-		if (result.code === "ok") {
-			this.redoStack.pop();
-			this.undoStack.push(redo.checkpoint);
-		}
-		return result;
+		// 新 run 开始时 redo frontier 已失效；空栈命令不得为了确认 noop 而中断正在运行的 Agent。
+		if (this.redoStack.length === 0) return noop();
+		return this.runOperation("redo");
 	}
 
 	async beforeTree(event: SessionBeforeTreeEvent): Promise<SessionBeforeTreeResult | undefined> {
@@ -408,15 +409,13 @@ export class UndoControllerImpl implements UndoController {
 		}
 	}
 
-	private async runOperation(
-		action: "undo" | "redo",
-		checkpoint: CheckpointRecord,
-		targetManifestId?: ManifestId,
-	): Promise<OperationResult> {
+	private async runOperation(action: "undo" | "redo"): Promise<OperationResult> {
 		if (this.locked || this.operationInFlight) return { code: "busy", changedFiles: 0 };
 		const profile = new OperationProfiler();
 		const done = (result: OperationResult): OperationResult => profile.attach(result);
 		this.operationInFlight = true;
+		this.operationAction = action;
+		this.operationProfiler = profile;
 		this.promptDeferralInFlight = true;
 		this.lastSafetyManifestId = null;
 		let lease: { release(): Promise<void> } | undefined;
@@ -424,13 +423,19 @@ export class UndoControllerImpl implements UndoController {
 			if (!await profile.measure("idle", () => this.ensureIdle())) {
 				return done({ code: "idle_timeout", changedFiles: 0 });
 			}
+			// 中断中的 run 会在 waitForIdle() 内由 agentSettled() 推入栈，必须在此之后选择目标。
+			const redo = action === "redo" ? this.redoStack.at(-1) : undefined;
+			const checkpoint = action === "undo" ? this.undoStack.at(-1) : redo?.checkpoint;
+			if (checkpoint === undefined) return done(noop());
+			const targetManifestId = redo?.targetManifestId;
 			try {
 				lease = await profile.measure("lock", () => this.dependencies.acquireWorkspaceLock());
 			} catch {
 				return done({ code: "busy", changedFiles: 0 });
 			}
 			if (checkpoint.changedPaths.length === 0) {
-				return done(await this.runSessionOnlyOperation(action, checkpoint, targetManifestId, profile));
+				const result = await this.runSessionOnlyOperation(action, checkpoint, targetManifestId, profile);
+				return done(this.advanceHistory(action, checkpoint, result));
 			}
 			const restoreTargetManifestId = targetManifestId ?? (
 				action === "undo" ? checkpoint.beforeManifestId : checkpoint.afterManifestId
@@ -512,7 +517,7 @@ export class UndoControllerImpl implements UndoController {
 				await this.dependencies.journal.markCommitted(descriptor.opId);
 			});
 			this.lastSafetyManifestId = rollback.manifestId;
-			return done({ code: "ok", changedFiles: applied.verifiedPaths });
+			return done(this.advanceHistory(action, checkpoint, { code: "ok", changedFiles: applied.verifiedPaths }));
 		} catch {
 			this.locked = true;
 			return done({ code: "recovery_required", changedFiles: 0 });
@@ -522,9 +527,28 @@ export class UndoControllerImpl implements UndoController {
 				await profile.measure("unlock", () =>
 					activeLease.release().catch(() => { this.locked = true; }));
 			}
+			if (this.operationProfiler === profile) this.operationProfiler = undefined;
+			this.operationAction = undefined;
 			this.promptDeferralInFlight = false;
 			this.operationInFlight = false;
 		}
+	}
+
+	private advanceHistory(
+		action: "undo" | "redo",
+		checkpoint: CheckpointRecord,
+		result: OperationResult,
+	): OperationResult {
+		if (result.code !== "ok") return result;
+		if (action === "undo") {
+			if (this.lastSafetyManifestId === null) return result;
+			this.undoStack.pop();
+			this.redoStack.push({ checkpoint, targetManifestId: this.lastSafetyManifestId });
+			return { ...result, refillPrompt: checkpoint.rawPrompt };
+		}
+		this.redoStack.pop();
+		this.undoStack.push(checkpoint);
+		return result;
 	}
 
 	private async runSessionOnlyOperation(

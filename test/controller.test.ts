@@ -141,6 +141,14 @@ describe("UndoController", () => {
 		expect(deps.calls).toEqual([]);
 	});
 
+	it("流式期间空 redo 立即 noop，不中断当前 Agent", async () => {
+		const deps = dependencies({ isAgentIdle: () => false });
+		const controller = new UndoControllerImpl(deps);
+
+		expect(await controller.redo()).toEqual({ code: "noop", changedFiles: 0 });
+		expect(deps.calls).toEqual([]);
+	});
+
 	it("空 changedPaths 的 undo/redo 只提交 session 事务且不访问 workspace", async () => {
 		const prepared: Array<{ descriptor: OperationDescriptor; plan: RestorePlan }> = [];
 		const failWorkspaceCall = vi.fn(async () => { throw new Error("workspace fast path 不应调用"); });
@@ -239,6 +247,67 @@ describe("UndoController", () => {
 
 		expect(deps.calls).toEqual(["capture", "entry:pi-undo:start", "capture", "entry:pi-undo:checkpoint"]);
 		expect(controller.history()).toEqual({ undoCount: 1, redoCount: 0, locked: false });
+	});
+
+	it("自然 settled 预制双向 restore，中断后立即 undo 只预制当前方向并撤销最新 run", async () => {
+		const prepared: string[] = [];
+		let captures = 0;
+		let controller!: UndoControllerImpl;
+		const deps = dependencies({
+			isAgentIdle: () => false,
+			waitForIdle: async () => {
+				deps.calls.push("idle");
+				await controller.agentSettled();
+				return true;
+			},
+			capture: async () => {
+				captures += 1;
+				deps.calls.push("capture");
+				return manifest(captures === 1 ? "a" : "c");
+			},
+			prepareDurableRestore: async (current, target) => {
+				prepared.push(`${current.manifestId[0]}->${target.manifestId[0]}`);
+			},
+		});
+		controller = new UndoControllerImpl(deps);
+		await controller.prepareInput("被中断的 run", { streaming: false });
+		await controller.beforeAgentStart();
+		deps.calls.length = 0;
+		let now = 0;
+		const clock = vi.spyOn(performance, "now").mockImplementation(() => {
+			now += 100;
+			return now;
+		});
+
+		const result = await controller.undo();
+		clock.mockRestore();
+
+		expect(result).toMatchObject({ code: "ok", refillPrompt: "被中断的 run" });
+		expect(prepared).toEqual(["c->a"]);
+		expect(deps.calls.slice(0, 4)).toEqual(["abort", "idle", "capture", "entry:pi-undo:checkpoint"]);
+		expect(controller.history()).toEqual({ undoCount: 0, redoCount: 1, locked: false });
+		expect(result.timings).toEqual(expect.arrayContaining([
+			expect.objectContaining({ phase: "settled.capture", durationMs: 100 }),
+			expect.objectContaining({ phase: "settled.changedPaths", durationMs: 100 }),
+			expect.objectContaining({ phase: "settled.prepareUndo", durationMs: 100 }),
+			expect.objectContaining({ phase: "settled.checkpoint", durationMs: 100 }),
+		]));
+	});
+
+	it("没有待执行 undo 时 settled 仍并行预制 redo 与 undo 两个方向", async () => {
+		const prepared: string[] = [];
+		const deps = dependencies({
+			prepareDurableRestore: async (current, target) => {
+				prepared.push(`${current.manifestId[0]}->${target.manifestId[0]}`);
+			},
+		});
+		const controller = new UndoControllerImpl(deps);
+
+		await controller.prepareInput("正常 run", { streaming: false });
+		await controller.beforeAgentStart();
+		await controller.agentSettled();
+
+		expect(prepared.sort()).toEqual(["a->c", "c->a"]);
 	});
 
 	it("normal run 的 before/after capture 均在 workspace lease 内完成", async () => {
