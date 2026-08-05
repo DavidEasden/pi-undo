@@ -312,6 +312,24 @@ describe("SnapshotStore", () => {
 		await store.assertComplete(manifest.manifestId);
 	});
 
+	it("native metadata 不可用时 ignored-present batch fallback 保持 file/symlink 语义", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, ".gitignore", "ignored-*\n");
+		await writeFixtureFile(workspace, "visible.txt", "visible\n");
+		await writeFixtureFile(workspace, "ignored-file", "ignored\n");
+		await symlink("visible.txt", join(workspace, "ignored-link"));
+		const topology = await new RootDiscovery().discover(workspace);
+		const store = new SnapshotStore({
+			storeRoot,
+			nativeMetadata: { inspect: async () => undefined },
+		});
+
+		const manifest = await store.capture(topology);
+
+		expect(manifest.roots[0]?.ignoredPresentPaths).toEqual(["ignored-file", "ignored-link"]);
+	});
+
 	it("轻量可见路径枚举与 complete capture 的受控叶子集合一致", async () => {
 		const workspace = await temporaryRoot("pi-undo-snapshot-");
 		const storeRoot = await temporaryRoot("pi-undo-store-");

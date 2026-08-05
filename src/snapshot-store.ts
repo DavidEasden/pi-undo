@@ -38,7 +38,9 @@ const TREE_BLOB_MEMBERSHIP_LIMIT = 65_536;
 const HASH_BATCH_MAX_PATHS = process.platform === "win32" ? 128 : 2_048;
 const HASH_BATCH_MAX_ARGUMENT_BYTES = process.platform === "win32" ? 24 * 1024 : 128 * 1024;
 const HASH_BATCH_CONCURRENCY = 4;
+const ROOT_CAPTURE_CONCURRENCY = 4;
 const FILE_SYSTEM_INSPECTION_CONCURRENCY = 32;
+const IGNORED_METADATA_BATCH_SIZE = 1_024;
 const INDEX_BATCH_MAX_ENTRIES = 4_096;
 const INDEX_BATCH_MAX_BYTES = 8 * 1024 * 1024;
 const BLOB_CACHE_MAX_BYTES = 128 * 1024 * 1024;
@@ -258,30 +260,41 @@ export class SnapshotStore {
 			const transactionsRoot = join(storeDirectory, "transactions");
 			await mkdir(transactionsRoot, { recursive: true });
 			transactionDirectory = await mkdtemp(join(transactionsRoot, "capture-"));
+			const activeTransactionDirectory = transactionDirectory;
 
-			const roots: SnapshotRoot[] = [];
-			const cacheUpdates: VisibleLeafCacheUpdate[] = [];
-			for (const root of topology.roots) {
-				if (root.state !== "active") {
-					const coverage = rootCaptureCoverage(root.relativeRoot, scope);
-					roots.push(snapshotRoot(root, {
-						treeId: null,
-						coverage,
-						...ignoredPresentProof(coverage, []),
-						objectClosure: inactiveRootClosure(root),
-					}));
-					continue;
-				}
-				const captured = await this.captureRoot(
-					topology,
-					root,
-					transactionDirectory,
-					scope,
-					artifactExclusions,
-				);
-				roots.push(snapshotRoot(root, captured));
-				cacheUpdates.push(captured.cacheUpdate);
-			}
+			// 每个 root 使用独立私有 ODB、index 与 worktree；结果保持输入顺序，缓存仍在整个 capture
+			// 持久化成功后统一发布，因此可并行缩短 nested-repository workspace 的关键路径。
+			const capturedRoots = await mapConcurrentOrdered(
+				topology.roots,
+				ROOT_CAPTURE_CONCURRENCY,
+				async (root): Promise<{ readonly root: SnapshotRoot; readonly cacheUpdate?: VisibleLeafCacheUpdate }> => {
+					if (root.state !== "active") {
+						const coverage = rootCaptureCoverage(root.relativeRoot, scope);
+						return {
+							root: snapshotRoot(root, {
+								treeId: null,
+								coverage,
+								...ignoredPresentProof(coverage, []),
+								objectClosure: inactiveRootClosure(root),
+							}),
+						};
+					}
+					const captured = await this.captureRoot(
+						topology,
+						root,
+						activeTransactionDirectory,
+						scope,
+						artifactExclusions,
+					);
+					return {
+						root: snapshotRoot(root, captured),
+						cacheUpdate: captured.cacheUpdate,
+					};
+				},
+			);
+			const roots = capturedRoots.map((captured) => captured.root);
+			const cacheUpdates = capturedRoots.flatMap((captured) =>
+				captured.cacheUpdate === undefined ? [] : [captured.cacheUpdate]);
 
 			await this.assertTopology(topology, "捕获期间 topology 已变化");
 			const content = {
@@ -720,6 +733,7 @@ export class SnapshotStore {
 			inclusions,
 			exclusions,
 			exactExclusions,
+			transactionDirectory,
 		);
 		const treeId = (await this.runGit(["write-tree"], { cwd: absoluteRoot, env: environment })).trim();
 		if (!isObjectId(treeId)) {
@@ -743,6 +757,7 @@ export class SnapshotStore {
 		inclusions: readonly string[] | null,
 		exclusions: readonly string[],
 		exactExclusions: ReadonlySet<string>,
+		requestDirectory: string,
 	): Promise<string[]> {
 		if (inclusions === null) {
 			return [];
@@ -761,7 +776,8 @@ export class SnapshotStore {
 			"--",
 			...pathspecs,
 		], { cwd, env: gitBacked ? sourceGitEnvironment() : environment });
-		const result = new Set<string>();
+		const candidates: string[] = [];
+		const seen = new Set<string>();
 		for (const relativePath of parseNulPaths(output)) {
 			if (
 				exclusions.some((excluded) => isPathAtOrBelow(excluded, relativePath)) ||
@@ -769,23 +785,74 @@ export class SnapshotStore {
 			) {
 				continue;
 			}
-			await assertNoSymlinkEscape(cwd, relativePath);
-			const metadata = await lstat(join(cwd, ...relativePath.split("/"))).catch((error) => {
-				if (hasErrorCode(error, "ENOENT")) return null;
-				throw error;
-			});
-			if (metadata === null) {
-				continue;
-			}
-			if (!metadata.isFile() && !metadata.isSymbolicLink()) {
-				throw new SnapshotStoreError("capture_failed", `ignored-present proof 只接受叶子路径：${relativePath}`);
-			}
-			if (result.has(relativePath)) {
+			if (seen.has(relativePath)) {
 				throw new SnapshotStoreError("capture_failed", `ignored-present proof 包含重复路径：${relativePath}`);
 			}
-			result.add(relativePath);
+			seen.add(relativePath);
+			candidates.push(relativePath);
 		}
-		return [...result].sort(comparePaths);
+		// ignored build/vendor trees 常含数万叶子；复用同一批量 metadata 协议，避免逐路径重复
+		// 遍历父目录。Native 与 fallback 都在叶子扫描前后复核共享父目录。
+		const nativeEntries = await this.inspectIgnoredMetadataBatches(cwd, candidates, requestDirectory);
+		const kinds = nativeEntries === undefined
+			? await this.collectIgnoredPresentKindsFallback(cwd, candidates)
+			: nativeEntries.map((entry) => entry.kind);
+		const result: string[] = [];
+		for (let index = 0; index < candidates.length; index += 1) {
+			const relativePath = candidates[index]!;
+			const kind = kinds[index]!;
+			if (kind === "absent") continue;
+			if (kind !== "file" && kind !== "symlink") {
+				throw new SnapshotStoreError("capture_failed", `ignored-present proof 只接受叶子路径：${relativePath}`);
+			}
+			result.push(relativePath);
+		}
+		return result.sort(comparePaths);
+	}
+
+	private async inspectIgnoredMetadataBatches(
+		cwd: string,
+		paths: readonly string[],
+		requestDirectory: string,
+	): Promise<readonly NativeMetadataEntry[] | undefined> {
+		const result: NativeMetadataEntry[] = [];
+		for (let offset = 0; offset < paths.length; offset += IGNORED_METADATA_BATCH_SIZE) {
+			const batch = paths.slice(offset, offset + IGNORED_METADATA_BATCH_SIZE);
+			const inspected = await this.nativeMetadata.inspect(cwd, batch, requestDirectory);
+			if (inspected === undefined) {
+				if (result.length > 0) {
+					throw new SnapshotStoreError("capture_failed", "native ignored metadata 能力在批次间变化");
+				}
+				return undefined;
+			}
+			result.push(...inspected);
+		}
+		return result;
+	}
+
+	private async collectIgnoredPresentKindsFallback(
+		cwd: string,
+		paths: readonly string[],
+	): Promise<readonly NativeMetadataEntry["kind"][]> {
+		const result: NativeMetadataEntry["kind"][] = [];
+		for (let offset = 0; offset < paths.length; offset += IGNORED_METADATA_BATCH_SIZE) {
+			const batch = paths.slice(offset, offset + IGNORED_METADATA_BATCH_SIZE);
+			await assertNoSymlinkParents(cwd, batch);
+			const kinds = await mapConcurrentOrdered(batch, FILE_SYSTEM_INSPECTION_CONCURRENCY, async (relativePath) => {
+				const metadata = await lstat(join(cwd, ...relativePath.split("/"))).catch((error) => {
+					if (hasErrorCode(error, "ENOENT")) return null;
+					throw error;
+				});
+				return metadata === null
+					? "absent" as const
+					: metadata.isFile() ? "file" as const
+					: metadata.isSymbolicLink() ? "symlink" as const
+					: "other" as const;
+			});
+			await assertNoSymlinkParents(cwd, batch);
+			result.push(...kinds);
+		}
+		return result;
 	}
 
 	private async stageWorktree(

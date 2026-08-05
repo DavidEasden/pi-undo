@@ -12,7 +12,7 @@ import {
 	type ControllerInitialState,
 } from "./controller.ts";
 import { finalizeDurablePack, hasDurablePack, loadDurablePack } from "./durable-pack.ts";
-import { assertCursor, canonicalJson, checksum } from "./encoding.ts";
+import { assertCursor, canonicalJson, checksum, sameWorkspaceSnapshot } from "./encoding.ts";
 import { JournalStore, finalizeCursorMarker, inspectCursorMarkers } from "./journal.ts";
 import type { CheckpointRecord, ManifestId, SessionFileIdentity } from "./model.ts";
 import {
@@ -223,6 +223,8 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 			return capture(scopePaths);
 		},
 		changedPaths: async (before, after) => {
+			// 完全相同的 workspace snapshot 只撤回 session 分支；无需再次展开所有 root tree。
+			if (sameWorkspaceSnapshot(before, after)) return [];
 			const plan = await restore.plan(before, after);
 			return [...new Set([...plan.deletePaths, ...plan.writePaths])].sort();
 		},

@@ -44,6 +44,32 @@ export function checksum(value: string | Uint8Array): string {
 	return createHash("sha256").update(input).digest("hex");
 }
 
+export function sameWorkspaceSnapshot(left: SnapshotManifest, right: SnapshotManifest): boolean {
+	if (
+		left.schemaVersion !== right.schemaVersion ||
+		left.workspaceIdentity !== right.workspaceIdentity ||
+		left.topologyFingerprint !== right.topologyFingerprint ||
+		left.coverage !== right.coverage ||
+		left.roots.length !== right.roots.length
+	) return false;
+	return left.roots.every((root, index) => {
+		const candidate = right.roots[index];
+		return candidate !== undefined &&
+			root.relativeRoot === candidate.relativeRoot &&
+			root.parentRoot === candidate.parentRoot &&
+			root.state === candidate.state &&
+			root.sourceIdentity === candidate.sourceIdentity &&
+			root.privateRepositoryId === candidate.privateRepositoryId &&
+			(root.gitlinkOid ?? null) === (candidate.gitlinkOid ?? null) &&
+			root.treeId === candidate.treeId &&
+			root.coverage === candidate.coverage &&
+			root.ignorePolicy === candidate.ignorePolicy &&
+			root.ignoreClosure === candidate.ignoreClosure &&
+			root.objectClosure === candidate.objectClosure &&
+			sameStrings(root.ignoredPresentPaths, candidate.ignoredPresentPaths);
+	});
+}
+
 export function ignoredPresentClosure(
 	root: Pick<SnapshotRoot, "coverage" | "ignorePolicy" | "ignoredPresentPaths">,
 ): string {
@@ -200,6 +226,10 @@ export function assertOperationId(value: unknown): string {
 		fail("invalid_operation_id", "opId 不能作为不安全路径使用");
 	}
 	return value;
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+	return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function encodeJson(value: unknown, ancestors: Set<object>): string {

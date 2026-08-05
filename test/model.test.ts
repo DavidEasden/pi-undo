@@ -5,6 +5,7 @@ import {
 	assertMutationRecord,
 	canonicalJson,
 	checksum,
+	sameWorkspaceSnapshot,
 	topologyFingerprint,
 } from "../src/encoding.ts";
 import type {
@@ -139,6 +140,35 @@ function mutation(overrides: Partial<MutationRecord> = {}): MutationRecord {
 	const { checksum: _checksum, ...content } = next as typeof next & { checksum?: string };
 	return { ...next, checksum: overrides.checksum ?? checksum(canonicalJson(content)) };
 }
+
+describe("sameWorkspaceSnapshot", () => {
+	it("忽略 manifest identity 与创建时间，但要求完整 workspace 语义一致", () => {
+		const before = manifest();
+		const after = manifest({ createdAt: "2026-07-24T00:01:00.000Z" });
+
+		expect(after.manifestId).not.toBe(before.manifestId);
+		expect(sameWorkspaceSnapshot(before, after)).toBe(true);
+	});
+
+	it("任一 root tree、object closure 或 ignored proof 变化时不等价", () => {
+		const before = manifest();
+		const roots = before.roots.map((root, index) => index === 0
+			? { ...root, treeId: "tree-changed" }
+			: root);
+		const ignoredRoots = before.roots.map((root, index) => index === 0
+			? { ...root, ignoredPresentPaths: ["ignored.txt"] }
+			: root);
+
+		expect(sameWorkspaceSnapshot(before, { ...before, roots })).toBe(false);
+		expect(sameWorkspaceSnapshot(before, { ...before, roots: ignoredRoots })).toBe(false);
+		expect(sameWorkspaceSnapshot(before, {
+			...before,
+			roots: before.roots.map((root, index) => index === 1
+				? { ...root, objectClosure: "c".repeat(64) }
+				: root),
+		})).toBe(false);
+	});
+});
 
 describe("canonicalJson", () => {
 	it("discovery root 不需要持久化阶段的 capture 元数据", () => {

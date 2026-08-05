@@ -3,10 +3,11 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { canonicalJson, checksum } from "../src/encoding.ts";
 import type { CheckpointRecord, CursorState, ManifestId, SessionFileIdentity } from "../src/model.ts";
 import { createPiUndoRuntime } from "../src/pi-runtime.ts";
+import { RestoreEngine } from "../src/restore-engine.ts";
 
 const temporaryRoots: string[] = [];
 
@@ -59,6 +60,33 @@ describe("Pi runtime restart", () => {
 });
 
 describe("Pi runtime cursor durability", () => {
+	it("workspace snapshot 完全相同时 settled 跳过昂贵的 tree plan", async () => {
+		const fixture = await liveOperationFixture();
+		const runtime = await createPiUndoRuntime(fixture.context as any, fixture.pi as any);
+		expect(await runtime.controller.prepareInput("只读 run", { streaming: false })).toEqual({ action: "continue" });
+		await runtime.controller.beforeAgentStart();
+		const startEntryId = fixture.manager.getLeafId();
+		fixture.appendSessionEntry({
+			type: "message",
+			id: "user-readonly",
+			parentId: startEntryId,
+			message: { role: "user", content: "只读 run" },
+		});
+		fixture.appendSessionEntry({
+			type: "message",
+			id: "assistant-readonly",
+			parentId: "user-readonly",
+			message: { role: "assistant", content: [] },
+		});
+		const plan = vi.spyOn(RestoreEngine.prototype, "plan");
+
+		await runtime.controller.agentSettled();
+
+		expect(plan).not.toHaveBeenCalled();
+		plan.mockRestore();
+		expect(runtime.controller.listCheckpoints().at(-1)?.changedPaths).toEqual([]);
+	});
+
 	it("append cursor 后使用最新 leaf 校验当前 branch", async () => {
 		const fixture = await liveOperationFixture();
 		const runtime = await createPiUndoRuntime(fixture.context as any, fixture.pi as any);

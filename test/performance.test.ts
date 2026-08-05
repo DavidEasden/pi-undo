@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, readFile, realpath, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -6,9 +6,11 @@ import { describe, expect, it } from "vitest";
 
 import { GitRunner, type GitRunOptions, type GitRunResult } from "../src/git-runner.ts";
 import { MutationJournal } from "../src/mutation-journal.ts";
+import type { NativeMetadataEntry, NativeMetadataPort } from "../src/native-metadata.ts";
 import { RestoreEngine } from "../src/restore-engine.ts";
 import { RootDiscovery } from "../src/root-discovery.ts";
 import { SnapshotStore } from "../src/snapshot-store.ts";
+import { createGitRepo, createNestedRepo } from "./fixtures.ts";
 
 class CountingGitRunner extends GitRunner {
 	readonly calls: string[][] = [];
@@ -35,7 +37,156 @@ class CountingGitRunner extends GitRunner {
 	}
 }
 
+class FailingRootGitRunner extends CountingGitRunner {
+	failRoot: string | undefined;
+
+	override async run(args: readonly string[], options: GitRunOptions = {}): Promise<GitRunResult> {
+		if (this.failRoot !== undefined && options.cwd === this.failRoot && args.includes("write-tree")) {
+			this.failRoot = undefined;
+			throw new Error("injected root failure");
+		}
+		return super.run(args, options);
+	}
+}
+
+class RootConcurrencyGitRunner extends CountingGitRunner {
+	activeRootCaptures = 0;
+	maxActiveRootCaptures = 0;
+
+	override async run(args: readonly string[], options: GitRunOptions = {}): Promise<GitRunResult> {
+		if (args[0] !== "read-tree") return super.run(args, options);
+		this.activeRootCaptures += 1;
+		this.maxActiveRootCaptures = Math.max(this.maxActiveRootCaptures, this.activeRootCaptures);
+		try {
+			await new Promise((resolveDelay) => setTimeout(resolveDelay, 40));
+			return await super.run(args, options);
+		} finally {
+			this.activeRootCaptures -= 1;
+		}
+	}
+}
+
+class RecordingMetadataPort implements NativeMetadataPort {
+	readonly calls: string[][] = [];
+	failOnIgnoredBatch: number | undefined;
+	private ignoredBatches = 0;
+
+	resetIgnoredBatches(): void {
+		this.ignoredBatches = 0;
+	}
+
+	async inspect(
+		workspaceRoot: string,
+		paths: readonly string[],
+		_requestDirectory: string,
+	): Promise<readonly NativeMetadataEntry[] | undefined> {
+		this.calls.push([...paths]);
+		if (paths.length > 0 && paths.every((path) => path.startsWith("ignored/"))) {
+			this.ignoredBatches += 1;
+			if (this.ignoredBatches === this.failOnIgnoredBatch) return undefined;
+		}
+		return Promise.all(paths.map(async (path): Promise<NativeMetadataEntry> => {
+			const metadata = await lstat(join(workspaceRoot, ...path.split("/")), { bigint: true }).catch(() => null);
+			if (metadata === null) return { path, kind: "absent" };
+			return {
+				path,
+				kind: metadata.isSymbolicLink() ? "symlink" : metadata.isFile() ? "file" : "other",
+				dev: metadata.dev,
+				ino: metadata.ino,
+				mode: metadata.mode,
+				size: metadata.size,
+				mtimeNs: metadata.mtimeNs,
+				ctimeNs: metadata.ctimeNs,
+			};
+		}));
+	}
+}
+
 describe("undo/redo restore performance", () => {
+	it("独立 nested roots 并行 capture 且保持 manifest 顺序", async () => {
+		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-root-parallel-"));
+		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-root-parallel-store-"));
+		try {
+			await createGitRepo(workspace);
+			await Promise.all([
+				createNestedRepo(workspace, "nested-a"),
+				createNestedRepo(workspace, "nested-b"),
+				createNestedRepo(workspace, "nested-c"),
+			]);
+			const git = new RootConcurrencyGitRunner();
+			const discovery = new RootDiscovery(git);
+			const store = new SnapshotStore({ storeRoot, git, discovery });
+			const topology = await discovery.discover(workspace);
+			git.calls.length = 0;
+
+			const manifest = await store.capture(topology);
+
+			expect(git.maxActiveRootCaptures).toBeGreaterThanOrEqual(2);
+			expect(git.maxActiveRootCaptures).toBeLessThanOrEqual(4);
+			expect(git.maxActiveHashCalls).toBeLessThanOrEqual(16);
+			expect(manifest.roots.map((root) => root.relativeRoot))
+				.toEqual(topology.roots.map((root) => root.relativeRoot));
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("并行 multi-root 失败不发布任何 root fingerprint cache", async () => {
+		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-root-failure-"));
+		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-root-failure-store-"));
+		try {
+			await createGitRepo(workspace);
+			const [nestedA] = await Promise.all([
+				createNestedRepo(workspace, "nested-a"),
+				createNestedRepo(workspace, "nested-b"),
+			]);
+			const git = new FailingRootGitRunner();
+			const discovery = new RootDiscovery(git);
+			const store = new SnapshotStore({ storeRoot, git, discovery });
+			const topology = await discovery.discover(workspace);
+			git.failRoot = await realpath(nestedA.root);
+
+			await expect(store.capture(topology)).rejects.toMatchObject({ code: "capture_failed" });
+			git.calls.length = 0;
+			await store.capture(topology);
+
+			expect(countCommand(git.calls, "hash-object")).toBe(topology.roots.length);
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("大量 ignored-present 叶子使用有界 metadata batches", async () => {
+		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-ignored-batch-"));
+		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-ignored-batch-store-"));
+		try {
+			await mkdir(join(workspace, "ignored"));
+			await writeFile(join(workspace, ".gitignore"), "ignored/\n");
+			await Promise.all(Array.from({ length: 2_100 }, (_, index) =>
+				writeFile(join(workspace, "ignored", `file-${index}.txt`), `${index}\n`)));
+			const nativeMetadata = new RecordingMetadataPort();
+			const discovery = new RootDiscovery();
+			const store = new SnapshotStore({ storeRoot, discovery, nativeMetadata });
+			const topology = await discovery.discover(workspace);
+
+			const manifest = await store.capture(topology);
+
+			expect(manifest.roots[0]?.ignoredPresentPaths).toHaveLength(2_100);
+			const ignoredBatches = nativeMetadata.calls.filter((paths) =>
+				paths.length > 0 && paths.every((path) => path.startsWith("ignored/")));
+			expect(ignoredBatches.map((paths) => paths.length)).toEqual([1_024, 1_024, 52]);
+
+			nativeMetadata.failOnIgnoredBatch = 2;
+			nativeMetadata.resetIgnoredBatches();
+			await expect(store.capture(topology)).rejects.toMatchObject({ code: "capture_failed" });
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+		}
+	}, 30_000);
+
 	it("四千文件 rollback snapshot 使用分块批量 Git 调用", async () => {
 		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-capture-perf-"));
 		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-capture-perf-store-"));
