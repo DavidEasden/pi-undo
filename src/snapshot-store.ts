@@ -1,4 +1,4 @@
-import type { Stats } from "node:fs";
+import type { BigIntStats } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -20,7 +20,7 @@ import type {
 	SnapshotManifest,
 	SnapshotRoot,
 } from "./model.ts";
-import { assertNoSymlinkEscape, pathSetsOverlap, relativeSafePath } from "./path-safety.ts";
+import { assertNoSymlinkEscape, assertNoSymlinkParents, pathSetsOverlap, relativeSafePath } from "./path-safety.ts";
 import { RootDiscovery, type RootTopology } from "./root-discovery.ts";
 import { WorkspaceLock } from "./workspace-lock.ts";
 
@@ -42,6 +42,7 @@ const INDEX_BATCH_MAX_BYTES = 8 * 1024 * 1024;
 const BLOB_CACHE_MAX_BYTES = 128 * 1024 * 1024;
 const BLOB_BATCH_MAX_BYTES = 16 * 1024 * 1024;
 const BLOB_BATCH_MAX_ENTRIES = process.platform === "win32" ? 256 : 2_048;
+const RACY_CLEAN_WINDOW_NS = 2_000_000_000n;
 
 interface PinRecord {
 	readonly schemaVersion: 1;
@@ -70,6 +71,7 @@ interface CapturedRootResult {
 	readonly ignoredPresentPaths: readonly string[];
 	readonly ignoreClosure: string;
 	readonly objectClosure: string;
+	readonly cacheUpdate: VisibleLeafCacheUpdate;
 }
 
 interface VisibleLeaf {
@@ -77,6 +79,25 @@ interface VisibleLeaf {
 	readonly kind: "file" | "symlink";
 	readonly mode: number;
 	readonly fingerprint: string;
+	readonly changedAtNs: bigint;
+	readonly cacheable: boolean;
+}
+
+interface CachedVisibleLeaf extends VisibleLeaf {
+	readonly objectId: string;
+	readonly verifiedAtNs: bigint;
+}
+
+interface StagedWorktree {
+	readonly leaves: readonly VisibleLeaf[];
+	readonly objectIds: ReadonlyMap<string, string>;
+	readonly verifiedAtNs: bigint;
+}
+
+interface VisibleLeafCacheUpdate {
+	readonly gitDirectory: string;
+	readonly staged: StagedWorktree;
+	readonly inclusions: readonly string[] | null;
 }
 
 interface CachedBlob {
@@ -146,6 +167,7 @@ export class SnapshotStore {
 	private readonly treeEntriesCache = new Map<string, Promise<CapturedTreeEntry[]>>();
 	private readonly treeBlobMembership = new Map<string, string>();
 	private readonly blobCache = new Map<string, CachedBlob>();
+	private readonly visibleLeafCache = new Map<string, Map<string, CachedVisibleLeaf>>();
 	private blobCacheBytes = 0;
 
 	constructor(options: SnapshotStoreOptions = {}) {
@@ -223,6 +245,7 @@ export class SnapshotStore {
 			transactionDirectory = await mkdtemp(join(transactionsRoot, "capture-"));
 
 			const roots: SnapshotRoot[] = [];
+			const cacheUpdates: VisibleLeafCacheUpdate[] = [];
 			for (const root of topology.roots) {
 				if (root.state !== "active") {
 					const coverage = rootCaptureCoverage(root.relativeRoot, scope);
@@ -242,6 +265,7 @@ export class SnapshotStore {
 					artifactExclusions,
 				);
 				roots.push(snapshotRoot(root, captured));
+				cacheUpdates.push(captured.cacheUpdate);
 			}
 
 			await this.assertTopology(topology, "捕获期间 topology 已变化");
@@ -261,6 +285,7 @@ export class SnapshotStore {
 			await this.touchStore(storeDirectory);
 			await writeContentAddressed(manifestPath, Buffer.from(canonicalJson(manifest), "utf8"));
 			this.manifestLocations.set(manifestId, manifestPath);
+			for (const update of cacheUpdates) this.rememberVisibleLeaves(update);
 			return manifest;
 		} catch (error) {
 			if (error instanceof SnapshotStoreError) {
@@ -624,6 +649,9 @@ export class SnapshotStore {
 						this.manifestLocations.delete(id);
 					}
 				}
+				for (const gitDirectory of this.visibleLeafCache.keys()) {
+					if (gitDirectory.startsWith(`${storeDirectory}${sep}`)) this.visibleLeafCache.delete(gitDirectory);
+				}
 			} catch (error) {
 				await writeJsonAtomic(join(storeDirectory, GC_METADATA_FILE), {
 					schemaVersion: SCHEMA_VERSION,
@@ -659,13 +687,14 @@ export class SnapshotStore {
 			.map((candidate) => rootRelativePath(root.relativeRoot, candidate.relativeRoot));
 		const exactExclusions = ownedArtifactExclusions(topology.roots, root.relativeRoot, artifactExclusions);
 		const inclusions = ownedRootInclusions(requestedInclusions, exclusions);
-		await this.stageWorktree(
+		const staged = await this.stageWorktree(
 			absoluteRoot,
 			environment,
 			root.gitBacked,
 			inclusions,
 			exclusions,
 			exactExclusions,
+			this.visibleLeafCache.get(gitDirectory),
 		);
 		const coverage = rootCoverageFromInclusions(inclusions);
 		const ignoredPresentPaths = await this.captureIgnoredPresentPaths(
@@ -687,6 +716,7 @@ export class SnapshotStore {
 			coverage,
 			...ignoredPresentProof(coverage, ignoredPresentPaths),
 			objectClosure: treeObjectClosure(treeId, entries),
+			cacheUpdate: { gitDirectory, staged, inclusions },
 		};
 	}
 
@@ -749,7 +779,8 @@ export class SnapshotStore {
 		inclusions: readonly string[] | null,
 		exclusions: readonly string[],
 		exactExclusions: ReadonlySet<string>,
-	): Promise<void> {
+		cache: ReadonlyMap<string, CachedVisibleLeaf> | undefined,
+	): Promise<StagedWorktree> {
 		const leaves = await this.collectVisibleLeaves(
 			cwd,
 			environment,
@@ -759,10 +790,22 @@ export class SnapshotStore {
 			exactExclusions,
 		);
 		const objectIds = new Map<string, string>();
-		const hashBatches = hashPathBatches(leaves.filter((leaf) => leaf.kind === "file"));
+		const uncached: VisibleLeaf[] = [];
+		for (const leaf of leaves) {
+			const cached = cache?.get(leaf.relativePath);
+			if (
+				leaf.cacheable && cached?.cacheable === true && cached.kind === leaf.kind &&
+				cached.mode === leaf.mode && cached.fingerprint === leaf.fingerprint &&
+				cached.verifiedAtNs > cached.changedAtNs + RACY_CLEAN_WINDOW_NS
+			) {
+				objectIds.set(leaf.relativePath, cached.objectId);
+			} else {
+				uncached.push(leaf);
+			}
+		}
+		const hashBatches = hashPathBatches(uncached.filter((leaf) => leaf.kind === "file"));
 		const hashedBatches = await mapConcurrentOrdered(hashBatches, HASH_BATCH_CONCURRENCY, async (batch) => {
-			await mapConcurrentOrdered(batch, FILE_SYSTEM_INSPECTION_CONCURRENCY, (leaf) =>
-				this.assertVisibleLeafUnchanged(cwd, leaf));
+			await this.assertVisibleLeavesUnchanged(cwd, batch);
 			const output = await this.runGit([
 				"hash-object",
 				"-w",
@@ -771,15 +814,15 @@ export class SnapshotStore {
 				...batch.map((leaf) => leaf.relativePath),
 			], { cwd, env: environment });
 			const hashes = parseObjectIdLines(output, batch.length);
-			await mapConcurrentOrdered(batch, FILE_SYSTEM_INSPECTION_CONCURRENCY, (leaf) =>
-				this.assertVisibleLeafUnchanged(cwd, leaf));
+			await this.assertVisibleLeavesUnchanged(cwd, batch);
 			return batch.map((leaf, index) => [leaf.relativePath, hashes[index]!] as const);
 		});
 		for (const batch of hashedBatches) {
 			for (const [relativePath, objectId] of batch) objectIds.set(relativePath, objectId);
 		}
-		for (const leaf of leaves) {
+		for (const leaf of uncached) {
 			if (leaf.kind !== "symlink") continue;
+			await assertNoSymlinkEscape(cwd, leaf.relativePath);
 			await this.assertVisibleLeafUnchanged(cwd, leaf);
 			const linkText = await readlink(join(cwd, ...leaf.relativePath.split("/")), { encoding: "buffer" });
 			decodeUtf8(linkText, "symlink target 不是可无损表示的 UTF-8");
@@ -791,6 +834,7 @@ export class SnapshotStore {
 			if (!isObjectId(objectId)) {
 				throw new SnapshotStoreError("capture_failed", `文件对象 materialize 失败：${leaf.relativePath}`);
 			}
+			await assertNoSymlinkEscape(cwd, leaf.relativePath);
 			await this.assertVisibleLeafUnchanged(cwd, leaf);
 			objectIds.set(leaf.relativePath, objectId);
 		}
@@ -801,11 +845,42 @@ export class SnapshotStore {
 				stdin: indexInput,
 			});
 		}
+		await this.assertVisibleLeavesUnchanged(cwd, leaves);
+		return { leaves, objectIds, verifiedAtNs: BigInt(Date.now()) * 1_000_000n };
+	}
+
+	private rememberVisibleLeaves(update: VisibleLeafCacheUpdate): void {
+		const { gitDirectory, staged, inclusions } = update;
+		const cache = inclusions !== null && inclusions.length === 0
+			? new Map<string, CachedVisibleLeaf>()
+			: new Map(this.visibleLeafCache.get(gitDirectory));
+		if (inclusions !== null && inclusions.length > 0) {
+			for (const relativePath of cache.keys()) {
+				if (inclusions.some((inclusion) => isPathAtOrBelow(inclusion, relativePath))) {
+					cache.delete(relativePath);
+				}
+			}
+		}
+		for (const leaf of staged.leaves) {
+			const objectId = staged.objectIds.get(leaf.relativePath);
+			if (objectId === undefined) continue;
+			if (!leaf.cacheable) {
+				cache.delete(leaf.relativePath);
+				continue;
+			}
+			cache.set(leaf.relativePath, { ...leaf, objectId, verifiedAtNs: staged.verifiedAtNs });
+		}
+		this.visibleLeafCache.set(gitDirectory, cache);
+	}
+
+	private async assertVisibleLeavesUnchanged(cwd: string, leaves: readonly VisibleLeaf[]): Promise<void> {
+		await assertNoSymlinkParents(cwd, leaves.map((leaf) => leaf.relativePath));
+		await mapConcurrentOrdered(leaves, FILE_SYSTEM_INSPECTION_CONCURRENCY, (leaf) =>
+			this.assertVisibleLeafUnchanged(cwd, leaf));
 	}
 
 	private async assertVisibleLeafUnchanged(cwd: string, leaf: VisibleLeaf): Promise<void> {
-		await assertNoSymlinkEscape(cwd, leaf.relativePath);
-		const metadata = await lstat(join(cwd, ...leaf.relativePath.split("/"))).catch((error) => {
+		const metadata = await lstat(join(cwd, ...leaf.relativePath.split("/")), { bigint: true }).catch((error) => {
 			if (hasErrorCode(error, "ENOENT")) return null;
 			throw error;
 		});
@@ -873,28 +948,34 @@ export class SnapshotStore {
 			exclusions,
 			exactExclusions,
 		);
+		await assertNoSymlinkParents(cwd, paths);
 		const leaves = await mapConcurrentOrdered(paths, FILE_SYSTEM_INSPECTION_CONCURRENCY, async (relativePath) => {
 			relativeSafePath(cwd, relativePath);
-			await assertNoSymlinkEscape(cwd, relativePath);
-			const metadata = await lstat(join(cwd, ...relativePath.split("/"))).catch((error) => {
+			const metadata = await lstat(join(cwd, ...relativePath.split("/")), { bigint: true }).catch((error) => {
 				if (hasErrorCode(error, "ENOENT")) return null;
 				throw error;
 			});
 			if (metadata === null) return null;
+			const cacheable = visibleLeafMetadataCacheable(metadata);
+			const changedAtNs = metadata.mtimeNs > metadata.ctimeNs ? metadata.mtimeNs : metadata.ctimeNs;
 			if (metadata.isSymbolicLink()) {
 				return {
 					relativePath,
 					kind: "symlink" as const,
 					mode: 0o120000,
 					fingerprint: visibleLeafFingerprint(metadata),
+					changedAtNs,
+					cacheable,
 				};
 			}
 			if (metadata.isFile()) {
 				return {
 					relativePath,
 					kind: "file" as const,
-					mode: (metadata.mode & 0o111) === 0 ? 0o100644 : 0o100755,
+					mode: (metadata.mode & 0o111n) === 0n ? 0o100644 : 0o100755,
 					fingerprint: visibleLeafFingerprint(metadata),
+					changedAtNs,
+					cacheable,
 				};
 			}
 			throw new SnapshotStoreError("capture_failed", `不支持的工作区文件类型：${relativePath}`);
@@ -937,6 +1018,7 @@ export class SnapshotStore {
 		}
 		await mkdir(dirname(gitDirectory), { recursive: true });
 		await this.runGit(["init", "--bare", "--quiet", gitDirectory], { env: cleanGitEnvironment() });
+		this.visibleLeafCache.delete(gitDirectory);
 		await this.configurePrivateRepository(gitDirectory);
 	}
 
@@ -1559,16 +1641,21 @@ function indexInfoBatches(
 	return result;
 }
 
-function visibleLeafFingerprint(metadata: Stats): string {
+function visibleLeafFingerprint(metadata: BigIntStats): string {
 	return checksum(canonicalJson({
 		kind: metadata.isSymbolicLink() ? "symlink" : metadata.isFile() ? "file" : "other",
-		dev: metadata.dev,
-		ino: metadata.ino,
-		mode: metadata.mode,
-		size: metadata.size,
-		mtimeMs: metadata.mtimeMs,
-		ctimeMs: metadata.ctimeMs,
+		dev: metadata.dev.toString(),
+		ino: metadata.ino.toString(),
+		mode: metadata.mode.toString(),
+		size: metadata.size.toString(),
+		mtimeNs: metadata.mtimeNs.toString(),
+		ctimeNs: metadata.ctimeNs.toString(),
 	}));
+}
+
+function visibleLeafMetadataCacheable(metadata: BigIntStats): boolean {
+	// dev/ino/ctime 缺失时无法证明路径仍指向同一未修改对象，必须回退内容 hash。
+	return metadata.dev !== 0n && metadata.ino !== 0n && metadata.ctimeNs > 0n;
 }
 
 async function mapConcurrentOrdered<T, R>(

@@ -14,9 +14,14 @@ class CountingGitRunner extends GitRunner {
 	readonly calls: string[][] = [];
 	activeHashCalls = 0;
 	maxActiveHashCalls = 0;
+	failNextWriteTree = false;
 
 	override async run(args: readonly string[], options: GitRunOptions = {}): Promise<GitRunResult> {
 		this.calls.push([...args]);
+		if (this.failNextWriteTree && args.includes("write-tree")) {
+			this.failNextWriteTree = false;
+			throw new Error("injected write-tree failure");
+		}
 		const isHash = args.includes("hash-object");
 		if (isHash) {
 			this.activeHashCalls += 1;
@@ -40,6 +45,8 @@ describe("undo/redo restore performance", () => {
 				join(workspace, "src", `file-${String(index).padStart(5, "0")}.txt`),
 				`content ${index}\n`,
 			)));
+			// 缓存采用 Git 式 racily-clean 窗口；基线文件必须早于验证时刻。
+			await new Promise((resolveDelay) => setTimeout(resolveDelay, 2_100));
 			const git = new CountingGitRunner();
 			const discovery = new RootDiscovery(git);
 			const store = new SnapshotStore({ storeRoot, git, discovery });
@@ -58,17 +65,62 @@ describe("undo/redo restore performance", () => {
 			expect(countCommand(git.calls, "cat-file")).toBe(1);
 			expect(git.calls.length).toBeLessThanOrEqual(52);
 
+			git.calls.length = 0;
+			await store.capture(topology);
+			expect(countCommand(git.calls, "hash-object")).toBe(0);
+			expect(countCommand(git.calls, "update-index")).toBe(2);
+
 			await writeFile(join(workspace, "src", "file-00000.txt"), "changed\n");
+			git.calls.length = 0;
+			await store.capture(topology);
+			expect(countCommand(git.calls, "hash-object")).toBe(1);
+			expect(countCommand(git.calls, "update-index")).toBe(2);
+			expect(git.calls.length).toBeLessThanOrEqual(18);
+
 			git.calls.length = 0;
 			await store.capture(topology, ["src/file-00000.txt"]);
 			expect(countCommand(git.calls, "hash-object")).toBe(1);
 			expect(countCommand(git.calls, "update-index")).toBe(1);
 			expect(git.calls.length).toBeLessThanOrEqual(14);
+
+			await unlink(join(workspace, "src", "file-00000.txt"));
+			await writeFile(join(workspace, "src", "file-00000.txt"), "changed\n");
+			git.calls.length = 0;
+			await store.capture(topology);
+			expect(countCommand(git.calls, "hash-object")).toBe(1);
 		} finally {
 			await rm(workspace, { recursive: true, force: true });
 			await rm(storeRoot, { recursive: true, force: true });
 		}
 	}, 120_000);
+
+	it("失败的 capture 不发布 fingerprint cache", async () => {
+		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-cache-failure-"));
+		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-cache-failure-store-"));
+		try {
+			await writeFile(join(workspace, "file.txt"), "before\n");
+			const git = new CountingGitRunner();
+			const discovery = new RootDiscovery(git);
+			const store = new SnapshotStore({ storeRoot, git, discovery });
+			const topology = await discovery.discover(workspace);
+			await store.capture(topology);
+			await writeFile(join(workspace, "file.txt"), "after\n");
+
+			git.failNextWriteTree = true;
+			await expect(store.capture(topology)).rejects.toMatchObject({ code: "capture_failed" });
+			await new Promise((resolveDelay) => setTimeout(resolveDelay, 2_100));
+			git.calls.length = 0;
+			await store.capture(topology);
+			expect(countCommand(git.calls, "hash-object")).toBe(1);
+
+			git.calls.length = 0;
+			await store.capture(topology);
+			expect(countCommand(git.calls, "hash-object")).toBe(0);
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+		}
+	});
 
 	it("两千五百文件 plan 按字节上限而非固定条数切分 blob 批次", async () => {
 		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-plan-batch-"));

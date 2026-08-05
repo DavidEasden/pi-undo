@@ -64,6 +64,30 @@ export async function assertNoSymlinkEscape(root: string, relativePath: string):
 	}
 }
 
+/** 批量核验叶子路径的全部父目录；共享目录只执行一次 lstat。 */
+export async function assertNoSymlinkParents(root: string, relativePaths: readonly string[]): Promise<void> {
+	const directories = new Set<string>();
+	for (const relativePath of relativePaths) {
+		const safePath = relativeSafePath(root, relativePath);
+		if (safePath === ".") continue;
+		const parts = safePath.split("/");
+		for (let index = 1; index < parts.length; index += 1) {
+			directories.add(parts.slice(0, index).join("/"));
+		}
+	}
+	const ordered = [...directories].sort((left, right) => pathDepth(left) - pathDepth(right) || left.localeCompare(right));
+	for (const directory of ordered) {
+		try {
+			const metadata = await lstat(join(resolve(root), ...directory.split("/")));
+			if (metadata.isSymbolicLink()) fail("symlink_escape", "中间路径组件不能是 symlink");
+			if (!metadata.isDirectory()) fail("unsafe_path", "中间路径组件不是目录");
+		} catch (error) {
+			if (hasErrorCode(error, "ENOENT")) continue;
+			throw error;
+		}
+	}
+}
+
 export function pathSetsOverlap(leftPaths: readonly string[], rightPaths: readonly string[]): boolean {
 	for (const path of leftPaths) assertRelativeCandidate(path);
 	for (const path of rightPaths) assertRelativeCandidate(path);

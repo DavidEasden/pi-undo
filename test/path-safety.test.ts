@@ -1,5 +1,9 @@
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
-import { pathSetsOverlap } from "../src/path-safety.ts";
+import { assertNoSymlinkParents, pathSetsOverlap } from "../src/path-safety.ts";
 
 describe("pathSetsOverlap", () => {
 	it.each([
@@ -36,6 +40,27 @@ describe("pathSetsOverlap", () => {
 			const left = Array.from({ length: random() % 24 }, path);
 			const right = Array.from({ length: random() % 24 }, path);
 			expect(pathSetsOverlap(left, right)).toBe(legacyPathSetsOverlap(left, right));
+		}
+	});
+});
+
+describe("assertNoSymlinkParents", () => {
+	it("允许叶子 symlink，但拒绝任一共享父目录 symlink", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-undo-path-parents-"));
+		const outside = await mkdtemp(join(tmpdir(), "pi-undo-path-outside-"));
+		try {
+			await mkdir(join(root, "safe"));
+			await writeFile(join(root, "safe", "file.txt"), "safe\n");
+			await symlink(join(outside, "target.txt"), join(root, "safe", "leaf-link"));
+			await expect(assertNoSymlinkParents(root, ["safe/file.txt", "safe/leaf-link"]))
+				.resolves.toBeUndefined();
+
+			await symlink(outside, join(root, "escape"));
+			await expect(assertNoSymlinkParents(root, ["safe/file.txt", "escape/file.txt"]))
+				.rejects.toMatchObject({ code: "symlink_escape" });
+		} finally {
+			await rm(root, { recursive: true, force: true });
+			await rm(outside, { recursive: true, force: true });
 		}
 	});
 });
