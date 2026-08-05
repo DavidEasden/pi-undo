@@ -79,7 +79,7 @@ export async function createNativeFileBatch(options: {
 	};
 }
 
-function nativeExecutable(): string | undefined {
+export function nativeExecutable(): string | undefined {
 	const platform = process.platform === "darwin"
 		? "darwin"
 		: process.platform === "linux" ? "linux"

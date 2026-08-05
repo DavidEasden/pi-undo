@@ -1,6 +1,6 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -119,8 +119,26 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let request_path = std::env::args().nth(1).ok_or("缺少 request path")?;
-    let request_bytes = fs::read(&request_path).map_err(error("读取 request 失败"))?;
+    let first = std::env::args().nth(1).ok_or("缺少 request path")?;
+    if first == "--capabilities" {
+        #[cfg(unix)]
+        println!(
+            "{}",
+            r#"{"ok":true,"capabilities":["restore-v1","inspect-v1"]}"#
+        );
+        #[cfg(not(unix))]
+        println!("{}", r#"{"ok":true,"capabilities":["restore-v1"]}"#);
+        return Ok(());
+    }
+    if first == "--inspect" {
+        let request_path = std::env::args().nth(2).ok_or("缺少 inspect request path")?;
+        return run_inspect(Path::new(&request_path));
+    }
+    run_restore(Path::new(&first))
+}
+
+fn run_restore(request_path: &Path) -> Result<(), String> {
+    let request_bytes = fs::read(request_path).map_err(error("读取 request 失败"))?;
     let request: Request = serde_json::from_slice(&request_bytes)
         .map_err(|error| format!("解析 request 失败: {error}"))?;
     if request.schema_version != 1 || request.op_id.is_empty() {
@@ -249,6 +267,212 @@ fn run() -> Result<(), String> {
 
     println!("{{\"ok\":true,\"processed\":{}}}", operations.len());
     Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InspectRequest {
+    schema_version: u32,
+    workspace_root: String,
+    paths: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InspectResponse {
+    ok: bool,
+    processed: usize,
+    entries: Vec<InspectEntry>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InspectEntry {
+    path: String,
+    kind: String,
+    dev: Option<String>,
+    ino: Option<String>,
+    mode: Option<String>,
+    size: Option<String>,
+    mtime_ns: Option<String>,
+    ctime_ns: Option<String>,
+}
+
+fn run_inspect(request_path: &Path) -> Result<(), String> {
+    let request_bytes = fs::read(request_path).map_err(error("读取 inspect request 失败"))?;
+    let request: InspectRequest = serde_json::from_slice(&request_bytes)
+        .map_err(|error| format!("解析 inspect request 失败: {error}"))?;
+    if request.schema_version != 1 {
+        return Err("inspect schemaVersion 不受支持".into());
+    }
+    let workspace =
+        fs::canonicalize(&request.workspace_root).map_err(error("workspace canonicalize 失败"))?;
+    if workspace.as_path() != Path::new(&request.workspace_root) {
+        return Err("workspaceRoot 必须是 canonical path".into());
+    }
+    #[cfg(not(unix))]
+    return Err("当前平台 native metadata inspect 不受支持".into());
+    #[cfg(unix)]
+    {
+        let mut seen = BTreeSet::new();
+        let mut parents = BTreeSet::new();
+        for path in &request.paths {
+            validate_relative_path(path)?;
+            if !seen.insert(path.clone()) {
+                return Err(format!("inspect 路径重复：{path}"));
+            }
+            let parts = Path::new(path).components().collect::<Vec<_>>();
+            let mut parent = PathBuf::new();
+            for component in parts.iter().take(parts.len().saturating_sub(1)) {
+                if let Component::Normal(value) = component {
+                    parent.push(value);
+                    parents.insert(parent.clone());
+                }
+            }
+        }
+        assert_inspect_parents(&workspace, &parents)?;
+        let entries = parallel_inspect(&workspace, request.paths)?;
+        assert_inspect_parents(&workspace, &parents)?;
+        let response = InspectResponse {
+            ok: true,
+            processed: entries.len(),
+            entries,
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&response)
+                .map_err(|error| format!("编码 inspect response 失败: {error}"))?
+        );
+        Ok(())
+    }
+}
+
+fn validate_relative_path(relative: &str) -> Result<(), String> {
+    let path = Path::new(relative);
+    if relative.is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(format!("不安全 inspect 路径：{relative}"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn assert_inspect_parents(workspace: &Path, parents: &BTreeSet<PathBuf>) -> Result<(), String> {
+    for parent in parents {
+        match fs::symlink_metadata(workspace.join(parent)) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!("inspect 中间路径是 symlink：{}", parent.display()));
+            }
+            Ok(metadata) if !metadata.file_type().is_dir() => {
+                return Err(format!("inspect 中间路径不是目录：{}", parent.display()));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "inspect 父目录 metadata 失败：{}: {error}",
+                    parent.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn parallel_inspect(workspace: &Path, paths: Vec<String>) -> Result<Vec<InspectEntry>, String> {
+    let entries = Arc::new(paths);
+    let next = AtomicUsize::new(0);
+    let results = Mutex::new(
+        (0..entries.len())
+            .map(|_| None::<InspectEntry>)
+            .collect::<Vec<_>>(),
+    );
+    let failure = Mutex::new(None::<String>);
+    thread::scope(|scope| {
+        for _ in 0..CONCURRENCY.min(entries.len()) {
+            let entries = Arc::clone(&entries);
+            let next = &next;
+            let results = &results;
+            let failure = &failure;
+            scope.spawn(move || {
+                loop {
+                    if failure.lock().unwrap().is_some() {
+                        break;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= entries.len() {
+                        break;
+                    }
+                    match inspect_entry(workspace, entries[index].clone()) {
+                        Ok(entry) => results.lock().unwrap()[index] = Some(entry),
+                        Err(error) => {
+                            let mut guard = failure.lock().unwrap();
+                            if guard.is_none() {
+                                *guard = Some(error);
+                            }
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    if let Some(error) = failure.lock().unwrap().take() {
+        return Err(error);
+    }
+    results
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.ok_or_else(|| "native inspect 结果缺失".into()))
+        .collect()
+}
+
+#[cfg(unix)]
+fn inspect_entry(workspace: &Path, path: String) -> Result<InspectEntry, String> {
+    match fs::symlink_metadata(workspace.join(&path)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(InspectEntry {
+            path,
+            kind: "absent".into(),
+            dev: None,
+            ino: None,
+            mode: None,
+            size: None,
+            mtime_ns: None,
+            ctime_ns: None,
+        }),
+        Err(error) => Err(format!("inspect 叶子 metadata 失败：{path}: {error}")),
+        Ok(metadata) => {
+            let kind = if metadata.file_type().is_symlink() {
+                "symlink"
+            } else if metadata.file_type().is_file() {
+                "file"
+            } else {
+                "other"
+            };
+            Ok(InspectEntry {
+                path,
+                kind: kind.into(),
+                dev: Some(metadata.dev().to_string()),
+                ino: Some(metadata.ino().to_string()),
+                mode: Some(metadata.mode().to_string()),
+                size: Some(metadata.size().to_string()),
+                mtime_ns: Some(
+                    ((metadata.mtime() as i128) * 1_000_000_000 + metadata.mtime_nsec() as i128)
+                        .to_string(),
+                ),
+                ctime_ns: Some(
+                    ((metadata.ctime() as i128) * 1_000_000_000 + metadata.ctime_nsec() as i128)
+                        .to_string(),
+                ),
+            })
+        }
+    }
 }
 
 fn load_pack(
@@ -768,4 +992,81 @@ fn error_path<'a>(
     path: &'a str,
 ) -> impl FnOnce(std::io::Error) -> String + 'a {
     move |error| format!("{prefix}: {path}: {error}")
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+
+    fn fixture() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "pi-undo-native-inspect-test-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::canonicalize(root).unwrap()
+    }
+
+    fn request(root: &Path, paths: &[&str]) -> PathBuf {
+        let path = root.join("request.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1,
+                "workspaceRoot": root,
+                "paths": paths,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn inspect_preserves_unix_identity_and_absence() {
+        let root = fixture();
+        fs::write(root.join("a.txt"), b"abc").unwrap();
+        let entries = parallel_inspect(&root, vec!["a.txt".into(), "gone.txt".into()]).unwrap();
+        assert_eq!(entries[0].kind, "file");
+        assert_eq!(entries[0].size.as_deref(), Some("3"));
+        assert!(entries[0].dev.as_deref().unwrap().parse::<u64>().unwrap() > 0);
+        assert_eq!(entries[1].kind, "absent");
+        assert!(entries[1].dev.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inspect_rejects_symlink_parent() {
+        let root = fixture();
+        fs::create_dir(root.join("target")).unwrap();
+        fs::write(root.join("target/a.txt"), b"abc").unwrap();
+        symlink(root.join("target"), root.join("link")).unwrap();
+        let request_path = request(&root, &["link/a.txt"]);
+        let result = run_inspect(&request_path);
+        assert!(result.unwrap_err().contains("中间路径是 symlink"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inspect_rejects_unsafe_and_duplicate_paths() {
+        let root = fixture();
+        let unsafe_request = request(&root, &["../escape"]);
+        assert!(
+            run_inspect(&unsafe_request)
+                .unwrap_err()
+                .contains("不安全 inspect 路径")
+        );
+        let duplicate_request = request(&root, &["a.txt", "a.txt"]);
+        assert!(
+            run_inspect(&duplicate_request)
+                .unwrap_err()
+                .contains("inspect 路径重复")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 }

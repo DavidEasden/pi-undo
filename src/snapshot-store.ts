@@ -20,6 +20,8 @@ import type {
 	SnapshotManifest,
 	SnapshotRoot,
 } from "./model.ts";
+import type { NativeMetadataEntry, NativeMetadataPort } from "./native-metadata.ts";
+import { NativeMetadataInspector } from "./native-metadata.ts";
 import { assertNoSymlinkEscape, assertNoSymlinkParents, pathSetsOverlap, relativeSafePath } from "./path-safety.ts";
 import { RootDiscovery, type RootTopology } from "./root-discovery.ts";
 import { WorkspaceLock } from "./workspace-lock.ts";
@@ -74,6 +76,16 @@ interface CapturedRootResult {
 	readonly cacheUpdate: VisibleLeafCacheUpdate;
 }
 
+interface VisibleLeafMetadata {
+	readonly kind: "file" | "symlink" | "other";
+	readonly dev: bigint;
+	readonly ino: bigint;
+	readonly mode: bigint;
+	readonly size: bigint;
+	readonly mtimeNs: bigint;
+	readonly ctimeNs: bigint;
+}
+
 interface VisibleLeaf {
 	readonly relativePath: string;
 	readonly kind: "file" | "symlink";
@@ -111,6 +123,7 @@ export interface SnapshotStoreOptions {
 	readonly discovery?: RootDiscovery;
 	readonly lock?: WorkspaceLock;
 	readonly clock?: () => number;
+	readonly nativeMetadata?: NativeMetadataPort;
 }
 
 export interface CaptureOptions {
@@ -162,6 +175,7 @@ export class SnapshotStore {
 	private readonly discovery: RootDiscovery;
 	private readonly lock: WorkspaceLock;
 	private readonly clock: () => number;
+	private readonly nativeMetadata: NativeMetadataPort;
 	private readonly manifestLocations = new Map<string, string>();
 	// Tree 与 blob 都由 object ID 内容寻址；缓存只复用已从私有 ODB 读取的不可变内容。
 	private readonly treeEntriesCache = new Map<string, Promise<CapturedTreeEntry[]>>();
@@ -177,6 +191,7 @@ export class SnapshotStore {
 		this.discovery = options.discovery ?? new RootDiscovery(this.git);
 		this.lock = options.lock ?? new WorkspaceLock();
 		this.clock = options.clock ?? Date.now;
+		this.nativeMetadata = options.nativeMetadata ?? new NativeMetadataInspector();
 	}
 
 	static supportsValidatedBlobBatch(store: SnapshotStore): boolean {
@@ -695,6 +710,7 @@ export class SnapshotStore {
 			exclusions,
 			exactExclusions,
 			this.visibleLeafCache.get(gitDirectory),
+			transactionDirectory,
 		);
 		const coverage = rootCoverageFromInclusions(inclusions);
 		const ignoredPresentPaths = await this.captureIgnoredPresentPaths(
@@ -780,6 +796,7 @@ export class SnapshotStore {
 		exclusions: readonly string[],
 		exactExclusions: ReadonlySet<string>,
 		cache: ReadonlyMap<string, CachedVisibleLeaf> | undefined,
+		requestDirectory: string,
 	): Promise<StagedWorktree> {
 		const leaves = await this.collectVisibleLeaves(
 			cwd,
@@ -788,6 +805,7 @@ export class SnapshotStore {
 			inclusions,
 			exclusions,
 			exactExclusions,
+			requestDirectory,
 		);
 		const objectIds = new Map<string, string>();
 		const uncached: VisibleLeaf[] = [];
@@ -845,7 +863,7 @@ export class SnapshotStore {
 				stdin: indexInput,
 			});
 		}
-		await this.assertVisibleLeavesUnchanged(cwd, leaves);
+		await this.assertVisibleLeavesUnchanged(cwd, leaves, requestDirectory);
 		return { leaves, objectIds, verifiedAtNs: BigInt(Date.now()) * 1_000_000n };
 	}
 
@@ -873,7 +891,28 @@ export class SnapshotStore {
 		this.visibleLeafCache.set(gitDirectory, cache);
 	}
 
-	private async assertVisibleLeavesUnchanged(cwd: string, leaves: readonly VisibleLeaf[]): Promise<void> {
+	private async assertVisibleLeavesUnchanged(
+		cwd: string,
+		leaves: readonly VisibleLeaf[],
+		requestDirectory?: string,
+	): Promise<void> {
+		if (requestDirectory !== undefined) {
+			const inspected = await this.nativeMetadata.inspect(
+				cwd,
+				leaves.map((leaf) => leaf.relativePath),
+				requestDirectory,
+			);
+			if (inspected !== undefined) {
+				for (let index = 0; index < leaves.length; index += 1) {
+					const leaf = leaves[index]!;
+					const metadata = nativeVisibleLeafMetadata(inspected[index]!);
+					if (metadata === null || visibleLeafFingerprint(metadata) !== leaf.fingerprint) {
+						throw new SnapshotStoreError("capture_failed", `捕获期间工作区叶子已变化：${leaf.relativePath}`);
+					}
+				}
+				return;
+			}
+		}
 		await assertNoSymlinkParents(cwd, leaves.map((leaf) => leaf.relativePath));
 		await mapConcurrentOrdered(leaves, FILE_SYSTEM_INSPECTION_CONCURRENCY, (leaf) =>
 			this.assertVisibleLeafUnchanged(cwd, leaf));
@@ -884,7 +923,7 @@ export class SnapshotStore {
 			if (hasErrorCode(error, "ENOENT")) return null;
 			throw error;
 		});
-		if (metadata === null || visibleLeafFingerprint(metadata) !== leaf.fingerprint) {
+		if (metadata === null || visibleLeafFingerprint(visibleLeafMetadataFromStats(metadata)) !== leaf.fingerprint) {
 			throw new SnapshotStoreError("capture_failed", `捕获期间工作区叶子已变化：${leaf.relativePath}`);
 		}
 	}
@@ -939,6 +978,7 @@ export class SnapshotStore {
 		inclusions: readonly string[] | null,
 		exclusions: readonly string[],
 		exactExclusions: ReadonlySet<string>,
+		requestDirectory: string,
 	): Promise<VisibleLeaf[]> {
 		const paths = await this.queryVisibleLeafPaths(
 			cwd,
@@ -948,39 +988,46 @@ export class SnapshotStore {
 			exclusions,
 			exactExclusions,
 		);
+		const nativeEntries = await this.nativeMetadata.inspect(cwd, paths, requestDirectory);
+		const metadataEntries = nativeEntries === undefined
+			? await this.collectVisibleLeafMetadataFallback(cwd, paths)
+			: nativeEntries.map((entry) => nativeVisibleLeafMetadata(entry));
+		const leaves: VisibleLeaf[] = [];
+		for (let index = 0; index < paths.length; index += 1) {
+			const relativePath = paths[index]!;
+			const metadata = metadataEntries[index]!;
+			if (metadata === null) continue;
+			if (metadata.kind === "other") {
+				throw new SnapshotStoreError("capture_failed", `不支持的工作区文件类型：${relativePath}`);
+			}
+			const cacheable = visibleLeafMetadataCacheable(metadata);
+			leaves.push({
+				relativePath,
+				kind: metadata.kind,
+				mode: metadata.kind === "symlink"
+					? 0o120000
+					: (metadata.mode & 0o111n) === 0n ? 0o100644 : 0o100755,
+				fingerprint: visibleLeafFingerprint(metadata),
+				changedAtNs: metadata.mtimeNs > metadata.ctimeNs ? metadata.mtimeNs : metadata.ctimeNs,
+				cacheable,
+			});
+		}
+		return leaves;
+	}
+
+	private async collectVisibleLeafMetadataFallback(
+		cwd: string,
+		paths: readonly string[],
+	): Promise<readonly (VisibleLeafMetadata | null)[]> {
 		await assertNoSymlinkParents(cwd, paths);
-		const leaves = await mapConcurrentOrdered(paths, FILE_SYSTEM_INSPECTION_CONCURRENCY, async (relativePath) => {
+		return mapConcurrentOrdered(paths, FILE_SYSTEM_INSPECTION_CONCURRENCY, async (relativePath) => {
 			relativeSafePath(cwd, relativePath);
 			const metadata = await lstat(join(cwd, ...relativePath.split("/")), { bigint: true }).catch((error) => {
 				if (hasErrorCode(error, "ENOENT")) return null;
 				throw error;
 			});
-			if (metadata === null) return null;
-			const cacheable = visibleLeafMetadataCacheable(metadata);
-			const changedAtNs = metadata.mtimeNs > metadata.ctimeNs ? metadata.mtimeNs : metadata.ctimeNs;
-			if (metadata.isSymbolicLink()) {
-				return {
-					relativePath,
-					kind: "symlink" as const,
-					mode: 0o120000,
-					fingerprint: visibleLeafFingerprint(metadata),
-					changedAtNs,
-					cacheable,
-				};
-			}
-			if (metadata.isFile()) {
-				return {
-					relativePath,
-					kind: "file" as const,
-					mode: (metadata.mode & 0o111n) === 0n ? 0o100644 : 0o100755,
-					fingerprint: visibleLeafFingerprint(metadata),
-					changedAtNs,
-					cacheable,
-				};
-			}
-			throw new SnapshotStoreError("capture_failed", `不支持的工作区文件类型：${relativePath}`);
+			return metadata === null ? null : visibleLeafMetadataFromStats(metadata);
 		});
-		return leaves.filter((leaf): leaf is VisibleLeaf => leaf !== null);
 	}
 
 	private async validateIgnoreQuery(
@@ -1641,9 +1688,40 @@ function indexInfoBatches(
 	return result;
 }
 
-function visibleLeafFingerprint(metadata: BigIntStats): string {
-	return checksum(canonicalJson({
+function visibleLeafMetadataFromStats(metadata: BigIntStats): VisibleLeafMetadata {
+	return {
 		kind: metadata.isSymbolicLink() ? "symlink" : metadata.isFile() ? "file" : "other",
+		dev: metadata.dev,
+		ino: metadata.ino,
+		mode: metadata.mode,
+		size: metadata.size,
+		mtimeNs: metadata.mtimeNs,
+		ctimeNs: metadata.ctimeNs,
+	};
+}
+
+function nativeVisibleLeafMetadata(entry: NativeMetadataEntry): VisibleLeafMetadata | null {
+	if (entry.kind === "absent") return null;
+	if (
+		entry.dev === undefined || entry.ino === undefined || entry.mode === undefined ||
+		entry.size === undefined || entry.mtimeNs === undefined || entry.ctimeNs === undefined
+	) {
+		throw new SnapshotStoreError("capture_failed", `native metadata 缺少字段：${entry.path}`);
+	}
+	return {
+		kind: entry.kind,
+		dev: entry.dev,
+		ino: entry.ino,
+		mode: entry.mode,
+		size: entry.size,
+		mtimeNs: entry.mtimeNs,
+		ctimeNs: entry.ctimeNs,
+	};
+}
+
+function visibleLeafFingerprint(metadata: VisibleLeafMetadata): string {
+	return checksum(canonicalJson({
+		kind: metadata.kind,
 		dev: metadata.dev.toString(),
 		ino: metadata.ino.toString(),
 		mode: metadata.mode.toString(),
@@ -1653,7 +1731,7 @@ function visibleLeafFingerprint(metadata: BigIntStats): string {
 	}));
 }
 
-function visibleLeafMetadataCacheable(metadata: BigIntStats): boolean {
+function visibleLeafMetadataCacheable(metadata: VisibleLeafMetadata): boolean {
 	// dev/ino/ctime 缺失时无法证明路径仍指向同一未修改对象，必须回退内容 hash。
 	return metadata.dev !== 0n && metadata.ino !== 0n && metadata.ctimeNs > 0n;
 }
