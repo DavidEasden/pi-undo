@@ -23,11 +23,11 @@ Each completed agent run creates a checkpoint that captures both the Pi session 
 - Node.js `22.19.0` or later.
 - Git available on `PATH` (used internally for content-addressed snapshots).
 
-### Rust 原生加速
+### Native Rust Acceleration
 
-pi-undo 包含跨平台 Rust 原生 helper（`pi-undo-fs`），用于加速文件系统操作。发布包会同时包含以下六个预编译二进制：
+pi-undo includes a cross-platform native Rust helper (`pi-undo-fs`) to accelerate filesystem operations. The published package contains these six precompiled binaries:
 
-| 平台 | 架构 | 二进制名称 |
+| Platform | Architecture | Binary |
 |---|---|---|
 | macOS | arm64 | `pi-undo-fs-darwin-arm64` |
 | macOS | x64 | `pi-undo-fs-darwin-x64` |
@@ -36,33 +36,33 @@ pi-undo 包含跨平台 Rust 原生 helper（`pi-undo-fs`），用于加速文�
 | Windows | arm64 | `pi-undo-fs-win32-arm64.exe` |
 | Windows | x64 | `pi-undo-fs-win32-x64.exe` |
 
-扩展会根据当前运行环境自动选择对应二进制，因此用户无需安装 Rust，也无需手动选择平台。Windows 二进制带有 `.exe` 后缀。对于尚未提供预编译二进制的平台，扩展会自动回退到 TypeScript 路径，功能仍然可用。
+The extension automatically selects the correct binary for the current runtime, so users do not need to install Rust or choose a platform manually. Windows binaries use the `.exe` suffix. On platforms without a precompiled binary, the extension automatically falls back to the TypeScript implementation with the same functionality.
 
 ## Installation
 
-### 从 npm 安装（推荐）
+### Install from npm (Recommended)
 
-所有受支持的平台使用同一个安装命令；npm 包会包含 macOS/Linux/Windows 的 arm64/x64 预编译 Rust helper，扩展启动时自动选择当前平台的版本：
+All supported platforms use the same installation command. The npm package includes precompiled arm64 and x64 Rust helpers for macOS, Linux, and Windows, and the extension selects the correct version at startup:
 
 ```bash
 pi install npm:@davideasden/pi-undo
 ```
 
-重启 Pi 即可加载扩展。用户不需要安装 Rust，也不需要手动选择或安装平台专用包。
+Restart Pi to load the extension. Users do not need to install Rust or select and install a platform-specific package.
 
-### 从本地源码安装
+### Install from Local Source
 
 ```bash
 pi install /path/to/pi-undo
 ```
 
-### 开发模式直接加载
+### Load Directly for Development
 
 ```bash
 pi -e /absolute/path/to/pi-undo/extensions/pi-undo.ts
 ```
 
-> **注意**：`pi install` 会将整个包（包括 `native/bin/` 下的预编译二进制）复制到 Pi 的扩展目录。如果你从源码构建后想要包含新编译的原生二进制，确保运行 `npm run build:native` 后再执行 `pi install`。
+> **Note:** `pi install` copies the entire package, including the precompiled binaries under `native/bin/`, into Pi's extension directory. To include a newly compiled native binary in a source installation, run `npm run build:native` before `pi install`.
 
 ## Usage
 
@@ -233,6 +233,46 @@ When `recovery_required` appears, first back up the workspace and Pi session JSO
 
 A transaction directory may contain `descriptor.json`, `restore-plan.json`, `state.json`, `mutations.jsonl`, `durable-pack-v1.bin`, and a native helper request. Do not delete `.pi-undo` without a backup: unresolved packs or quarantine artifacts may be the only surviving copy of a file version.
 
+### Troubleshooting `recovery_required`
+
+First stop other Pi instances, editors, formatters, and watchers that may write to the same workspace. Then completely quit and restart Pi once. Startup recovery is idempotent and normally finishes an interrupted transaction automatically. Deleting `.pi-undo` while Pi is still running does not clear the in-memory recovery lock, and the active process may recreate the directory.
+
+If the footer includes an `opId`, locate that exact transaction first. Recovery data is stored under the session directory for each workspace. Inspecting `.pi-undo` for a different workspace can therefore produce a misleading result that no pending journal exists:
+
+```bash
+OP_ID="op-..."; TX="$(find "${PI_AGENT_DIR:-$HOME/.pi/agent}/sessions" -type d -path "*/.pi-undo/transactions/$OP_ID" -print -quit)"; test -n "$TX" && printf 'transaction=%s\n' "$TX"
+```
+
+Back up the workspace before continuing. Inspect the transaction phase and descriptor without editing them:
+
+```bash
+jq '{opId,phase,revision,observedLogicalLeaf}' "$TX/state.json"
+jq '{action,fromLogicalLeaf,toLogicalLeaf,workspaceIdentity,sessionIdentity,scopeCount:(.scopePaths | length)}' "$TX/descriptor.json"
+```
+
+List every non-terminal transaction under the same `.pi-undo` root. This command is intentionally kept on one line because trailing whitespace after a continuation backslash can break `find -exec` when a multiline command is pasted:
+
+```bash
+ROOT="$(dirname "$(dirname "$TX")")"; find "$ROOT/transactions" -name state.json -type f -exec jq -r 'select(.phase != "COMMITTED" and .phase != "ABORTED") | "\(.opId) \(.phase)"' {} +
+```
+
+If `mutations.jsonl` exists, summarize the final state of each mutation ordinal and list mutations that have not been cleaned:
+
+```bash
+jq -s 'group_by(.ordinal) | map(.[-1]) | group_by(.state) | map({state: .[0].state, count: length})' "$TX/mutations.jsonl"
+jq -s 'group_by(.ordinal) | map(.[-1]) | map(select(.state != "CLEANED")) | .[] | {ordinal,path,kind,state}' "$TX/mutations.jsonl"
+```
+
+- If the second command prints any records, artifacts or file mutations are still active. Do not delete or move the transaction. Preserve the workspace, session JSONL, transaction directory, and same-directory `.pi-undo-*` artifacts for manual recovery.
+- If the second command prints nothing, every WAL mutation is already `CLEANED`. A footer such as `recovery_required files:1 op:...` may still appear because the conflict path count has a minimum fallback of one. `files:1` alone does not prove that one active file remains.
+- Only when every mutation is `CLEANED`, the transaction phase is still `RECOVERY_REQUIRED`, and you have independently verified that the current workspace and Pi session are the result you want to keep, back up and isolate that transaction:
+
+```bash
+SESSION="$(jq -r '.sessionIdentity.path' "$TX/descriptor.json")"; STAMP="$(date '+%Y%m%d-%H%M%S')"; BACKUP="$ROOT/recovery-backup/$STAMP"; mkdir -p "$BACKUP"; cp -p "$SESSION" "$BACKUP/$(basename "$SESSION").backup"; mv "$TX" "$BACKUP/"
+```
+
+After isolating a fully cleaned transaction, completely quit every Pi process for that workspace and start Pi again. Reloading the session alone may retain the in-memory recovery lock. Do not edit `state.json` by hand because journal states and descriptors are checksum-bound. Do not remove the entire `.pi-undo` directory because it may still contain committed history, snapshots, packs, or the only recoverable copy of a file.
+
 ## Limitations
 
 - Git-ignored files are not included in snapshots and are not created or deleted during restore.
@@ -246,7 +286,7 @@ A transaction directory may contain `descriptor.json`, `restore-plan.json`, `sta
 
 ## Development
 
-### 依赖
+### Dependencies
 
 Clone the repository and install dependencies:
 
@@ -256,24 +296,24 @@ cd pi-undo
 npm install
 ```
 
-### 构建 Rust 原生 helper
+### Build the Native Rust Helper
 
-如果需要构建或更新原生二进制，确保已安装 [Rust 工具链](https://rustup.rs/)：
+Install the [Rust toolchain](https://rustup.rs/) before building or updating a native binary:
 
 ```bash
 npm run build:native
 ```
 
-`npm run build:native` 会在 `native/pi-undo-fs/target/release/` 下生成当前构建平台的 `pi-undo-fs`。发布流程会在 macOS、Linux 和 Windows runner 上分别构建 arm64/x64 版本，统一重命名后放入 `native/bin/`，再打包成包含六个二进制的 npm 包。
+`npm run build:native` creates `pi-undo-fs` for the current build platform under `native/pi-undo-fs/target/release/`. The release workflow builds arm64 and x64 versions on macOS, Linux, and Windows runners, renames them consistently under `native/bin/`, and packages all six binaries in the npm package.
 
-本地开发时，如果只需要验证当前平台，可以将生成的文件复制到 `native/bin/` 并按平台重命名，例如：Windows 生成的文件应使用对应的 `.exe` 文件名。
+For local development on the current platform, copy the generated file into `native/bin/` and rename it for the platform. For example, a Windows build must use the corresponding `.exe` filename.
 
 ```bash
 cp native/pi-undo-fs/target/release/pi-undo-fs native/bin/pi-undo-fs-darwin-arm64
 chmod +x native/bin/pi-undo-fs-darwin-arm64
 ```
 
-发布包必须包含 Requirements 中列出的六个平台二进制；CI 会在打包前检查这一点，并在推送 `v*` tag 时发布该 CI 构建的完整 npm 包。npm 仓库需要为此 GitHub Actions workflow 配置 npm Trusted Publishing（OIDC）。如果当前平台没有对应二进制，扩展会自动使用 TypeScript 回退路径。
+The published package must contain all six platform binaries listed under Requirements. CI verifies them before packaging and publishes the complete CI-built npm package when a `v*` tag is pushed. The npm package must configure Trusted Publishing (OIDC) for this GitHub Actions workflow. If no binary is available for the current platform, the extension automatically uses the TypeScript fallback.
 
 ### Project Layout
 
