@@ -359,6 +359,28 @@ describe("UndoController", () => {
 		expect(controller.history()).toEqual({ undoCount: 0, redoCount: 0, locked: false });
 	});
 
+	it("输入前快照失败时 fail-open 且 captureFailed 可观测，成功后复位", async () => {
+		let captures = 0;
+		const deps = dependencies({
+			capture: async () => {
+				captures += 1;
+				if (captures === 1) throw new Error("EPERM: operation not permitted, fsync");
+				return manifest("a");
+			},
+		});
+		const controller = new UndoControllerImpl(deps);
+
+		expect(await controller.prepareInput("失败轮", { streaming: false })).toEqual({ action: "continue" });
+		expect(controller.captureFailed()).toBe(true);
+		// 快照失败时 staged 未建立，settled 不应产生 checkpoint。
+		await controller.beforeAgentStart();
+		await controller.agentSettled();
+		expect(controller.history()).toEqual({ undoCount: 0, redoCount: 0, locked: false });
+
+		expect(await controller.prepareInput("恢复轮", { streaming: false })).toEqual({ action: "continue" });
+		expect(controller.captureFailed()).toBe(false);
+	});
+
 	it("after capture 失败写 barrier 暂停历史，下一次成功 baseline 可重新开始", async () => {
 		let captures = 0;
 		const deps = dependencies({

@@ -145,6 +145,8 @@ export interface UndoController {
 	cancelTree?(): Promise<void>;
 	recover(): Promise<void>;
 	history(): HistoryState;
+	/** 最近一次输入前快照是否失败（此时本次 run 不可 undo，但输入不受影响）。 */
+	captureFailed(): boolean;
 }
 
 interface StagedRun {
@@ -192,6 +194,7 @@ export class UndoControllerImpl implements UndoController {
 	private operationProfiler: OperationProfiler | undefined;
 	private promptDeferralInFlight = false;
 	private lastSafetyManifestId: ManifestId | null = null;
+	private lastCaptureFailed = false;
 
 	constructor(dependencies: ControllerDependencies, initialState: ControllerInitialState = {}) {
 		this.dependencies = dependencies;
@@ -205,6 +208,10 @@ export class UndoControllerImpl implements UndoController {
 		return { undoCount: this.undoStack.length, redoCount: this.redoStack.length, locked: this.locked };
 	}
 
+	captureFailed(): boolean {
+		return this.lastCaptureFailed;
+	}
+
 	listCheckpoints(): readonly CheckpointRecord[] {
 		return [...this.undoStack];
 	}
@@ -216,11 +223,13 @@ export class UndoControllerImpl implements UndoController {
 		if (context.streaming || text.length === 0) return { action: "continue" };
 		try {
 			const before = await this.captureWithWorkspaceLock();
+			this.lastCaptureFailed = false;
 			this.historyPaused = false;
 			this.staged = { rawPrompt: text, before, sourceLogicalLeaf: this.dependencies.getLogicalLeafId() };
 			return { action: "continue" };
 		} catch {
 			// 无法证明输入前状态：放弃记录本次历史，但绝不吞掉用户输入。
+			this.lastCaptureFailed = true;
 			return { action: "continue" };
 		}
 	}

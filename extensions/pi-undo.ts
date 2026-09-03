@@ -46,6 +46,7 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 		let acceptedReplay: DeferredPrompt | undefined;
 		let activeCommands = new Set<symbol>();
 		let activeAction: "undo" | "redo" | undefined;
+		let captureFailureNotified = false;
 
 		const initialize = async (context: ExtensionContext): Promise<void> => {
 			const currentGeneration = ++generation;
@@ -55,6 +56,7 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 			acceptedReplay = undefined;
 			activeCommands = new Set<symbol>();
 			activeAction = undefined;
+			captureFailureNotified = false;
 			try {
 				const next = await runtimeFactory(context, pi);
 				if (currentGeneration !== generation) return;
@@ -249,6 +251,10 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 						context.ui.notify("Queued prompt text restored; image attachments must be reattached", "warning");
 					}
 				}
+			}
+			if (result.action === "continue" && active.controller.captureFailed() && !captureFailureNotified) {
+				captureFailureNotified = true;
+				context.ui.notify("pi-undo: pre-input snapshot failed; this run will not be undoable", "warning");
 			}
 			return result;
 		});

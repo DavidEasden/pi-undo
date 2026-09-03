@@ -86,10 +86,28 @@ export async function fsyncFile(file: string): Promise<void> {
 	}
 }
 
+/** 不支持目录 fsync 的平台/文件系统（Windows/NTFS、网络盘、exFAT、FUSE 等）返回的 errno。 */
+const TOLERATED_DIR_FSYNC_CODES = new Set(["EPERM", "EINVAL", "ENOTSUP", "EOPNOTSUPP", "ENOSYS"]);
+
+/** 目录 fsync 失败是否因平台/文件系统不支持而可以安全降级跳过。 */
+export function isToleratedDirFsyncError(error: unknown): boolean {
+	return typeof error === "object" && error !== null && "code" in error &&
+		typeof (error as { code?: unknown }).code === "string" &&
+		TOLERATED_DIR_FSYNC_CODES.has((error as { code: string }).code);
+}
+
 export async function fsyncDirectory(directory: string): Promise<void> {
+	if (process.platform === "win32") {
+		// Windows 对目录句柄调用 fsync 必然返回 EPERM；rename 的持久性由文件系统自身保证。
+		return;
+	}
 	const handle = await open(directory, "r");
 	try {
 		await handle.sync();
+	} catch (error) {
+		// 目录 fsync 只是崩溃持久性的 best-effort 强化，文件内容的 fsync 不受影响：
+		// 不支持目录 fsync 的文件系统降级跳过，其余错误照常传播。
+		if (!isToleratedDirFsyncError(error)) throw error;
 	} finally {
 		await handle.close();
 	}

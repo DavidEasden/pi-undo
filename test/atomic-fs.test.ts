@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	fsyncDirectory,
 	fsyncFile,
+	isToleratedDirFsyncError,
 	writeBytesAtomic,
 	writeContentAddressed,
 	writeJsonAtomic,
@@ -51,6 +52,33 @@ describe("atomic filesystem", () => {
 
 		expect([...await readFile(target)]).toEqual([4, 5]);
 		expect(await readdir(root)).toEqual(["blob"]);
+	});
+
+	it("目录 fsync 在不支持的文件系统上降级跳过，其余错误照常传播", () => {
+		expect(isToleratedDirFsyncError({ code: "EPERM" })).toBe(true);
+		expect(isToleratedDirFsyncError({ code: "EINVAL" })).toBe(true);
+		expect(isToleratedDirFsyncError({ code: "ENOTSUP" })).toBe(true);
+		expect(isToleratedDirFsyncError({ code: "EOPNOTSUPP" })).toBe(true);
+		expect(isToleratedDirFsyncError({ code: "ENOSYS" })).toBe(true);
+		expect(isToleratedDirFsyncError({ code: "EIO" })).toBe(false);
+		expect(isToleratedDirFsyncError(new Error("fsync failed"))).toBe(false);
+		expect(isToleratedDirFsyncError(undefined)).toBe(false);
+	});
+
+	it("win32 上跳过目录 fsync，原子写入仍可完成", async () => {
+		const original = process.platform;
+		Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+		try {
+			const root = await temporaryRoot();
+			const target = join(root, "state.json");
+
+			await writeJsonAtomic(target, { ok: true });
+
+			expect(JSON.parse(await readFile(target, "utf8"))).toEqual({ ok: true });
+			expect(await readdir(root)).toEqual(["state.json"]);
+		} finally {
+			Object.defineProperty(process, "platform", { value: original, configurable: true });
+		}
 	});
 
 	it("内容寻址文件遇到目录目标时不会覆盖该目标", async () => {
