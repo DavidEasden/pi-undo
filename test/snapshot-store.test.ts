@@ -330,6 +330,38 @@ describe("SnapshotStore", () => {
 		expect(manifest.roots[0]?.ignoredPresentPaths).toEqual(["ignored-file", "ignored-link"]);
 	});
 
+	it("ignored 目录内的嵌套仓库折叠为目录项时跳过该项，不阻断 capture", async () => {
+		const repository = await createGitRepo();
+		temporaryRoots.push(repository.root);
+		await runGit(repository.root, ["config", "user.email", "test@example.com"]);
+		await runGit(repository.root, ["config", "user.name", "test"]);
+		await writeFixtureFile(repository.root, ".gitignore", "ignored-repos/\n");
+		await runGit(repository.root, ["add", ".gitignore"]);
+		await runGit(repository.root, ["commit", "-m", "init"]);
+		// git 对 ignored 目录内的嵌套仓库边界输出折叠目录项 "ignored-repos/nested/"。
+		const nested = await createNestedRepo(repository.root, "ignored-repos/nested");
+		temporaryRoots.push(nested.root);
+		await writeFixtureFile(repository.root, "ignored-repos/plain.txt", "ignored\n");
+
+		const topology = await new RootDiscovery().discover(repository.root);
+		const collapsed = await new GitRunner().run(
+			["-c", "core.fsmonitor=false", "ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+			{ cwd: repository.root },
+		);
+		expect(collapsed.stdout.includes("ignored-repos/nested/")).toBe(true);
+
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		const store = new SnapshotStore({ storeRoot });
+
+		const manifest = await store.capture(topology);
+
+		const outerRoot = manifest.roots.find((root) => root.relativeRoot === ".");
+		expect(outerRoot?.ignoredPresentPaths).toContain("ignored-repos/plain.txt");
+		expect(outerRoot?.ignoredPresentPaths?.some((path) => path.startsWith("ignored-repos/nested"))).toBe(false);
+		// 嵌套仓库自身作为独立 root 被捕获。
+		expect(manifest.roots.some((root) => root.relativeRoot === "ignored-repos/nested")).toBe(true);
+	});
+
 	it("轻量可见路径枚举与 complete capture 的受控叶子集合一致", async () => {
 		const workspace = await temporaryRoot("pi-undo-snapshot-");
 		const storeRoot = await temporaryRoot("pi-undo-store-");

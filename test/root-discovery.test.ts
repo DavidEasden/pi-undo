@@ -121,6 +121,25 @@ describe("RootDiscovery", () => {
 		expect(states.get("modules/broken")).toBe("broken");
 	});
 
+	it("gitlink 空目录骨架（如 git worktree 遗留）按未初始化处理，含文件才算 broken", async () => {
+		const outer = await createGitRepo();
+		temporaryRoots.push(outer.root);
+		const empty = await createLocalSubmodule(outer.root, "modules/empty-skeleton");
+		const nested = await createLocalSubmodule(outer.root, "modules/nested-skeleton");
+		temporaryRoots.push(empty.sourceRoot, nested.sourceRoot);
+		await rm(join(empty.root, ".git"), { force: true });
+		await rm(empty.root, { recursive: true, force: true });
+		await mkdir(empty.root, { recursive: true });
+		await rm(nested.root, { recursive: true, force: true });
+		await mkdir(join(nested.root, "left", "right"), { recursive: true });
+
+		const topology = await new RootDiscovery().discover(outer.root);
+		const states = new Map(topology.roots.map((root) => [root.relativeRoot, root.state]));
+
+		expect(states.get("modules/empty-skeleton")).toBe("uninitialized");
+		expect(states.get("modules/nested-skeleton")).toBe("uninitialized");
+	});
+
 	it("initialized submodule 合并父 index 的 gitlinkOid，gitlink 删除会改变 fingerprint", async () => {
 		const outer = await createGitRepo();
 		temporaryRoots.push(outer.root);

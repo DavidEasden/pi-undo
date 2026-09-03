@@ -333,10 +333,35 @@ async function isSafeDirectory(directory: string, workspaceIdentity: string): Pr
 async function gitlinkState(absolutePath: string): Promise<DiscoveryRoot["state"]> {
 	try {
 		await lstat(absolutePath);
-		return "broken";
 	} catch {
 		return "uninitialized";
 	}
+	// git worktree / 部分 checkout 会为 gitlink 留下空目录骨架（可能含指向共享依赖的 symlink）；
+	// 内容寻址快照只跟踪文件，不含任何文件的目录与未初始化等价，避免整个 workspace 无法快照。
+	return (await directoryTreeContainsFile(absolutePath)) ? "broken" : "uninitialized";
+}
+
+const SKELETON_NOISE_FILES = new Set([".DS_Store", "desktop.ini", "Thumbs.db"]);
+
+async function directoryTreeContainsFile(directory: string): Promise<boolean> {
+	let entries;
+	try {
+		entries = await readdir(directory, { withFileTypes: true });
+	} catch {
+		return true;
+	}
+	for (const entry of entries) {
+		if (entry.isDirectory()) {
+			if (await directoryTreeContainsFile(join(directory, entry.name))) return true;
+		} else if (entry.isSymbolicLink() || SKELETON_NOISE_FILES.has(entry.name)) {
+			// symlink 不适随也不计内容：uninitialized 根下的内容不被捕获也不会被 restore 触碰，
+			// 原样保留不会丢失；OS 噪音文件不应让整个 workspace 无法快照。
+			continue;
+		} else {
+			return true;
+		}
+	}
+	return false;
 }
 
 function cleanGitEnvironment(): Readonly<Record<string, string | undefined>> {

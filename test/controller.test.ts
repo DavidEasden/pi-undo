@@ -372,6 +372,7 @@ describe("UndoController", () => {
 
 		expect(await controller.prepareInput("失败轮", { streaming: false })).toEqual({ action: "continue" });
 		expect(controller.captureFailed()).toBe(true);
+		expect(controller.captureFailureReason()).toContain("fsync");
 		// 快照失败时 staged 未建立，settled 不应产生 checkpoint。
 		await controller.beforeAgentStart();
 		await controller.agentSettled();
@@ -379,6 +380,7 @@ describe("UndoController", () => {
 
 		expect(await controller.prepareInput("恢复轮", { streaming: false })).toEqual({ action: "continue" });
 		expect(controller.captureFailed()).toBe(false);
+		expect(controller.captureFailureReason()).toBeUndefined();
 	});
 
 	it("after capture 失败写 barrier 暂停历史，下一次成功 baseline 可重新开始", async () => {

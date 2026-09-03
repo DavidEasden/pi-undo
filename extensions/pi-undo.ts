@@ -254,7 +254,11 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 			}
 			if (result.action === "continue" && active.controller.captureFailed() && !captureFailureNotified) {
 				captureFailureNotified = true;
-				context.ui.notify("pi-undo: pre-input snapshot failed; this run will not be undoable", "warning");
+				const reason = active.controller.captureFailureReason();
+				context.ui.notify(
+					`pi-undo: pre-input snapshot failed${reason === undefined || reason.length === 0 ? "" : ` (${reason})`}; this run will not be undoable`,
+					"warning",
+				);
 			}
 			return result;
 		});

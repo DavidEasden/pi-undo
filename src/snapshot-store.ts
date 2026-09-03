@@ -252,8 +252,9 @@ export class SnapshotStore {
 			const coverage = captureCoverage(topology.workspaceIdentity, scope);
 			const artifactExclusions = captureExclusions(topology.workspaceIdentity, options.excludePaths);
 			await this.assertTopology(topology, "捕获前 topology 已变化");
-			if (topology.roots.some((root) => root.state === "broken")) {
-				throw new SnapshotStoreError("capture_failed", "broken root 不能静默进入快照");
+			const brokenRoots = brokenRootPaths(topology);
+			if (brokenRoots.length > 0) {
+				throw new SnapshotStoreError("capture_failed", `broken root 不能静默进入快照: ${brokenRoots.join(", ")}`);
 			}
 
 			const storeDirectory = this.storeDirectory(topology);
@@ -347,8 +348,9 @@ export class SnapshotStore {
 			}
 			const artifactExclusions = captureExclusions(topology.workspaceIdentity, options.excludePaths);
 			await this.assertTopology(topology, "可见路径枚举前 topology 已变化");
-			if (topology.roots.some((root) => root.state === "broken")) {
-				throw new SnapshotStoreError("capture_failed", "broken root 不能静默进入可见路径枚举");
+			const brokenRoots = brokenRootPaths(topology);
+			if (brokenRoots.length > 0) {
+				throw new SnapshotStoreError("capture_failed", `broken root 不能静默进入可见路径枚举: ${brokenRoots.join(", ")}`);
 			}
 
 			const storeDirectory = this.storeDirectory(topology);
@@ -1572,6 +1574,10 @@ function ignoredPresentProof(coverage: string, ignoredPresentPaths: readonly str
 	};
 }
 
+function brokenRootPaths(topology: Pick<RootTopology, "roots">): string[] {
+	return topology.roots.filter((root) => root.state === "broken").map((root) => root.relativeRoot);
+}
+
 function inactiveRootClosure(root: Pick<RootTopologyIdentity, "relativeRoot" | "state">): string {
 	return checksum(canonicalJson({
 		relativeRoot: root.relativeRoot,
@@ -1879,11 +1885,16 @@ function parseTreeEntries(output: Uint8Array): CapturedTreeEntry[] {
 }
 
 function parseNulPaths(output: Uint8Array): string[] {
-	return splitNulRecords(output).map((record) => {
+	const paths: string[] = [];
+	for (const record of splitNulRecords(output)) {
 		const path = decodeUtf8(record);
+		// git 在嵌套仓库边界会输出折叠的目录项（如 "dir/"）；该目录由 root discovery
+		// 作为独立 root 捕获，不属于本仓库的路径枚举，直接跳过。
+		if (path.endsWith("/")) continue;
 		relativeSafePath("/", path);
-		return path;
-	});
+		paths.push(path);
+	}
+	return paths;
 }
 
 function splitNulRecords(output: Uint8Array): Uint8Array[] {

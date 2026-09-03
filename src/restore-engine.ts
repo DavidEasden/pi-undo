@@ -1661,7 +1661,10 @@ function assertCompatibleManifests(
 		throw new Error("restore manifest 不属于同一 workspace");
 	}
 	if (current.roots.some((root) => root.state === "broken") || target.roots.some((root) => root.state === "broken")) {
-		throw new Error("broken root 不能用于 restore");
+		const brokenRoots = [...current.roots, ...target.roots]
+			.filter((root, index, all) => root.state === "broken" && all.findIndex((candidate) => candidate.relativeRoot === root.relativeRoot) === index)
+			.map((root) => root.relativeRoot);
+		throw new Error(`broken root 不能用于 restore: ${brokenRoots.join(", ")}`);
 	}
 	const scopedCoverage = scope === undefined
 		? undefined

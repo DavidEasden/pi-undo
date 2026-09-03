@@ -147,6 +147,8 @@ export interface UndoController {
 	history(): HistoryState;
 	/** 最近一次输入前快照是否失败（此时本次 run 不可 undo，但输入不受影响）。 */
 	captureFailed(): boolean;
+	/** 最近一次输入前快照失败的原因（截断后的错误消息）；成功时为 undefined。 */
+	captureFailureReason(): string | undefined;
 }
 
 interface StagedRun {
@@ -195,6 +197,7 @@ export class UndoControllerImpl implements UndoController {
 	private promptDeferralInFlight = false;
 	private lastSafetyManifestId: ManifestId | null = null;
 	private lastCaptureFailed = false;
+	private lastCaptureFailureMessage: string | undefined;
 
 	constructor(dependencies: ControllerDependencies, initialState: ControllerInitialState = {}) {
 		this.dependencies = dependencies;
@@ -212,6 +215,10 @@ export class UndoControllerImpl implements UndoController {
 		return this.lastCaptureFailed;
 	}
 
+	captureFailureReason(): string | undefined {
+		return this.lastCaptureFailed ? this.lastCaptureFailureMessage : undefined;
+	}
+
 	listCheckpoints(): readonly CheckpointRecord[] {
 		return [...this.undoStack];
 	}
@@ -224,12 +231,14 @@ export class UndoControllerImpl implements UndoController {
 		try {
 			const before = await this.captureWithWorkspaceLock();
 			this.lastCaptureFailed = false;
+			this.lastCaptureFailureMessage = undefined;
 			this.historyPaused = false;
 			this.staged = { rawPrompt: text, before, sourceLogicalLeaf: this.dependencies.getLogicalLeafId() };
 			return { action: "continue" };
-		} catch {
+		} catch (error) {
 			// 无法证明输入前状态：放弃记录本次历史，但绝不吞掉用户输入。
 			this.lastCaptureFailed = true;
+			this.lastCaptureFailureMessage = truncateReason(error instanceof Error ? error.message : String(error));
 			return { action: "continue" };
 		}
 	}
@@ -853,4 +862,8 @@ class OperationProfiler {
 
 function noop(): OperationResult {
 	return { code: "noop", changedFiles: 0 };
+}
+
+function truncateReason(reason: string): string {
+	return reason.replace(/[\u0000-\u001F\u007F]+/g, " ").trim().slice(0, 120);
 }
