@@ -145,6 +145,8 @@ export interface UndoController {
 	cancelTree?(): Promise<void>;
 	recover(): Promise<void>;
 	history(): HistoryState;
+	/** 后台预热快照缓存：立即返回，失败静默；后续 capture 会先等预热完成。 */
+	warmUp(): void;
 	/** 最近一次输入前快照是否失败（此时本次 run 不可 undo，但输入不受影响）。 */
 	captureFailed(): boolean;
 	/** 最近一次输入前快照失败的原因（截断后的错误消息）；成功时为 undefined。 */
@@ -198,6 +200,7 @@ export class UndoControllerImpl implements UndoController {
 	private lastSafetyManifestId: ManifestId | null = null;
 	private lastCaptureFailed = false;
 	private lastCaptureFailureMessage: string | undefined;
+	private warmUpInFlight: Promise<void> | undefined;
 
 	constructor(dependencies: ControllerDependencies, initialState: ControllerInitialState = {}) {
 		this.dependencies = dependencies;
@@ -213,6 +216,17 @@ export class UndoControllerImpl implements UndoController {
 
 	captureFailed(): boolean {
 		return this.lastCaptureFailed;
+	}
+
+	warmUp(): void {
+		if (this.locked || this.warmUpInFlight !== undefined) return;
+		this.warmUpInFlight = (async () => {
+			try {
+				await this.captureWithWorkspaceLock();
+			} catch {
+				// 预热是 best-effort：失败静默，正式 capture 会再次尝试并上报。
+			}
+		})();
 	}
 
 	captureFailureReason(): string | undefined {
@@ -677,6 +691,10 @@ export class UndoControllerImpl implements UndoController {
 	}
 
 	private async captureWithWorkspaceLock(): Promise<SnapshotManifest> {
+		// 预热可能仍持有 workspace lock：先等它完成再 acquire，避免排队超时；
+		// 此时进程内缓存已暖，本次 capture 只需指纹校验。
+		const warmUp = this.warmUpInFlight;
+		if (warmUp !== undefined) await warmUp;
 		const lease = await this.dependencies.acquireWorkspaceLock();
 		try {
 			return await this.dependencies.capture();

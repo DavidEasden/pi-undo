@@ -359,6 +359,57 @@ describe("UndoController", () => {
 		expect(controller.history()).toEqual({ undoCount: 0, redoCount: 0, locked: false });
 	});
 
+	it("warmUp 后台预热不产生历史，prompt capture 会先等预热完成", async () => {
+		const events: string[] = [];
+		let captures = 0;
+		const deps = dependencies({
+			acquireWorkspaceLock: async () => {
+				events.push("acquire");
+				return { release: async () => { events.push("release"); } };
+			},
+			capture: async () => {
+				captures += 1;
+				events.push(`capture:${captures}`);
+				return manifest(captures === 1 ? "a" : "c");
+			},
+		});
+		const controller = new UndoControllerImpl(deps);
+
+		controller.warmUp();
+		await new Promise((resolve) => setImmediate(resolve));
+
+		expect(captures).toBe(1);
+		expect(controller.history()).toEqual({ undoCount: 0, redoCount: 0, locked: false });
+		expect(controller.captureFailed()).toBe(false);
+
+		await controller.prepareInput("预热后的首条 prompt", { streaming: false });
+
+		expect(captures).toBe(2);
+		expect(events.filter((event) => event.startsWith("capture:"))).toEqual(["capture:1", "capture:2"]);
+		expect(events.indexOf("release")).toBeLessThan(events.lastIndexOf("acquire"));
+	});
+
+	it("warmUp 失败静默且不设置 captureFailed，后续 capture 正常进行", async () => {
+		let captures = 0;
+		const deps = dependencies({
+			capture: async () => {
+				captures += 1;
+				if (captures === 1) throw new Error("warmup failed");
+				return manifest("a");
+			},
+		});
+		const controller = new UndoControllerImpl(deps);
+
+		controller.warmUp();
+		await new Promise((resolve) => setImmediate(resolve));
+
+		expect(captures).toBe(1);
+		expect(controller.captureFailed()).toBe(false);
+		expect(await controller.prepareInput("正常轮", { streaming: false })).toEqual({ action: "continue" });
+		expect(captures).toBe(2);
+		expect(controller.captureFailed()).toBe(false);
+	});
+
 	it("输入前快照失败时 fail-open 且 captureFailed 可观测，成功后复位", async () => {
 		let captures = 0;
 		const deps = dependencies({

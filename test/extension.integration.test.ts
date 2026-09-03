@@ -36,7 +36,7 @@ function deferredPromptHarness() {
 	const controller = {
 		history: () => ({ undoCount: 1, redoCount: 0, locked }),
 		listCheckpoints: () => [],
-		recover: async () => {}, captureFailed: () => false, captureFailureReason: () => undefined,
+		recover: async () => {}, captureFailed: () => false, captureFailureReason: () => undefined, warmUp: () => {},
 		prepareInput: async () => ({ action: operationInFlight ? "defer" as const : "continue" as const }),
 		beforeAgentStart: async () => {},
 		agentSettled: async () => {},
@@ -122,7 +122,7 @@ describe("pi-undo extension", () => {
 				controller: {
 					history: () => ({ undoCount: 1, redoCount: 0, locked: false }),
 					listCheckpoints: () => [],
-					recover: async () => {}, captureFailed: () => false, captureFailureReason: () => undefined,
+					recover: async () => {}, captureFailed: () => false, captureFailureReason: () => undefined, warmUp: () => {},
 					prepareInput: async () => ({
 						action: runtimeGeneration === 1 && oldOperationInFlight ? "defer" as const : "continue" as const,
 					}),
@@ -290,7 +290,7 @@ describe("pi-undo extension", () => {
 			controller: {
 				history: () => ({ undoCount: 0, redoCount: 0, locked: false }),
 				listCheckpoints: () => [],
-				recover: async () => {}, captureFailed: () => false, captureFailureReason: () => undefined,
+				recover: async () => {}, captureFailed: () => false, captureFailureReason: () => undefined, warmUp: () => {},
 				prepareInput: async () => ({ action: "continue" as const }),
 				beforeAgentStart: async () => {},
 				agentSettled: async () => {},
@@ -337,7 +337,7 @@ describe("pi-undo extension", () => {
 			controller: {
 				history: () => ({ undoCount: 0, redoCount: 1, locked: false }),
 				listCheckpoints: () => [],
-				recover: async () => {}, captureFailed: () => false, captureFailureReason: () => undefined,
+				recover: async () => {}, captureFailed: () => false, captureFailureReason: () => undefined, warmUp: () => {},
 				prepareInput: async () => ({ action: "continue" as const }),
 				beforeAgentStart: async () => {},
 				agentSettled: async () => {},
@@ -400,7 +400,7 @@ describe("pi-undo extension", () => {
 			controller: {
 				history: () => ({ undoCount: 1, redoCount: 0, locked: false }),
 				listCheckpoints: () => [checkpoint as any],
-				recover: async () => {}, captureFailed: () => false, captureFailureReason: () => undefined, prepareInput: async () => ({ action: "continue" as const }),
+				recover: async () => {}, captureFailed: () => false, captureFailureReason: () => undefined, warmUp: () => {}, prepareInput: async () => ({ action: "continue" as const }),
 				beforeAgentStart: async () => {}, agentSettled: async () => {},
 				undo: async () => ({ code: "noop" as const, changedFiles: 0 }),
 				redo: async () => ({ code: "noop" as const, changedFiles: 0 }),
@@ -436,7 +436,7 @@ describe("pi-undo extension", () => {
 		} as unknown as ExtensionAPI;
 		createPiUndoExtension(async () => ({
 			controller: {
-				history: () => ({ undoCount: 0, redoCount: 0, locked: false }), listCheckpoints: () => [], recover: async () => {}, captureFailed: () => false, captureFailureReason: () => undefined,
+				history: () => ({ undoCount: 0, redoCount: 0, locked: false }), listCheckpoints: () => [], recover: async () => {}, captureFailed: () => false, captureFailureReason: () => undefined, warmUp: () => {},
 				prepareInput: async () => ({ action: "continue" as const }), beforeAgentStart: async () => {}, agentSettled: async () => {},
 				undo: async () => ({ code: "noop" as const, changedFiles: 0 }), redo: async () => ({ code: "noop" as const, changedFiles: 0 }),
 				beforeTree: async () => undefined, afterTree: async () => {},

@@ -65,6 +65,8 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 				const history = next.controller.history();
 				if (history.locked) next.reporter.setRecoveryRequired("pending journal", next.recovery);
 				else next.reporter.setReady(history.undoCount, history.redoCount);
+				// 后台预热快照缓存，把新会话首次冷 capture 移出第一条 prompt 的关键路径。
+				next.controller.warmUp();
 			} catch (error) {
 				if (currentGeneration !== generation) return;
 				runtime = undefined;
