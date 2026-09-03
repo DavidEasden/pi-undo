@@ -269,6 +269,67 @@ describe("SnapshotStore", () => {
 		expect((await readdir(workspace)).sort()).toEqual(["file.txt"]);
 	});
 
+	it("叶子指纹缓存持久化后跨实例复用，新进程首次 capture 不再全量 hash", async () => {
+		const repository = await createGitRepo();
+		temporaryRoots.push(repository.root);
+		await writeFixtureFile(repository.root, "a.txt", "内容A\n");
+		await writeFixtureFile(repository.root, "nested/b.txt", "内容B\n");
+		await runGit(repository.root, ["add", "a.txt", "nested/b.txt"]);
+		await runGit(repository.root, ["commit", "-m", "init"]);
+		// 避开 RACY_CLEAN_WINDOW_NS：文件 mtime 与首次验证时刻需相隔 2s 以上，
+		// 否则缓存条目会被判 racy 而强制重算（生产环境跨会话间隔远超窗口）。
+		await new Promise((resolve) => setTimeout(resolve, 2100));
+		const topology = await new RootDiscovery().discover(repository.root);
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+
+		// 实例 1（冷）：正常 hash 并把指纹缓存落盘。
+		const firstGit = new RecordingGitRunner();
+		const first = new SnapshotStore({ storeRoot, git: firstGit });
+		const firstManifest = await first.capture(topology);
+		expect(firstGit.calls.some((call) => call.args[0] === "hash-object")).toBe(true);
+
+		// 实例 2（模拟新进程）：加载持久化缓存后不再 hash，且快照内容一致。
+		const secondGit = new RecordingGitRunner();
+		const second = new SnapshotStore({ storeRoot, git: secondGit });
+		const secondManifest = await second.capture(topology);
+		expect(secondGit.calls.some((call) => call.args[0] === "hash-object")).toBe(false);
+		expect(secondManifest.roots[0]?.treeId).toBe(firstManifest.roots[0]?.treeId);
+
+		// 修改单个文件后：仅该文件重新 hash。
+		await writeFixtureFile(repository.root, "a.txt", "修改后\n");
+		const thirdGit = new RecordingGitRunner();
+		const third = new SnapshotStore({ storeRoot, git: thirdGit });
+		const thirdManifest = await third.capture(topology);
+		const hashedPaths = thirdGit.calls
+			.filter((call) => call.args[0] === "hash-object" && call.args.includes("--no-filters"))
+			.flatMap((call) => call.args.slice(call.args.indexOf("--") + 1));
+		expect(hashedPaths).toContain("a.txt");
+		expect(hashedPaths).not.toContain("nested/b.txt");
+		expect(thirdManifest.roots[0]?.treeId).not.toBe(firstManifest.roots[0]?.treeId);
+	});
+
+	it("损坏的 leaf-cache.json 被忽略，capture 正常走冷路径", async () => {
+		const repository = await createGitRepo();
+		temporaryRoots.push(repository.root);
+		await writeFixtureFile(repository.root, "file.txt", "内容\n");
+		await runGit(repository.root, ["add", "file.txt"]);
+		await runGit(repository.root, ["commit", "-m", "init"]);
+		const topology = await new RootDiscovery().discover(repository.root);
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+
+		const seed = new SnapshotStore({ storeRoot });
+		await seed.capture(topology);
+		const storesDirectory = join(storeRoot, "stores");
+		const storeDirectory = join(storesDirectory, (await readdir(storesDirectory))[0]!);
+		await writeFile(join(storeDirectory, "leaf-cache.json"), "{invalid json", "utf8");
+
+		const git = new RecordingGitRunner();
+		const store = new SnapshotStore({ storeRoot, git });
+		const manifest = await store.capture(topology);
+		expect(git.calls.some((call) => call.args[0] === "hash-object")).toBe(true);
+		expect(manifest.coverage).toBe("complete");
+	});
+
 	it("捕获 synthetic workspace 的文件、模式、二进制、大文件和 symlink，并排除 ignored", async () => {
 		const workspace = await temporaryRoot("pi-undo-snapshot-");
 		const storeRoot = await temporaryRoot("pi-undo-store-");

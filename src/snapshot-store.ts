@@ -3,7 +3,7 @@ import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, stat 
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
-import { fsyncDirectory, writeContentAddressed, writeJsonAtomic } from "./atomic-fs.ts";
+import { fsyncDirectory, writeBytesAtomic, writeContentAddressed, writeJsonAtomic } from "./atomic-fs.ts";
 import {
 	assertManifest,
 	canonicalJson,
@@ -47,6 +47,7 @@ const BLOB_CACHE_MAX_BYTES = 128 * 1024 * 1024;
 const BLOB_BATCH_MAX_BYTES = 16 * 1024 * 1024;
 const BLOB_BATCH_MAX_ENTRIES = process.platform === "win32" ? 256 : 2_048;
 const RACY_CLEAN_WINDOW_NS = 2_000_000_000n;
+const LEAF_CACHE_FILE = "leaf-cache.json";
 
 interface PinRecord {
 	readonly schemaVersion: 1;
@@ -119,6 +120,22 @@ interface CachedBlob {
 	size: number;
 }
 
+/** 持久化叶子缓存文件（storeDirectory/leaf-cache.json），schema 不匹配时整体忽略。 */
+interface PersistedLeafCacheFile {
+	readonly schemaVersion: 1;
+	readonly entries: Readonly<Record<string, Readonly<Record<string, PersistedLeafCacheEntry>>>>;
+}
+
+interface PersistedLeafCacheEntry {
+	readonly kind: "file" | "symlink";
+	readonly mode: number;
+	readonly fingerprint: string;
+	readonly cacheable: boolean;
+	readonly objectId: string;
+	readonly changedAtNs: string;
+	readonly verifiedAtNs: string;
+}
+
 export interface SnapshotStoreOptions {
 	readonly storeRoot?: string;
 	readonly git?: GitRunner;
@@ -184,6 +201,7 @@ export class SnapshotStore {
 	private readonly treeBlobMembership = new Map<string, string>();
 	private readonly blobCache = new Map<string, CachedBlob>();
 	private readonly visibleLeafCache = new Map<string, Map<string, CachedVisibleLeaf>>();
+	private readonly leafCacheDirectoriesLoaded = new Set<string>();
 	private blobCacheBytes = 0;
 
 	constructor(options: SnapshotStoreOptions = {}) {
@@ -258,6 +276,8 @@ export class SnapshotStore {
 			}
 
 			const storeDirectory = this.storeDirectory(topology);
+			// 新进程首次 capture 时从磁盘加载叶子指纹缓存，避免全量重新 hash。
+			await this.loadPersistedLeafCache(storeDirectory);
 			const transactionsRoot = join(storeDirectory, "transactions");
 			await mkdir(transactionsRoot, { recursive: true });
 			transactionDirectory = await mkdtemp(join(transactionsRoot, "capture-"));
@@ -315,6 +335,8 @@ export class SnapshotStore {
 			await writeContentAddressed(manifestPath, Buffer.from(canonicalJson(manifest), "utf8"));
 			this.manifestLocations.set(manifestId, manifestPath);
 			for (const update of cacheUpdates) this.rememberVisibleLeaves(update);
+			// 指纹缓存落盘：让下一个进程（新会话）的首次 capture 跳过全量内容 hash。
+			await this.persistLeafCache(storeDirectory);
 			return manifest;
 		} catch (error) {
 			if (error instanceof SnapshotStoreError) {
@@ -958,6 +980,69 @@ export class SnapshotStore {
 			cache.set(leaf.relativePath, { ...leaf, objectId, verifiedAtNs: staged.verifiedAtNs });
 		}
 		this.visibleLeafCache.set(gitDirectory, cache);
+	}
+
+	/** 从 storeDirectory 读取持久化叶子缓存并合并进内存；进程内已有条目优先。 */
+	private async loadPersistedLeafCache(storeDirectory: string): Promise<void> {
+		if (this.leafCacheDirectoriesLoaded.has(storeDirectory)) return;
+		this.leafCacheDirectoriesLoaded.add(storeDirectory);
+		let file: unknown;
+		try {
+			file = JSON.parse(await readFile(join(storeDirectory, LEAF_CACHE_FILE), "utf8"));
+		} catch {
+			return; // 缺失或损坏：忽略，本次 capture 走冷路径并重建缓存。
+		}
+		if (!isPersistedLeafCacheFile(file)) return;
+		const prefix = `${storeDirectory}${sep}`;
+		for (const [gitDirectory, entries] of Object.entries(file.entries)) {
+			if (!gitDirectory.startsWith(prefix) || this.visibleLeafCache.has(gitDirectory)) continue;
+			const cache = new Map<string, CachedVisibleLeaf>();
+			for (const [relativePath, entry] of Object.entries(entries)) {
+				cache.set(relativePath, {
+					relativePath,
+					kind: entry.kind,
+					mode: entry.mode,
+					fingerprint: entry.fingerprint,
+					cacheable: entry.cacheable,
+					changedAtNs: BigInt(entry.changedAtNs),
+					objectId: entry.objectId,
+					verifiedAtNs: BigInt(entry.verifiedAtNs),
+				});
+			}
+			this.visibleLeafCache.set(gitDirectory, cache);
+		}
+	}
+
+	/** 把当前 storeDirectory 范围内的叶子缓存原子写入磁盘（best-effort）。 */
+	private async persistLeafCache(storeDirectory: string): Promise<void> {
+		const prefix = `${storeDirectory}${sep}`;
+		const entries: Record<string, Record<string, PersistedLeafCacheEntry>> = {};
+		for (const [gitDirectory, cache] of this.visibleLeafCache) {
+			if (!gitDirectory.startsWith(prefix)) continue;
+			const rootEntries: Record<string, PersistedLeafCacheEntry> = {};
+			for (const [relativePath, leaf] of cache) {
+				rootEntries[relativePath] = {
+					kind: leaf.kind,
+					mode: leaf.mode,
+					fingerprint: leaf.fingerprint,
+					cacheable: leaf.cacheable,
+					objectId: leaf.objectId,
+					changedAtNs: leaf.changedAtNs.toString(),
+					verifiedAtNs: leaf.verifiedAtNs.toString(),
+				};
+			}
+			entries[gitDirectory] = rootEntries;
+		}
+		try {
+			// 用普通 JSON 序列化（非 canonicalJson）：缓存只在本机消费，避免大规模排序开销。
+			await writeBytesAtomic(
+				join(storeDirectory, LEAF_CACHE_FILE),
+				Buffer.from(JSON.stringify({ schemaVersion: 1, entries }), "utf8"),
+				0o600,
+			);
+		} catch {
+			// 缓存写入是 best-effort：失败只影响下次性能，不影响正确性。
+		}
 	}
 
 	private async assertVisibleLeavesUnchanged(
@@ -1790,6 +1875,33 @@ function nativeVisibleLeafMetadata(entry: NativeMetadataEntry): VisibleLeafMetad
 		mtimeNs: entry.mtimeNs,
 		ctimeNs: entry.ctimeNs,
 	};
+}
+
+function isPersistedLeafCacheFile(value: unknown): value is PersistedLeafCacheFile {
+	if (typeof value !== "object" || value === null) return false;
+	const file = value as { schemaVersion?: unknown; entries?: unknown };
+	if (file.schemaVersion !== 1 || typeof file.entries !== "object" || file.entries === null) return false;
+	for (const entries of Object.values(file.entries as Record<string, unknown>)) {
+		if (typeof entries !== "object" || entries === null) return false;
+		for (const entry of Object.values(entries as Record<string, unknown>)) {
+			if (typeof entry !== "object" || entry === null) return false;
+			const candidate = entry as Partial<PersistedLeafCacheEntry>;
+			if (
+				(candidate.kind !== "file" && candidate.kind !== "symlink") ||
+				typeof candidate.mode !== "number" ||
+				typeof candidate.fingerprint !== "string" ||
+				typeof candidate.cacheable !== "boolean" ||
+				typeof candidate.objectId !== "string" ||
+				typeof candidate.changedAtNs !== "string" ||
+				typeof candidate.verifiedAtNs !== "string" ||
+				!/^[0-9]+$/.test(candidate.changedAtNs) ||
+				!/^[0-9]+$/.test(candidate.verifiedAtNs)
+			) {
+				return false;
+			}
+		}
+	}
+	return true;
 }
 
 function visibleLeafFingerprint(metadata: VisibleLeafMetadata): string {
