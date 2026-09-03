@@ -350,12 +350,12 @@ describe("UndoController", () => {
 		expect(checkpointData).toMatchObject({ startEntryId: "start-1", userEntryId: "user-1" });
 	});
 
-	it("streaming 输入不建立新 boundary，before capture 失败会 handled 但允许重试", async () => {
+	it("before capture 失败时放行输入且不记录历史", async () => {
 		const deps = dependencies({ capture: async () => { throw new Error("snapshot failed"); } });
 		const controller = new UndoControllerImpl(deps);
 
 		expect(await controller.prepareInput("继续", { streaming: true })).toEqual({ action: "continue" });
-		expect(await controller.prepareInput("新的", { streaming: false })).toEqual({ action: "handled" });
+		expect(await controller.prepareInput("新的", { streaming: false })).toEqual({ action: "continue" });
 		expect(controller.history()).toEqual({ undoCount: 0, redoCount: 0, locked: false });
 	});
 
@@ -702,7 +702,7 @@ describe("UndoController", () => {
 		expect(controller.history().locked).toBe(true);
 	});
 
-	it("事务进入 recovery lock 但尚未退出时仍 defer 输入，退出后才 handled", async () => {
+	it("事务进入 recovery lock 但尚未退出时仍 defer 输入，退出后放行输入", async () => {
 		let markRecoveryPhase: (() => void) | undefined;
 		let releaseRecoveryPhase: (() => void) | undefined;
 		const recoveryPhase = new Promise<void>((resolve) => { markRecoveryPhase = resolve; });
@@ -726,7 +726,7 @@ describe("UndoController", () => {
 		expect(await controller.prepareInput("不要丢失", { streaming: false })).toEqual({ action: "defer" });
 		releaseRecoveryPhase!();
 		expect((await undo).code).toBe("recovery_required");
-		expect(await controller.prepareInput("不要丢失", { streaming: false })).toEqual({ action: "handled" });
+		expect(await controller.prepareInput("不要丢失", { streaming: false })).toEqual({ action: "continue" });
 	});
 
 	it("SESSION_MOVED journal 持久化 observed logical leaf", async () => {
@@ -786,7 +786,7 @@ describe("UndoController", () => {
 		expect(restoreOpIds).toEqual(cursorOpIds);
 	});
 
-	it("恢复失败时尝试回滚；回滚失败进入 recovery lock 并拒绝新 prompt", async () => {
+	it("恢复失败时尝试回滚；回滚失败进入 recovery lock 但放行新 prompt", async () => {
 		let restores = 0;
 		const deps = dependencies({
 			applyRestore: async () => {
@@ -802,7 +802,7 @@ describe("UndoController", () => {
 		await controller.agentSettled();
 
 		expect(await controller.undo()).toMatchObject({ code: "recovery_required" });
-		expect(await controller.prepareInput("下一条", { streaming: false })).toEqual({ action: "handled" });
+		expect(await controller.prepareInput("下一条", { streaming: false })).toEqual({ action: "continue" });
 	});
 
 	it("streaming tree 只请求 abort 并取消，不发生文件恢复", async () => {
@@ -820,7 +820,7 @@ describe("UndoController", () => {
 		const controller = new UndoControllerImpl(deps);
 
 		expect(await controller.beforeTree({ targetLeafId: "requested-entry" })).toBeUndefined();
-		expect(await controller.prepareInput("tree 期间输入", { streaming: false })).toEqual({ action: "handled" });
+		expect(await controller.prepareInput("tree 期间输入", { streaming: false })).toEqual({ action: "defer" });
 		expect(deps.calls).toEqual(["capture", "prepare"]);
 		await controller.afterTree({ newLeafId: "tree-leaf" });
 

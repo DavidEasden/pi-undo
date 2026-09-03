@@ -213,7 +213,7 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 		pi.on("session_start", async (_event: unknown, context: ExtensionContext) => initialize(context));
 		pi.on("input", async (event: InputEvent, context: ExtensionContext) => {
 			const active = runtime;
-			if (active === undefined) return { action: "handled" as const };
+			if (active === undefined) return { action: "continue" as const };
 			const result = await active.controller.prepareInput(event.text, {
 				streaming: event.streamingBehavior !== undefined,
 			});
@@ -286,11 +286,16 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 			return result;
 		});
 		pi.on("session_tree", async (event: PiSessionTreeEvent) => {
-			if (runtime?.isInternalNavigation?.()) return;
-			await runtime?.controller.afterTree({
+			const active = runtime;
+			if (active?.isInternalNavigation?.()) return;
+			const treeGeneration = generation;
+			await active?.controller.afterTree({
 				newLeafId: event.newLeafId,
 				navigationTargetLeafId: event.summaryEntry?.parentId ?? event.newLeafId,
 			});
+			if (active !== undefined && runtime === active && generation === treeGeneration) {
+				resumeDeferredPrompts(active, treeGeneration, "session state ambiguous");
+			}
 		});
 		pi.on("session_shutdown", async () => {
 			generation += 1;

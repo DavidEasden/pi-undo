@@ -37,7 +37,7 @@ function deferredPromptHarness() {
 		history: () => ({ undoCount: 1, redoCount: 0, locked }),
 		listCheckpoints: () => [],
 		recover: async () => {},
-		prepareInput: async () => ({ action: operationInFlight ? "defer" as const : locked ? "handled" as const : "continue" as const }),
+		prepareInput: async () => ({ action: operationInFlight ? "defer" as const : "continue" as const }),
 		beforeAgentStart: async () => {},
 		agentSettled: async () => {},
 		undo: runOperation,
@@ -164,6 +164,29 @@ describe("pi-undo extension", () => {
 		expect(generation).toBe(2);
 		expect(notifications).toEqual([]);
 		expect(sent).toEqual([]);
+	});
+
+	it("runtime 未初始化时放行输入而不是吞掉（回归测试）", async () => {
+		const handlers = new Map<string, (event: any, context: any) => any>();
+		const pi = {
+			registerCommand() {},
+			on(name: string, handler: (event: any, eventContext: any) => any) { handlers.set(name, handler); },
+		} as unknown as ExtensionAPI;
+		const context = {
+			mode: "tui" as const,
+			ui: {
+				setStatus: () => {},
+				notify: () => {},
+				getEditorText: () => "",
+				setEditorText: () => {},
+			},
+		};
+		createPiUndoExtension(async () => {
+			throw new Error("runtime factory must not be invoked");
+		})(pi);
+
+		expect(await handlers.get("input")!({ text: "你好", source: "interactive" }, context))
+			.toEqual({ action: "continue" });
 	});
 
 	it("undo 期间暂存文本、文件引用与图片，并在完成后按 agent_settled 串行重放", async () => {

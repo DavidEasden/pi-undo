@@ -211,7 +211,8 @@ export class UndoControllerImpl implements UndoController {
 
 	async prepareInput(text: string, context: InputContext): Promise<InputEventResult> {
 		if (this.promptDeferralInFlight) return { action: "defer" };
-		if (this.locked || this.operationInFlight) return { action: "handled" };
+		if (this.locked) return { action: "continue" };
+		if (this.operationInFlight) return { action: "defer" };
 		if (context.streaming || text.length === 0) return { action: "continue" };
 		try {
 			const before = await this.captureWithWorkspaceLock();
@@ -219,8 +220,8 @@ export class UndoControllerImpl implements UndoController {
 			this.staged = { rawPrompt: text, before, sourceLogicalLeaf: this.dependencies.getLogicalLeafId() };
 			return { action: "continue" };
 		} catch {
-			// 无法证明输入前状态时保留编辑器输入；本轮尚未开始，可由用户直接重试。
-			return { action: "handled" };
+			// 无法证明输入前状态：放弃记录本次历史，但绝不吞掉用户输入。
+			return { action: "continue" };
 		}
 	}
 
