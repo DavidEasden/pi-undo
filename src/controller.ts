@@ -37,6 +37,7 @@ export interface ControllerDependencies {
 	readonly appendControl: (customType: string, data?: unknown) => Promise<string | null>;
 	readonly appendCursor: (cursor: CursorState) => Promise<CursorAppendResult>;
 	readonly capture: (scopePaths?: readonly string[]) => Promise<SnapshotManifest>;
+	readonly captureBaseline?: (baseline: SnapshotManifest) => Promise<SnapshotManifest>;
 	readonly captureSafety?: (
 		referenceManifestId: ManifestId,
 		targetManifestId: ManifestId,
@@ -170,6 +171,7 @@ export interface ControllerInitialState {
 	readonly redoStack?: readonly ControllerRedoEntry[];
 	readonly historyPaused?: boolean;
 	readonly locked?: boolean;
+	readonly recoveryCompleted?: boolean;
 }
 
 interface PendingTree {
@@ -201,6 +203,9 @@ export class UndoControllerImpl implements UndoController {
 	private lastCaptureFailed = false;
 	private lastCaptureFailureMessage: string | undefined;
 	private warmUpInFlight: Promise<void> | undefined;
+	private warmUpManifest: SnapshotManifest | undefined;
+	private recoveryInFlight: Promise<void> | undefined;
+	private recoveryCompleted = false;
 
 	constructor(dependencies: ControllerDependencies, initialState: ControllerInitialState = {}) {
 		this.dependencies = dependencies;
@@ -208,6 +213,7 @@ export class UndoControllerImpl implements UndoController {
 		this.redoStack.push(...(initialState.redoStack ?? []));
 		this.historyPaused = initialState.historyPaused ?? false;
 		this.locked = initialState.locked ?? false;
+		this.recoveryCompleted = initialState.recoveryCompleted ?? false;
 	}
 
 	history(): HistoryState {
@@ -222,7 +228,7 @@ export class UndoControllerImpl implements UndoController {
 		if (this.locked || this.warmUpInFlight !== undefined) return;
 		this.warmUpInFlight = (async () => {
 			try {
-				await this.captureWithWorkspaceLock();
+				this.warmUpManifest = await this.captureWithWorkspaceLock();
 			} catch {
 				// 预热是 best-effort：失败静默，正式 capture 会再次尝试并上报。
 			}
@@ -243,7 +249,14 @@ export class UndoControllerImpl implements UndoController {
 		if (this.operationInFlight) return { action: "defer" };
 		if (context.streaming || text.length === 0) return { action: "continue" };
 		try {
-			const before = await this.captureWithWorkspaceLock();
+			// warm-up 仍在进行时先等待，确保随后可以消费已完成的 baseline，而不是再次完整 capture。
+			const warmUp = this.warmUpInFlight;
+			if (warmUp !== undefined) await warmUp;
+			const warmUpManifest = this.warmUpManifest;
+			this.warmUpManifest = undefined;
+			const before = warmUpManifest !== undefined && this.dependencies.captureBaseline !== undefined
+				? await this.captureBaselineWithWorkspaceLock(warmUpManifest)
+				: await this.captureWithWorkspaceLock();
 			this.lastCaptureFailed = false;
 			this.lastCaptureFailureMessage = undefined;
 			this.historyPaused = false;
@@ -434,12 +447,24 @@ export class UndoControllerImpl implements UndoController {
 	}
 
 	async recover(): Promise<void> {
-		try {
-			const result = await this.dependencies.recoverPending();
-			if (result.kind === "locked") this.locked = true;
-		} catch {
-			this.locked = true;
+		if (this.recoveryCompleted) return;
+		const recoveryInFlight = this.recoveryInFlight;
+		if (recoveryInFlight !== undefined) {
+			await recoveryInFlight;
+			return;
 		}
+		const recovery = (async (): Promise<void> => {
+			try {
+				const result = await this.dependencies.recoverPending();
+				if (result.kind === "locked") this.locked = true;
+			} catch {
+				this.locked = true;
+			} finally {
+				this.recoveryCompleted = true;
+			}
+		})();
+		this.recoveryInFlight = recovery;
+		await recovery;
 	}
 
 	private async runOperation(action: "undo" | "redo"): Promise<OperationResult> {
@@ -698,6 +723,17 @@ export class UndoControllerImpl implements UndoController {
 		const lease = await this.dependencies.acquireWorkspaceLock();
 		try {
 			return await this.dependencies.capture();
+		} finally {
+			await lease.release();
+		}
+	}
+
+	private async captureBaselineWithWorkspaceLock(baseline: SnapshotManifest): Promise<SnapshotManifest> {
+		const captureBaseline = this.dependencies.captureBaseline;
+		if (captureBaseline === undefined) return this.captureWithWorkspaceLock();
+		const lease = await this.dependencies.acquireWorkspaceLock();
+		try {
+			return await captureBaseline(baseline);
 		} finally {
 			await lease.release();
 		}

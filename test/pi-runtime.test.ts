@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { canonicalJson, checksum } from "../src/encoding.ts";
 import type { CheckpointRecord, CursorState, ManifestId, SessionFileIdentity } from "../src/model.ts";
 import { createPiUndoRuntime } from "../src/pi-runtime.ts";
+import { JournalRecovery } from "../src/recovery.ts";
 import { RestoreEngine } from "../src/restore-engine.ts";
 
 const temporaryRoots: string[] = [];
@@ -56,6 +57,18 @@ describe("Pi runtime restart", () => {
 		const runtime = await createPiUndoRuntime(fixture.context as any, fixture.pi as any);
 
 		expect(runtime.controller.history()).toEqual({ undoCount: 1, redoCount: 0, locked: false });
+	});
+
+	it("runtime 启动阶段完成 recovery 后 controller.recover 不重复执行", async () => {
+		const fixture = await runtimeFixture("checkpoint");
+		const recovery = vi.spyOn(JournalRecovery.prototype, "recover");
+		try {
+			const runtime = await createPiUndoRuntime(fixture.context as any, fixture.pi as any);
+			await runtime.controller.recover();
+			expect(recovery).toHaveBeenCalledTimes(1);
+		} finally {
+			recovery.mockRestore();
+		}
 	});
 });
 

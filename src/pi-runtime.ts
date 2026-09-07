@@ -14,7 +14,7 @@ import {
 import { finalizeDurablePack, hasDurablePack, loadDurablePack } from "./durable-pack.ts";
 import { assertCursor, canonicalJson, checksum, sameWorkspaceSnapshot } from "./encoding.ts";
 import { JournalStore, finalizeCursorMarker, inspectCursorMarkers } from "./journal.ts";
-import type { CheckpointRecord, ManifestId, SessionFileIdentity } from "./model.ts";
+import type { CheckpointRecord, ManifestId, SessionFileIdentity, SnapshotManifest } from "./model.ts";
 import {
 	cleanupPackedMutations,
 	materializePackedMutationJournal,
@@ -50,7 +50,14 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 		if (topology.workspaceIdentity !== initialTopology.workspaceIdentity) {
 			throw new Error("workspace identity 已变化");
 		}
-		return store.capture(topology, scopePaths);
+		return store.capture(topology, scopePaths, { topologyAlreadyValidated: true });
+	};
+	const captureBaseline = async (baseline: SnapshotManifest) => {
+		const topology = await discovery.discover(context.cwd);
+		if (topology.workspaceIdentity !== initialTopology.workspaceIdentity) {
+			throw new Error("workspace identity 已变化");
+		}
+		return store.captureBaseline(topology, baseline, undefined, { topologyAlreadyValidated: true });
 	};
 	const recovery = new JournalRecovery({
 		sessionIdentity,
@@ -214,6 +221,7 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 		appendControl: async (customType, data) => appendControlEntry(pi, manager, customType, data),
 		appendCursor: async (cursor) => cursorWriter.appendCursor(cursor, pi, sourceFor(manager)),
 		capture,
+		captureBaseline,
 		captureSafety: async (referenceManifestId, targetManifestId, scopePaths) => {
 			const [reference, target] = await Promise.all([
 				store.loadManifest(referenceManifestId),
@@ -251,6 +259,7 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 	const controller = new UndoControllerImpl(dependencies, {
 		...rebuildControllerState(manager, sessionIdentity),
 		locked: startupRecovery.kind === "locked",
+		recoveryCompleted: true,
 	});
 	return {
 		controller,
