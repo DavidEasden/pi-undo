@@ -40,7 +40,7 @@ const HASH_BATCH_MAX_ARGUMENT_BYTES = process.platform === "win32" ? 24 * 1024 :
 const HASH_BATCH_CONCURRENCY = 4;
 const ROOT_CAPTURE_CONCURRENCY = 4;
 const FILE_SYSTEM_INSPECTION_CONCURRENCY = 32;
-const IGNORED_METADATA_BATCH_SIZE = 1_024;
+const METADATA_BATCH_SIZE = 1_024;
 const INDEX_BATCH_MAX_ENTRIES = 4_096;
 const INDEX_BATCH_MAX_BYTES = 8 * 1024 * 1024;
 const BLOB_CACHE_MAX_BYTES = 128 * 1024 * 1024;
@@ -1010,7 +1010,7 @@ export class SnapshotStore {
 		}
 		// ignored build/vendor trees 常含数万叶子；复用同一批量 metadata 协议，避免逐路径重复
 		// 遍历父目录。Native 与 fallback 都在叶子扫描前后复核共享父目录。
-		const nativeEntries = await this.inspectIgnoredMetadataBatches(cwd, candidates, requestDirectory);
+		const nativeEntries = await this.inspectNativeMetadataBatches(cwd, candidates, requestDirectory);
 		const kinds = nativeEntries === undefined
 			? await this.collectIgnoredPresentKindsFallback(cwd, candidates)
 			: nativeEntries.map((entry) => entry.kind);
@@ -1027,18 +1027,20 @@ export class SnapshotStore {
 		return result.sort(comparePaths);
 	}
 
-	private async inspectIgnoredMetadataBatches(
+	private async inspectNativeMetadataBatches(
 		cwd: string,
 		paths: readonly string[],
 		requestDirectory: string,
 	): Promise<readonly NativeMetadataEntry[] | undefined> {
+		// 空路径不得触发 native inspect；首批 unsupported 才整体回退，中途变化必须 fail closed。
+		if (paths.length === 0) return [];
 		const result: NativeMetadataEntry[] = [];
-		for (let offset = 0; offset < paths.length; offset += IGNORED_METADATA_BATCH_SIZE) {
-			const batch = paths.slice(offset, offset + IGNORED_METADATA_BATCH_SIZE);
+		for (let offset = 0; offset < paths.length; offset += METADATA_BATCH_SIZE) {
+			const batch = paths.slice(offset, offset + METADATA_BATCH_SIZE);
 			const inspected = await this.nativeMetadata.inspect(cwd, batch, requestDirectory);
 			if (inspected === undefined) {
 				if (result.length > 0) {
-					throw new SnapshotStoreError("capture_failed", "native ignored metadata 能力在批次间变化");
+					throw new SnapshotStoreError("capture_failed", "native metadata 能力在批次间变化");
 				}
 				return undefined;
 			}
@@ -1052,8 +1054,8 @@ export class SnapshotStore {
 		paths: readonly string[],
 	): Promise<readonly NativeMetadataEntry["kind"][]> {
 		const result: NativeMetadataEntry["kind"][] = [];
-		for (let offset = 0; offset < paths.length; offset += IGNORED_METADATA_BATCH_SIZE) {
-			const batch = paths.slice(offset, offset + IGNORED_METADATA_BATCH_SIZE);
+		for (let offset = 0; offset < paths.length; offset += METADATA_BATCH_SIZE) {
+			const batch = paths.slice(offset, offset + METADATA_BATCH_SIZE);
 			await assertNoSymlinkParents(cwd, batch);
 			const kinds = await mapConcurrentOrdered(batch, FILE_SYSTEM_INSPECTION_CONCURRENCY, async (relativePath) => {
 				const metadata = await lstat(join(cwd, ...relativePath.split("/"))).catch((error) => {
@@ -1243,12 +1245,12 @@ export class SnapshotStore {
 		leaves: readonly VisibleLeaf[],
 		requestDirectory?: string,
 	): Promise<void> {
+		if (leaves.length === 0) return;
+		const paths = leaves.map((leaf) => leaf.relativePath);
 		if (requestDirectory !== undefined) {
-			const inspected = await this.nativeMetadata.inspect(
-				cwd,
-				leaves.map((leaf) => leaf.relativePath),
-				requestDirectory,
-			);
+			// 分批 inspect 只核验当前批次祖先；全部可见路径必须在批次前后各包一层父目录检查。
+			await assertNoSymlinkParents(cwd, paths);
+			const inspected = await this.inspectNativeMetadataBatches(cwd, paths, requestDirectory);
 			if (inspected !== undefined) {
 				for (let index = 0; index < leaves.length; index += 1) {
 					const leaf = leaves[index]!;
@@ -1257,10 +1259,15 @@ export class SnapshotStore {
 						throw new SnapshotStoreError("capture_failed", `捕获期间工作区叶子已变化：${leaf.relativePath}`);
 					}
 				}
+				await assertNoSymlinkParents(cwd, paths);
 				return;
 			}
+			await mapConcurrentOrdered(leaves, FILE_SYSTEM_INSPECTION_CONCURRENCY, (leaf) =>
+				this.assertVisibleLeafUnchanged(cwd, leaf));
+			await assertNoSymlinkParents(cwd, paths);
+			return;
 		}
-		await assertNoSymlinkParents(cwd, leaves.map((leaf) => leaf.relativePath));
+		await assertNoSymlinkParents(cwd, paths);
 		await mapConcurrentOrdered(leaves, FILE_SYSTEM_INSPECTION_CONCURRENCY, (leaf) =>
 			this.assertVisibleLeafUnchanged(cwd, leaf));
 	}
@@ -1335,10 +1342,14 @@ export class SnapshotStore {
 			exclusions,
 			exactExclusions,
 		);
-		const nativeEntries = await this.nativeMetadata.inspect(cwd, paths, requestDirectory);
+		if (paths.length === 0) return [];
+		// 分批 inspect 只核验当前批次祖先；全部可见路径必须在批次前后各包一层父目录检查。
+		await assertNoSymlinkParents(cwd, paths);
+		const nativeEntries = await this.inspectNativeMetadataBatches(cwd, paths, requestDirectory);
 		const metadataEntries = nativeEntries === undefined
 			? await this.collectVisibleLeafMetadataFallback(cwd, paths)
 			: nativeEntries.map((entry) => nativeVisibleLeafMetadata(entry));
+		await assertNoSymlinkParents(cwd, paths);
 		const leaves: VisibleLeaf[] = [];
 		for (let index = 0; index < paths.length; index += 1) {
 			const relativePath = paths[index]!;

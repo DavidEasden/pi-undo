@@ -329,6 +329,99 @@ describe("UndoController", () => {
 		]);
 	});
 
+	it("settled 无变化时复用 captureBaseline 且保持 workspace lock", async () => {
+		const deps = dependencies({
+			acquireWorkspaceLock: async () => {
+				deps.calls.push("lock");
+				return { release: async () => { deps.calls.push("unlock"); } };
+			},
+			captureBaseline: async (baseline) => {
+				deps.calls.push("captureBaseline");
+				return baseline;
+			},
+			changedPaths: async (before, after) => {
+				expect(after).toBe(before);
+				return [];
+			},
+		});
+		const controller = new UndoControllerImpl(deps);
+
+		await controller.prepareInput("只读 run", { streaming: false });
+		await controller.beforeAgentStart();
+		await controller.agentSettled();
+
+		expect(deps.calls).toEqual([
+			"lock", "capture", "unlock", "entry:pi-undo:start",
+			"lock", "captureBaseline", "unlock", "entry:pi-undo:checkpoint",
+		]);
+		const checkpoint = controller.listCheckpoints().at(-1);
+		expect(checkpoint?.beforeManifestId).toBe(checkpoint?.afterManifestId);
+		expect(checkpoint?.changedPaths).toEqual([]);
+	});
+
+	it("settled 有变化时使用 captureBaseline 返回的新 manifest", async () => {
+		const deps = dependencies({
+			captureBaseline: async () => {
+				deps.calls.push("captureBaseline");
+				return manifest("c");
+			},
+			changedPaths: async (before, after) => {
+				expect(before.manifestId).toBe("a".repeat(64));
+				expect(after.manifestId).toBe("c".repeat(64));
+				return ["file.txt"];
+			},
+		});
+		const controller = new UndoControllerImpl(deps);
+
+		await controller.prepareInput("改文件", { streaming: false });
+		await controller.beforeAgentStart();
+		await controller.agentSettled();
+
+		expect(deps.calls.filter((item) => item === "capture")).toEqual(["capture"]);
+		expect(deps.calls).toContain("captureBaseline");
+		const checkpoint = controller.listCheckpoints().at(-1);
+		expect(checkpoint?.beforeManifestId).toBe("a".repeat(64));
+		expect(checkpoint?.afterManifestId).toBe("c".repeat(64));
+		expect(checkpoint?.changedPaths).toEqual(["file.txt"]);
+	});
+
+	it("旧适配器没有 captureBaseline 时 settled 回退完整 capture", async () => {
+		const deps = dependencies();
+		expect(deps.captureBaseline).toBeUndefined();
+		const controller = new UndoControllerImpl(deps);
+
+		await controller.prepareInput("兼容旧适配器", { streaming: false });
+		await controller.beforeAgentStart();
+		await controller.agentSettled();
+
+		expect(deps.calls.filter((item) => item === "capture")).toHaveLength(2);
+		expect(controller.listCheckpoints().at(-1)?.afterManifestId).toBe("c".repeat(64));
+	});
+
+	it("settled 的 captureBaseline 抛错写 barrier 并释放 lock", async () => {
+		const deps = dependencies({
+			acquireWorkspaceLock: async () => {
+				deps.calls.push("lock");
+				return { release: async () => { deps.calls.push("unlock"); } };
+			},
+			captureBaseline: async () => {
+				deps.calls.push("captureBaseline");
+				throw new Error("baseline failed");
+			},
+		});
+		const controller = new UndoControllerImpl(deps);
+
+		await controller.prepareInput("失败轮", { streaming: false });
+		await controller.beforeAgentStart();
+		await controller.agentSettled();
+
+		expect(await controller.undo()).toEqual({ code: "history_paused", changedFiles: 0 });
+		expect(deps.calls).toEqual([
+			"lock", "capture", "unlock", "entry:pi-undo:start",
+			"lock", "captureBaseline", "unlock", "entry:pi-undo:barrier",
+		]);
+	});
+
 	it("checkpoint 使用 start entry 后实际持久化的 user entry", async () => {
 		let checkpointData: unknown;
 		const deps = dependencies({

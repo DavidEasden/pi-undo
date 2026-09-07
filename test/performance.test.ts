@@ -69,6 +69,10 @@ class RootConcurrencyGitRunner extends CountingGitRunner {
 class RecordingMetadataPort implements NativeMetadataPort {
 	readonly calls: string[][] = [];
 	failOnIgnoredBatch: number | undefined;
+	alwaysUnsupported = false;
+	unsupportedOnCall: number | undefined;
+	throwOnCall: number | undefined;
+	mutateOnCall: number | undefined;
 	private ignoredBatches = 0;
 
 	resetIgnoredBatches(): void {
@@ -81,9 +85,21 @@ class RecordingMetadataPort implements NativeMetadataPort {
 		_requestDirectory: string,
 	): Promise<readonly NativeMetadataEntry[] | undefined> {
 		this.calls.push([...paths]);
+		if (this.throwOnCall === this.calls.length) {
+			throw new Error("injected native inspect failure");
+		}
+		if (this.alwaysUnsupported || this.unsupportedOnCall === this.calls.length) {
+			return undefined;
+		}
 		if (paths.length > 0 && paths.every((path) => path.startsWith("ignored/"))) {
 			this.ignoredBatches += 1;
 			if (this.ignoredBatches === this.failOnIgnoredBatch) return undefined;
+		}
+		if (this.mutateOnCall === this.calls.length) {
+			const target = this.calls[0]?.[0];
+			if (target !== undefined) {
+				await writeFile(join(workspaceRoot, target), "mutated-across-batches\n");
+			}
 		}
 		return Promise.all(paths.map(async (path): Promise<NativeMetadataEntry> => {
 			const metadata = await lstat(join(workspaceRoot, ...path.split("/")), { bigint: true }).catch(() => null);
@@ -181,6 +197,104 @@ describe("undo/redo restore performance", () => {
 			nativeMetadata.failOnIgnoredBatch = 2;
 			nativeMetadata.resetIgnoredBatches();
 			await expect(store.capture(topology)).rejects.toMatchObject({ code: "capture_failed" });
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("大量可见叶子初检与最终复核都按 1024 分批并保持路径顺序", async () => {
+		const { workspace, storeRoot } = await createVisibleLeafWorkspace(2_100);
+		try {
+			const nativeMetadata = new RecordingMetadataPort();
+			const discovery = new RootDiscovery();
+			const store = new SnapshotStore({ storeRoot, discovery, nativeMetadata });
+			const topology = await discovery.discover(workspace);
+
+			const manifest = await store.capture(topology);
+			const captured = (await store.listTree(manifest.manifestId, "."))
+				.filter((entry) => entry.kind !== "directory");
+			expect(captured).toHaveLength(2_100);
+			expect(nativeMetadata.calls.map((paths) => paths.length)).toEqual([1_024, 1_024, 52, 1_024, 1_024, 52]);
+			const initial = nativeMetadata.calls.slice(0, 3).flat();
+			const finalReview = nativeMetadata.calls.slice(3, 6).flat();
+			expect(initial).toHaveLength(2_100);
+			expect(finalReview).toEqual(initial);
+			expect(nativeMetadata.calls[0]).toEqual(initial.slice(0, 1_024));
+			expect(nativeMetadata.calls[1]).toEqual(initial.slice(1_024, 2_048));
+			expect(nativeMetadata.calls[2]).toEqual(initial.slice(2_048));
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("可见叶子 native 首批 unsupported 时整体回退 TypeScript 且不再继续分批", async () => {
+		const { workspace, storeRoot } = await createVisibleLeafWorkspace(2_100);
+		try {
+			const nativeMetadata = new RecordingMetadataPort();
+			nativeMetadata.alwaysUnsupported = true;
+			const discovery = new RootDiscovery();
+			const store = new SnapshotStore({ storeRoot, discovery, nativeMetadata });
+			const topology = await discovery.discover(workspace);
+
+			const manifest = await store.capture(topology);
+			const captured = (await store.listTree(manifest.manifestId, "."))
+				.filter((entry) => entry.kind !== "directory");
+			expect(captured).toHaveLength(2_100);
+			expect(nativeMetadata.calls.map((paths) => paths.length)).toEqual([1_024, 1_024]);
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("可见叶子 native 中途能力消失时 fail closed", async () => {
+		const { workspace, storeRoot } = await createVisibleLeafWorkspace(2_100);
+		try {
+			const nativeMetadata = new RecordingMetadataPort();
+			nativeMetadata.unsupportedOnCall = 2;
+			const discovery = new RootDiscovery();
+			const store = new SnapshotStore({ storeRoot, discovery, nativeMetadata });
+			const topology = await discovery.discover(workspace);
+
+			await expect(store.capture(topology)).rejects.toMatchObject({ code: "capture_failed" });
+			expect(nativeMetadata.calls.map((paths) => paths.length)).toEqual([1_024, 1_024]);
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("可见叶子 native 中途 inspect 异常时 fail closed", async () => {
+		const { workspace, storeRoot } = await createVisibleLeafWorkspace(2_100);
+		try {
+			const nativeMetadata = new RecordingMetadataPort();
+			nativeMetadata.throwOnCall = 2;
+			const discovery = new RootDiscovery();
+			const store = new SnapshotStore({ storeRoot, discovery, nativeMetadata });
+			const topology = await discovery.discover(workspace);
+
+			await expect(store.capture(topology)).rejects.toMatchObject({ code: "capture_failed" });
+			expect(nativeMetadata.calls).toHaveLength(2);
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("最终复核发现跨批次变化时 fail closed", async () => {
+		const { workspace, storeRoot } = await createVisibleLeafWorkspace(2_100);
+		try {
+			const nativeMetadata = new RecordingMetadataPort();
+			nativeMetadata.mutateOnCall = 4;
+			const discovery = new RootDiscovery();
+			const store = new SnapshotStore({ storeRoot, discovery, nativeMetadata });
+			const topology = await discovery.discover(workspace);
+
+			await expect(store.capture(topology)).rejects.toMatchObject({ code: "capture_failed" });
+			// 最终复核先分批 inspect 再比对 fingerprint，因此跨批变化仍会跑完 1024/1024/52。
+			expect(nativeMetadata.calls.map((paths) => paths.length)).toEqual([1_024, 1_024, 52, 1_024, 1_024, 52]);
 		} finally {
 			await rm(workspace, { recursive: true, force: true });
 			await rm(storeRoot, { recursive: true, force: true });
@@ -463,6 +577,15 @@ describe("undo/redo restore performance", () => {
 		}
 	}, 120_000);
 });
+
+async function createVisibleLeafWorkspace(fileCount: number): Promise<{ workspace: string; storeRoot: string }> {
+	const workspace = await mkdtemp(join(tmpdir(), "pi-undo-visible-batch-"));
+	const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-visible-batch-store-"));
+	await mkdir(join(workspace, "src"));
+	await Promise.all(Array.from({ length: fileCount }, (_, index) =>
+		writeFile(join(workspace, "src", `file-${String(index).padStart(4, "0")}.txt`), `${index}\n`)));
+	return { workspace, storeRoot };
+}
 
 function countCommand(calls: readonly string[][], command: string): number {
 	return calls.filter((args) => args.includes(command)).length;
