@@ -389,6 +389,50 @@ describe("UndoController", () => {
 		expect(events.indexOf("release")).toBeLessThan(events.lastIndexOf("acquire"));
 	});
 
+	it("warmUp baseline 命中时首条 prompt 不重复完整 capture", async () => {
+		let captures = 0;
+		let baselineCaptures = 0;
+		const deps = dependencies({
+			capture: async () => {
+				captures += 1;
+				return manifest("a");
+			},
+			captureBaseline: async (baseline) => {
+				baselineCaptures += 1;
+				return baseline;
+			},
+		});
+		const controller = new UndoControllerImpl(deps);
+
+		controller.warmUp();
+		await controller.prepareInput("复用 baseline", { streaming: false });
+
+		expect(captures).toBe(1);
+		expect(baselineCaptures).toBe(1);
+		expect(controller.captureFailed()).toBe(false);
+	});
+
+	it("并发 recover 只执行一次并共享结果", async () => {
+		let calls = 0;
+		let releaseRecovery!: () => void;
+		const recoveryGate = new Promise<void>((resolve) => { releaseRecovery = resolve; });
+		const deps = dependencies({
+			recoverPending: async () => {
+				calls += 1;
+				await recoveryGate;
+				return { kind: "clean" as const, operations: 0 };
+			},
+		});
+		const controller = new UndoControllerImpl(deps);
+
+		const first = controller.recover();
+		const second = controller.recover();
+		expect(calls).toBe(1);
+		releaseRecovery();
+		await Promise.all([first, second]);
+		expect(calls).toBe(1);
+	});
+
 	it("warmUp 失败静默且不设置 captureFailed，后续 capture 正常进行", async () => {
 		let captures = 0;
 		const deps = dependencies({

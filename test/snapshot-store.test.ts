@@ -62,6 +62,22 @@ class RecordingGitRunner extends GitRunner {
 	}
 }
 
+class MissingOnceBatchCheckGitRunner extends RecordingGitRunner {
+	missing = false;
+
+	override run(args: readonly string[], options?: GitRunOptions): Promise<GitRunResult> {
+		if (this.missing && args[0] === "cat-file" && args[1] === "--batch-check") {
+			this.missing = false;
+			this.calls.push({ args, options });
+			const objectIds = String(options?.stdin).trim().split("\n");
+			return Promise.resolve(successfulGitResult(Buffer.from(
+				`${objectIds.map((objectId) => `${objectId} missing`).join("\n")}\n`,
+			)));
+		}
+		return super.run(args, options);
+	}
+}
+
 class OverridingManifestSnapshotStore extends SnapshotStore {
 	loadManifestCalls = 0;
 
@@ -84,6 +100,7 @@ class ToggleMissingBatchGitRunner extends GitRunner {
 		return super.run(args, options);
 	}
 }
+
 
 class MutatingManifestAfterBlobReadGitRunner extends GitRunner {
 	manifestPath: string | undefined;
@@ -306,6 +323,152 @@ describe("SnapshotStore", () => {
 		expect(hashedPaths).toContain("a.txt");
 		expect(hashedPaths).not.toContain("nested/b.txt");
 		expect(thirdManifest.roots[0]?.treeId).not.toBe(firstManifest.roots[0]?.treeId);
+	});
+
+	it("baseline 未变化时只做 metadata/path 校验，不重复完整 Git capture", async () => {
+		const repository = await createGitRepo();
+		temporaryRoots.push(repository.root);
+		await writeFixtureFile(repository.root, "stable.txt", "stable\n");
+		await runGit(repository.root, ["add", "stable.txt"]);
+		await runGit(repository.root, ["commit", "-m", "stable file"]);
+		// 初次 capture 写入的 cache 要避开 racily-clean 窗口，才能证明 baseline 快路径本身命中。
+		await new Promise((resolve) => setTimeout(resolve, 2_100));
+		const discovery = new RootDiscovery();
+		const topology = await discovery.discover(repository.root);
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		const git = new RecordingGitRunner();
+		const store = new SnapshotStore({ storeRoot, git, discovery: new RootDiscovery(git) });
+		const baseline = await store.capture(topology);
+
+		git.calls.length = 0;
+		const reused = await store.captureBaseline(topology, baseline);
+
+		expect(reused).toEqual(baseline);
+		expect(git.calls.some((call) => call.args[0] === "hash-object")).toBe(false);
+		expect(git.calls.some((call) => call.args[0] === "update-index")).toBe(false);
+		expect(git.calls.some((call) => call.args[0] === "write-tree")).toBe(false);
+		expect(git.calls.some((call) => call.args[0] === "cat-file")).toBe(true);
+
+		await writeFixtureFile(repository.root, "stable.txt", "changed\n");
+		git.calls.length = 0;
+		const changed = await store.captureBaseline(topology, baseline);
+
+		expect(changed.manifestId).not.toBe(baseline.manifestId);
+		expect(git.calls.some((call) => call.args[0] === "hash-object")).toBe(true);
+		expect(git.calls.some((call) => call.args[0] === "write-tree")).toBe(true);
+	});
+
+	it("baseline topology 变化时回退完整 capture 并纳入新增 nested repository", async () => {
+		const repository = await createGitRepo();
+		temporaryRoots.push(repository.root);
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		const git = new RecordingGitRunner();
+		const discovery = new RootDiscovery(git);
+		const store = new SnapshotStore({ storeRoot, git, discovery });
+		const topology = await discovery.discover(repository.root);
+		const baseline = await store.capture(topology);
+
+		const nested = await createNestedRepo(repository.root, "nested-repository");
+		temporaryRoots.push(nested.root);
+		const changedTopology = await discovery.discover(repository.root);
+		git.calls.length = 0;
+		const changed = await store.captureBaseline(changedTopology, baseline);
+
+		expect(changed.manifestId).not.toBe(baseline.manifestId);
+		expect(changed.roots.some((root) => root.relativeRoot === "nested-repository")).toBe(true);
+		expect(git.calls.some((call) => call.args[0] === "write-tree")).toBe(true);
+	});
+
+	it("多 root baseline 未变化时各 root 都命中快路径", async () => {
+		const outer = await createGitRepo();
+		temporaryRoots.push(outer.root);
+		const nested = await createNestedRepo(outer.root, "nested-repository");
+		temporaryRoots.push(nested.root);
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		const git = new RecordingGitRunner();
+		const discovery = new RootDiscovery(git);
+		const store = new SnapshotStore({ storeRoot, git, discovery });
+		await new Promise((resolve) => setTimeout(resolve, 2_100));
+		const topology = await discovery.discover(outer.root);
+		const baseline = await store.capture(topology);
+
+		git.calls.length = 0;
+		const reused = await store.captureBaseline(topology, baseline);
+
+		expect(reused).toEqual(baseline);
+		expect(git.calls.some((call) => call.args[0] === "hash-object")).toBe(false);
+		expect(git.calls.some((call) => call.args[0] === "write-tree")).toBe(false);
+	});
+
+	it("ignored-present 路径变化时拒绝复用 baseline", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		await writeFixtureFile(workspace, ".gitignore", "ignored/\n");
+		await writeFixtureFile(workspace, "visible.txt", "visible\n");
+		await writeFixtureFile(workspace, "ignored/first.txt", "first\n");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		const git = new RecordingGitRunner();
+		const discovery = new RootDiscovery(git);
+		const store = new SnapshotStore({ storeRoot, git, discovery });
+		await new Promise((resolve) => setTimeout(resolve, 2_100));
+		const topology = await discovery.discover(workspace);
+		const baseline = await store.capture(topology);
+
+		git.calls.length = 0;
+		const reused = await store.captureBaseline(topology, baseline);
+		expect(reused).toEqual(baseline);
+		expect(git.calls.some((call) => call.args[0] === "write-tree")).toBe(false);
+
+		await writeFixtureFile(workspace, "ignored/second.txt", "second\n");
+		git.calls.length = 0;
+		const changed = await store.captureBaseline(topology, baseline);
+
+		expect(changed.manifestId).not.toBe(baseline.manifestId);
+		expect(changed.roots[0]?.ignoredPresentPaths).toEqual(["ignored/first.txt", "ignored/second.txt"]);
+		expect(git.calls.some((call) => call.args[0] === "write-tree")).toBe(true);
+	});
+
+	it("nested root scope 的 coverage 与 capture 一致并可复用 baseline", async () => {
+		const outer = await createGitRepo();
+		temporaryRoots.push(outer.root);
+		const nested = await createNestedRepo(outer.root, "nested-repository");
+		temporaryRoots.push(nested.root);
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		const git = new RecordingGitRunner();
+		const discovery = new RootDiscovery(git);
+		const store = new SnapshotStore({ storeRoot, git, discovery });
+		await new Promise((resolve) => setTimeout(resolve, 2_100));
+		const topology = await discovery.discover(outer.root);
+		const scope = ["nested-repository/README.md"];
+		const baseline = await store.capture(topology, scope);
+
+		git.calls.length = 0;
+		const reused = await store.captureBaseline(topology, baseline, scope);
+
+		expect(reused).toEqual(baseline);
+		expect(baseline.roots.find((root) => root.relativeRoot === ".")?.coverage).toBe("none");
+		expect(baseline.roots.find((root) => root.relativeRoot === "nested-repository")?.coverage)
+			.toBe(`paths:${checksum(canonicalJson(["README.md"]))}`);
+		expect(git.calls.some((call) => call.args[0] === "write-tree")).toBe(false);
+	});
+
+	it("baseline 对象完整性暂时不可用时回退完整 capture", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		await writeFixtureFile(workspace, "file.txt", "content\n");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		const git = new MissingOnceBatchCheckGitRunner();
+		const discovery = new RootDiscovery(git);
+		const store = new SnapshotStore({ storeRoot, git, discovery });
+		await new Promise((resolve) => setTimeout(resolve, 2_100));
+		const topology = await discovery.discover(workspace);
+		const baseline = await store.capture(topology);
+
+		git.missing = true;
+		git.calls.length = 0;
+		const refreshed = await store.captureBaseline(topology, baseline);
+
+		expect(refreshed.manifestId).not.toBe(baseline.manifestId);
+		expect(git.calls.some((call) => call.args[0] === "write-tree")).toBe(true);
+		expect(git.missing).toBe(false);
 	});
 
 	it("损坏的 leaf-cache.json 被忽略，capture 正常走冷路径", async () => {

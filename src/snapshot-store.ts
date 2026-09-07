@@ -147,6 +147,8 @@ export interface SnapshotStoreOptions {
 
 export interface CaptureOptions {
 	readonly excludePaths?: readonly string[];
+	/** 调用方刚完成 topology discovery 时跳过重复的捕获前校验。捕获后校验仍然执行。 */
+	readonly topologyAlreadyValidated?: boolean;
 }
 
 export interface SnapshotBlobRequest {
@@ -176,6 +178,12 @@ export class SnapshotStoreError extends Error {
 
 export interface SnapshotStore {
 	capture(topology: RootTopology, scope?: readonly string[], options?: CaptureOptions): Promise<SnapshotManifest>;
+	captureBaseline(
+		topology: RootTopology,
+		baseline: SnapshotManifest,
+		scope?: readonly string[],
+		options?: CaptureOptions,
+	): Promise<SnapshotManifest>;
 	listVisibleLeafPaths(topology: RootTopology, options?: CaptureOptions): Promise<readonly string[]>;
 	loadManifest(id: ManifestId): Promise<SnapshotManifest>;
 	assertComplete(id: ManifestId, scopePaths?: readonly string[]): Promise<void>;
@@ -269,7 +277,9 @@ export class SnapshotStore {
 			}
 			const coverage = captureCoverage(topology.workspaceIdentity, scope);
 			const artifactExclusions = captureExclusions(topology.workspaceIdentity, options.excludePaths);
-			await this.assertTopology(topology, "捕获前 topology 已变化");
+			if (options.topologyAlreadyValidated !== true) {
+				await this.assertTopology(topology, "捕获前 topology 已变化");
+			}
 			const brokenRoots = brokenRootPaths(topology);
 			if (brokenRoots.length > 0) {
 				throw new SnapshotStoreError("capture_failed", `broken root 不能静默进入快照: ${brokenRoots.join(", ")}`);
@@ -347,6 +357,189 @@ export class SnapshotStore {
 			if (transactionDirectory !== undefined) {
 				await rm(transactionDirectory, { recursive: true, force: true }).catch(() => {});
 			}
+		}
+	}
+
+	/**
+	 * 复核 warm-up 生成的 baseline；只有 topology、可见路径、文件 metadata 和 ignored proof
+	 * 都能由现有证据证明未变化时，才跳过完整 capture。
+	 */
+	async captureBaseline(
+		topology: RootTopology,
+		baseline: SnapshotManifest,
+		scope?: readonly string[],
+		options: CaptureOptions = {},
+	): Promise<SnapshotManifest> {
+		await this.assertPrivateStore(topology.workspaceIdentity);
+		const lockIdentity = `snapshot-store:${await prospectiveCanonicalPath(this.storesRoot)}`;
+		return this.lock.withLock(lockIdentity, () => this.captureBaselineLocked(topology, baseline, scope, options));
+	}
+
+	private async captureBaselineLocked(
+		topology: RootTopology,
+		baseline: SnapshotManifest,
+		scope: readonly string[] | undefined,
+		options: CaptureOptions,
+	): Promise<SnapshotManifest> {
+		try {
+			if (topology.fingerprint !== topologyFingerprint(topology.workspaceIdentity, topology.roots)) {
+				throw new SnapshotStoreError("capture_failed", "topology fingerprint 与 roots 不匹配");
+			}
+			if (options.topologyAlreadyValidated !== true) {
+				await this.assertTopology(topology, "捕获前 topology 已变化");
+			}
+			const brokenRoots = brokenRootPaths(topology);
+			if (brokenRoots.length > 0) {
+				throw new SnapshotStoreError("capture_failed", `broken root 不能静默进入 baseline 校验: ${brokenRoots.join(", ")}`);
+			}
+			if (await this.isBaselineFresh(topology, baseline, scope, options)) {
+				await this.assertTopology(topology, "捕获期间 topology 已变化");
+				await this.touchStore(this.storeDirectory(topology));
+				return baseline;
+			}
+			// 已完成一次捕获前 topology 校验；完整回退仍保留捕获后的校验。
+			return this.captureLocked(topology, scope, { ...options, topologyAlreadyValidated: true });
+		} catch (error) {
+			if (error instanceof SnapshotStoreError) {
+				throw error;
+			}
+			throw new SnapshotStoreError("capture_failed", errorMessage(error), { cause: error });
+		}
+	}
+
+	private async isBaselineFresh(
+		topology: RootTopology,
+		baseline: SnapshotManifest,
+		scope: readonly string[] | undefined,
+		options: CaptureOptions,
+	): Promise<boolean> {
+		try {
+			assertManifest(baseline);
+		} catch {
+			return false;
+		}
+		const artifactExclusions = captureExclusions(topology.workspaceIdentity, options.excludePaths);
+		if (
+			baseline.workspaceIdentity !== topology.workspaceIdentity ||
+			baseline.topologyFingerprint !== topology.fingerprint ||
+			baseline.coverage !== captureCoverage(topology.workspaceIdentity, scope) ||
+			baseline.roots.length !== topology.roots.length
+		) {
+			return false;
+		}
+
+		const storeDirectory = this.storeDirectory(topology);
+		await this.loadPersistedLeafCache(storeDirectory);
+		const transactionsRoot = join(storeDirectory, "transactions");
+		await mkdir(transactionsRoot, { recursive: true });
+		const transactionDirectory = await mkdtemp(join(transactionsRoot, "baseline-"));
+		try {
+			const baselineRoots = new Map(baseline.roots.map((root) => [root.relativeRoot, root]));
+			for (const root of topology.roots) {
+				const baselineRoot = baselineRoots.get(root.relativeRoot);
+				if (
+					baselineRoot === undefined ||
+					baselineRoot.parentRoot !== root.parentRoot ||
+					baselineRoot.state !== root.state ||
+					baselineRoot.sourceIdentity !== root.sourceIdentity ||
+					baselineRoot.privateRepositoryId !== root.privateRepositoryId ||
+					(baselineRoot.gitlinkOid ?? null) !== (root.gitlinkOid ?? null) ||
+					baselineRoot.coverage !== rootCaptureCoverage(root.relativeRoot, scope, topology.roots) ||
+					baselineRoot.ignorePolicy !== IGNORE_POLICY
+				) {
+					return false;
+				}
+				if (root.state !== "active") {
+					if (
+						baselineRoot.treeId !== null ||
+						baselineRoot.ignoredPresentPaths.length > 0 ||
+						baselineRoot.objectClosure !== inactiveRootClosure(root)
+					) {
+						return false;
+					}
+					continue;
+				}
+
+				const treeId = baselineRoot.treeId;
+				if (treeId === null) return false;
+				const gitDirectory = this.rootGitDirectory(storeDirectory, root);
+				await this.ensurePrivateRepository(gitDirectory);
+				await this.assertNoAlternates(gitDirectory);
+				const absoluteRoot = workspaceRootPath(topology.workspaceIdentity, root.relativeRoot);
+				const indexPath = join(transactionDirectory, `${rootStoreId(root)}.index`);
+				const environment = privateGitEnvironment(gitDirectory, absoluteRoot, indexPath);
+				await this.runGit(["read-tree", "--empty"], { cwd: absoluteRoot, env: environment });
+				await this.validateIgnoreQuery(absoluteRoot, environment, root.gitBacked);
+
+				const requestedInclusions = rootScopePathspecs(root.relativeRoot, scope);
+				const exclusions = topology.roots
+					.filter((candidate) => isStrictRootAncestor(root.relativeRoot, candidate.relativeRoot))
+					.map((candidate) => rootRelativePath(root.relativeRoot, candidate.relativeRoot));
+				const exactExclusions = ownedArtifactExclusions(topology.roots, root.relativeRoot, artifactExclusions);
+				const inclusions = ownedRootInclusions(requestedInclusions, exclusions);
+				const entries = await this.readTreeEntries(gitDirectory, treeId);
+				await this.assertObjectsComplete(gitDirectory, treeId, entries);
+				if (baselineRoot.objectClosure !== treeObjectClosure(treeId, entries)) return false;
+
+				const leaves = await this.collectVisibleLeaves(
+					absoluteRoot,
+					environment,
+					root.gitBacked,
+					inclusions,
+					exclusions,
+					exactExclusions,
+					transactionDirectory,
+				);
+				if (!samePathList(
+					leaves.map((leaf) => leaf.relativePath).sort(comparePaths),
+					entries.map((entry) => entry.relativePath).sort(comparePaths),
+				)) {
+					return false;
+				}
+				const cache = this.visibleLeafCache.get(gitDirectory);
+				if (cache === undefined) return false;
+				const entriesByPath = new Map(entries.map((entry) => [entry.relativePath, entry]));
+				for (const leaf of leaves) {
+					const entry = entriesByPath.get(leaf.relativePath);
+					const cached = cache.get(leaf.relativePath);
+					if (
+						entry === undefined ||
+						!leaf.cacheable ||
+						cached?.cacheable !== true ||
+						cached.kind !== leaf.kind ||
+						cached.mode !== leaf.mode ||
+						cached.fingerprint !== leaf.fingerprint ||
+						cached.objectId !== entry.objectId ||
+						cached.verifiedAtNs <= cached.changedAtNs + RACY_CLEAN_WINDOW_NS
+					) {
+						return false;
+					}
+				}
+
+				const ignoredPresentPaths = await this.captureIgnoredPresentPaths(
+					absoluteRoot,
+					environment,
+					root.gitBacked,
+					inclusions,
+					exclusions,
+					exactExclusions,
+					transactionDirectory,
+				);
+				if (!samePathList(ignoredPresentPaths, baselineRoot.ignoredPresentPaths)) return false;
+				if (baselineRoot.ignoreClosure !== ignoredPresentClosure({
+					coverage: baselineRoot.coverage,
+					ignorePolicy: IGNORE_POLICY,
+					ignoredPresentPaths,
+				})) return false;
+				// metadata 初检与最终复核之间若有变化，放弃 baseline，回退完整 capture。
+				await this.assertVisibleLeavesUnchanged(absoluteRoot, leaves, transactionDirectory);
+			}
+			return true;
+		} catch {
+			// baseline 证据读取失败时不复用旧快照；完整 capture 会重新建立对象和缓存。
+			return false;
+		} finally {
+			await rm(transactionDirectory, { recursive: true, force: true }).catch(() => {});
 		}
 	}
 
@@ -1593,8 +1786,17 @@ function ownedRootInclusions(
 	return owned.length === 0 ? null : owned;
 }
 
-function rootCaptureCoverage(rootPath: string, scope: readonly string[] | undefined): string {
-	return rootCoverageFromInclusions(rootScopePathspecs(rootPath, scope));
+function rootCaptureCoverage(
+	rootPath: string,
+	scope: readonly string[] | undefined,
+	roots?: readonly RootTopologyIdentity[],
+): string {
+	const requestedInclusions = rootScopePathspecs(rootPath, scope);
+	if (roots === undefined) return rootCoverageFromInclusions(requestedInclusions);
+	const exclusions = roots
+		.filter((root) => isStrictRootAncestor(rootPath, root.relativeRoot))
+		.map((root) => rootRelativePath(rootPath, root.relativeRoot));
+	return rootCoverageFromInclusions(ownedRootInclusions(requestedInclusions, exclusions));
 }
 
 function rootCoverageFromInclusions(inclusions: readonly string[] | null): string {
@@ -2184,6 +2386,10 @@ function gitExitCode(error: unknown): number | null | undefined {
 	return typeof result === "object" && result !== null && "code" in result && typeof result.code === "number"
 		? result.code
 		: undefined;
+}
+
+function samePathList(left: readonly string[], right: readonly string[]): boolean {
+	return left.length === right.length && left.every((path, index) => path === right[index]);
 }
 
 function comparePaths(left: string, right: string): number {
