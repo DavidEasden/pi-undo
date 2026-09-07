@@ -536,6 +536,26 @@ describe("SnapshotStore", () => {
 		await store.assertComplete(manifest.manifestId);
 	});
 
+	it("可见叶子为空时不调用 native metadata inspect", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		const calls: string[][] = [];
+		const topology = await new RootDiscovery().discover(workspace);
+		const store = new SnapshotStore({
+			storeRoot,
+			nativeMetadata: {
+				inspect: async (_cwd, paths) => {
+					calls.push([...paths]);
+					return [];
+				},
+			},
+		});
+
+		await store.capture(topology);
+
+		expect(calls).toEqual([]);
+	});
+
 	it("native metadata 不可用时 ignored-present batch fallback 保持 file/symlink 语义", async () => {
 		const workspace = await temporaryRoot("pi-undo-snapshot-");
 		const storeRoot = await temporaryRoot("pi-undo-store-");

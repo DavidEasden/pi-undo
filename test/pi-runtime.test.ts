@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { canonicalJson, checksum } from "../src/encoding.ts";
+import { GitRunner } from "../src/git-runner.ts";
 import type { CheckpointRecord, CursorState, ManifestId, SessionFileIdentity } from "../src/model.ts";
 import { createPiUndoRuntime } from "../src/pi-runtime.ts";
 import { JournalRecovery } from "../src/recovery.ts";
@@ -98,6 +99,74 @@ describe("Pi runtime cursor durability", () => {
 		expect(plan).not.toHaveBeenCalled();
 		plan.mockRestore();
 		expect(runtime.controller.listCheckpoints().at(-1)?.changedPaths).toEqual([]);
+	});
+
+	it("无变化 settled 复用 baseline，不 write-tree/hash-object/update-index", async () => {
+		const fixture = await liveOperationFixture();
+		await writeFile(join(fixture.workspace, "stable.txt"), "stable\n");
+		// 叶子缓存采用 2s racily-clean 窗口；文件必须早于首次 capture 的 verifiedAt。
+		await new Promise((resolve) => setTimeout(resolve, 2_100));
+		const runtime = await createPiUndoRuntime(fixture.context as any, fixture.pi as any);
+		expect(await runtime.controller.prepareInput("只读 run", { streaming: false })).toEqual({ action: "continue" });
+		await runtime.controller.beforeAgentStart();
+		const startEntryId = fixture.manager.getLeafId();
+		fixture.appendSessionEntry({
+			type: "message",
+			id: "user-stable",
+			parentId: startEntryId,
+			message: { role: "user", content: "只读 run" },
+		});
+		fixture.appendSessionEntry({
+			type: "message",
+			id: "assistant-stable",
+			parentId: "user-stable",
+			message: { role: "assistant", content: [] },
+		});
+		const git = vi.spyOn(GitRunner.prototype, "run");
+		try {
+			await runtime.controller.agentSettled();
+			const expensive = git.mock.calls.filter(([args]) =>
+				args.includes("write-tree") || args.includes("hash-object") || args.includes("update-index"));
+			expect(expensive).toEqual([]);
+		} finally {
+			git.mockRestore();
+		}
+		const checkpoint = runtime.controller.listCheckpoints().at(-1);
+		expect(checkpoint?.changedPaths).toEqual([]);
+		expect(checkpoint?.beforeManifestId).toBe(checkpoint?.afterManifestId);
+	});
+
+	it("settled 发现变化时 captureBaseline 回退完整 capture", async () => {
+		const fixture = await liveOperationFixture();
+		await writeFile(join(fixture.workspace, "tracked.txt"), "before\n");
+		await new Promise((resolve) => setTimeout(resolve, 2_100));
+		const runtime = await createPiUndoRuntime(fixture.context as any, fixture.pi as any);
+		expect(await runtime.controller.prepareInput("改文件", { streaming: false })).toEqual({ action: "continue" });
+		await runtime.controller.beforeAgentStart();
+		const startEntryId = fixture.manager.getLeafId();
+		fixture.appendSessionEntry({
+			type: "message",
+			id: "user-changed",
+			parentId: startEntryId,
+			message: { role: "user", content: "改文件" },
+		});
+		await writeFile(join(fixture.workspace, "tracked.txt"), "after\n");
+		fixture.appendSessionEntry({
+			type: "message",
+			id: "assistant-changed",
+			parentId: "user-changed",
+			message: { role: "assistant", content: [] },
+		});
+		const git = vi.spyOn(GitRunner.prototype, "run");
+		try {
+			await runtime.controller.agentSettled();
+			expect(git.mock.calls.some(([args]) => args.includes("write-tree"))).toBe(true);
+		} finally {
+			git.mockRestore();
+		}
+		const checkpoint = runtime.controller.listCheckpoints().at(-1);
+		expect(checkpoint?.changedPaths).toEqual(["tracked.txt"]);
+		expect(checkpoint?.beforeManifestId).not.toBe(checkpoint?.afterManifestId);
 	});
 
 	it("append cursor 后使用最新 leaf 校验当前 branch", async () => {

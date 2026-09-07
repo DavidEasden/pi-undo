@@ -375,7 +375,8 @@ export class UndoControllerImpl implements UndoController {
 		const measure = <T>(phase: string, operation: () => Promise<T>): Promise<T> =>
 			profiler === undefined ? operation() : profiler.measure(phase, operation);
 		try {
-			const after = await measure("settled.capture", () => this.captureWithWorkspaceLock());
+			// settled 复用 run 开始时的 before；helper 在缺少 captureBaseline 时回退完整 capture。
+			const after = await measure("settled.capture", () => this.captureBaselineWithWorkspaceLock(staged.before));
 			const changedPaths = await measure("settled.changedPaths", () =>
 				this.dependencies.changedPaths(staged.before, after));
 			if (changedPaths.length > 0 && this.dependencies.prepareDurableRestore !== undefined) {
