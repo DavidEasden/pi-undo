@@ -218,9 +218,10 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 		pi.on("input", async (event: InputEvent, context: ExtensionContext) => {
 			const active = runtime;
 			if (active === undefined) return { action: "continue" as const };
-			const result = await active.controller.prepareInput(event.text, {
-				streaming: event.streamingBehavior !== undefined,
-			});
+			const inputContext = { streaming: event.streamingBehavior !== undefined };
+			const result = active.controller.beginInput !== undefined
+				? active.controller.beginInput(event.text, inputContext)
+				: await active.controller.prepareInput(event.text, inputContext);
 			const replay = replaying;
 			if (result.action === "defer") {
 				if (replay !== undefined && event.source === "extension" && samePrompt(event.text, event.images, replay)) {
@@ -254,7 +255,10 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 					}
 				}
 			}
-			if (result.action === "continue" && active.controller.captureFailed() && !captureFailureNotified) {
+			if (
+				active.controller.beginInput === undefined &&
+				result.action === "continue" && active.controller.captureFailed() && !captureFailureNotified
+			) {
 				captureFailureNotified = true;
 				const reason = active.controller.captureFailureReason();
 				context.ui.notify(
@@ -263,6 +267,22 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 				);
 			}
 			return result;
+		});
+		pi.on("message_end", async (event, context: ExtensionContext) => {
+			if (event.message.role !== "user") return;
+			const active = runtime;
+			const messageGeneration = generation;
+			if (active === undefined || active.controller.commitInput === undefined) return;
+			await active.controller.commitInput();
+			if (runtime !== active || generation !== messageGeneration) return;
+			if (active.controller.captureFailed() && !captureFailureNotified) {
+				captureFailureNotified = true;
+				const reason = active.controller.captureFailureReason();
+				context.ui.notify(
+					`pi-undo: pre-input snapshot failed${reason === undefined || reason.length === 0 ? "" : ` (${reason})`}; this run will not be undoable`,
+					"warning",
+				);
+			}
 		});
 		pi.on("before_agent_start", async () => {
 			const active = runtime;

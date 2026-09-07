@@ -151,7 +151,7 @@ describe("pi-undo extension", () => {
 		};
 
 		expect([...handlers.keys()].sort()).toEqual([
-			"agent_settled", "before_agent_start", "input", "session_before_tree", "session_shutdown", "session_start", "session_tree",
+			"agent_settled", "before_agent_start", "input", "message_end", "session_before_tree", "session_shutdown", "session_start", "session_tree",
 		]);
 		await handlers.get("session_start")!({ type: "session_start" }, context);
 		const command = commands.get("undo")!("", context);
@@ -164,6 +164,44 @@ describe("pi-undo extension", () => {
 		expect(generation).toBe(2);
 		expect(notifications).toEqual([]);
 		expect(sent).toEqual([]);
+	});
+
+	it("快速输入路径在用户 message_end 后提交快照事务", async () => {
+		const handlers = new Map<string, (event: any, context: any) => any>();
+		const calls: string[] = [];
+		const controller = {
+			history: () => ({ undoCount: 0, redoCount: 0, locked: false }),
+			listCheckpoints: () => [],
+			recover: async () => {},
+			captureFailed: () => false,
+			captureFailureReason: () => undefined,
+			warmUp: () => {},
+			beginInput: () => { calls.push("begin"); return { action: "continue" as const }; },
+			commitInput: async () => { calls.push("commit"); },
+			prepareInput: async () => ({ action: "continue" as const }),
+			beforeAgentStart: async () => { calls.push("before"); },
+			agentSettled: async () => {},
+			undo: async () => ({ code: "noop" as const, changedFiles: 0 }),
+			redo: async () => ({ code: "noop" as const, changedFiles: 0 }),
+			beforeTree: async () => undefined,
+			afterTree: async () => {},
+		};
+		const pi = {
+			registerCommand() {},
+			on(name: string, handler: (event: any, context: any) => any) { handlers.set(name, handler); },
+		} as unknown as ExtensionAPI;
+		createPiUndoExtension(async (context) => ({ controller, reporter: new StatusReporter(context) }))(pi);
+		const context = {
+			mode: "tui" as const,
+			ui: { setStatus: () => {}, notify: () => {}, getEditorText: () => "", setEditorText: () => {} },
+		};
+
+		await handlers.get("session_start")!({}, context);
+		await handlers.get("input")!({ text: "快速输入", source: "interactive" }, context);
+		await handlers.get("before_agent_start")!({}, context);
+		expect(calls).toEqual(["begin", "before"]);
+		await handlers.get("message_end")!({ message: { role: "user" } }, context);
+		expect(calls).toEqual(["begin", "before", "commit"]);
 	});
 
 	it("runtime 未初始化时放行输入而不是吞掉（回归测试）", async () => {

@@ -350,6 +350,33 @@ describe("UndoController", () => {
 		expect(checkpointData).toMatchObject({ startEntryId: "start-1", userEntryId: "user-1" });
 	});
 
+	it("快速输入路径先放行用户消息，message_end 后才提交 start entry", async () => {
+		let releaseCapture!: () => void;
+		let markCaptureStarted!: () => void;
+		const captureStarted = new Promise<void>((resolve) => { markCaptureStarted = resolve; });
+		const captureGate = new Promise<void>((resolve) => { releaseCapture = resolve; });
+		const deps = dependencies({
+			capture: async () => {
+				markCaptureStarted();
+				await captureGate;
+				return manifest("a");
+			},
+		});
+		const controller = new UndoControllerImpl(deps);
+
+		expect(controller.beginInput!("快速输入", { streaming: false })).toEqual({ action: "continue" });
+		await captureStarted;
+		await controller.beforeAgentStart();
+		expect(deps.calls).not.toContain("entry:pi-undo:start");
+
+		const commit = controller.commitInput!();
+		await Promise.resolve();
+		expect(deps.calls).not.toContain("entry:pi-undo:start");
+		releaseCapture();
+		await commit;
+		expect(deps.calls).toContain("entry:pi-undo:start");
+	});
+
 	it("before capture 失败时放行输入且不记录历史", async () => {
 		const deps = dependencies({ capture: async () => { throw new Error("snapshot failed"); } });
 		const controller = new UndoControllerImpl(deps);
