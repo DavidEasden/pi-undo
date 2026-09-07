@@ -137,6 +137,10 @@ export interface UndoController {
 	/** 只读的 undo 栈视图（栈底在前）；仅供 /diff 等展示使用。 */
 	listCheckpoints(): readonly CheckpointRecord[];
 	prepareInput(text: string, context: InputContext): Promise<InputEventResult>;
+	/** 在 input hook 中启动快照，但不等待，供 message_end 前的快速路径使用。 */
+	beginInput?(text: string, context: InputContext): InputEventResult;
+	/** 在用户 message_end 后等待快照并写入 start entry。 */
+	commitInput?(): Promise<void>;
 	beforeAgentStart(): Promise<void>;
 	agentSettled(): Promise<void>;
 	undo(): Promise<OperationResult>;
@@ -204,6 +208,8 @@ export class UndoControllerImpl implements UndoController {
 	private lastCaptureFailureMessage: string | undefined;
 	private warmUpInFlight: Promise<void> | undefined;
 	private warmUpManifest: SnapshotManifest | undefined;
+	private pendingInputCapture: { readonly token: symbol; readonly promise: Promise<void> } | undefined;
+	private deferAgentStartUntilMessageEnd = false;
 	private recoveryInFlight: Promise<void> | undefined;
 	private recoveryCompleted = false;
 
@@ -249,28 +255,49 @@ export class UndoControllerImpl implements UndoController {
 		if (this.operationInFlight) return { action: "defer" };
 		if (context.streaming || text.length === 0) return { action: "continue" };
 		try {
-			// warm-up 仍在进行时先等待，确保随后可以消费已完成的 baseline，而不是再次完整 capture。
-			const warmUp = this.warmUpInFlight;
-			if (warmUp !== undefined) await warmUp;
-			const warmUpManifest = this.warmUpManifest;
-			this.warmUpManifest = undefined;
-			const before = warmUpManifest !== undefined && this.dependencies.captureBaseline !== undefined
-				? await this.captureBaselineWithWorkspaceLock(warmUpManifest)
-				: await this.captureWithWorkspaceLock();
-			this.lastCaptureFailed = false;
-			this.lastCaptureFailureMessage = undefined;
-			this.historyPaused = false;
-			this.staged = { rawPrompt: text, before, sourceLogicalLeaf: this.dependencies.getLogicalLeafId() };
+			const before = await this.captureInputBaseline();
+			this.stageInput(text, before);
 			return { action: "continue" };
 		} catch (error) {
 			// 无法证明输入前状态：放弃记录本次历史，但绝不吞掉用户输入。
-			this.lastCaptureFailed = true;
-			this.lastCaptureFailureMessage = truncateReason(error instanceof Error ? error.message : String(error));
+			this.recordCaptureFailure(error);
 			return { action: "continue" };
 		}
 	}
 
+	beginInput(text: string, context: InputContext): InputEventResult {
+		if (this.promptDeferralInFlight) return { action: "defer" };
+		if (this.locked) return { action: "continue" };
+		if (this.operationInFlight) return { action: "defer" };
+		if (context.streaming || text.length === 0) return { action: "continue" };
+		this.staged = undefined;
+		this.lastCaptureFailed = false;
+		this.lastCaptureFailureMessage = undefined;
+		this.deferAgentStartUntilMessageEnd = true;
+		const token = Symbol("input-capture");
+		const promise = this.captureInputForToken(text, token);
+		this.pendingInputCapture = { token, promise };
+		void promise.then(() => {
+			if (this.pendingInputCapture?.token === token) this.pendingInputCapture = undefined;
+		});
+		return { action: "continue" };
+	}
+
+	async commitInput(): Promise<void> {
+		if (!this.deferAgentStartUntilMessageEnd) return;
+		const pending = this.pendingInputCapture;
+		if (pending !== undefined) await pending.promise;
+		this.pendingInputCapture = undefined;
+		this.deferAgentStartUntilMessageEnd = false;
+		await this.startAgentRun();
+	}
+
 	async beforeAgentStart(): Promise<void> {
+		if (this.deferAgentStartUntilMessageEnd) return;
+		await this.startAgentRun();
+	}
+
+	private async startAgentRun(): Promise<void> {
 		if (this.locked || this.staged === undefined) return;
 		try {
 			this.staged.startEntryId = await this.dependencies.appendControl("pi-undo:start", {
@@ -291,6 +318,41 @@ export class UndoControllerImpl implements UndoController {
 		}
 		// 只有实际开始一个新 run 才会令 redo 分支失效；未启动的输入不会改变历史。
 		this.redoStack.length = 0;
+	}
+
+	private async captureInputBaseline(): Promise<SnapshotManifest> {
+		// warm-up 仍在进行时先等待，确保随后可以消费已完成的 baseline，而不是再次完整 capture。
+		const warmUp = this.warmUpInFlight;
+		if (warmUp !== undefined) await warmUp;
+		const warmUpManifest = this.warmUpManifest;
+		this.warmUpManifest = undefined;
+		return warmUpManifest !== undefined && this.dependencies.captureBaseline !== undefined
+			? this.captureBaselineWithWorkspaceLock(warmUpManifest)
+			: this.captureWithWorkspaceLock();
+	}
+
+	private async captureInputForToken(text: string, token: symbol): Promise<void> {
+		try {
+			const before = await this.captureInputBaseline();
+			if (this.pendingInputCapture?.token !== token) return;
+			this.stageInput(text, before);
+		} catch (error) {
+			if (this.pendingInputCapture?.token !== token) return;
+			// 无法证明输入前状态：放弃记录本次历史，但绝不吞掉用户输入。
+			this.recordCaptureFailure(error);
+		}
+	}
+
+	private stageInput(text: string, before: SnapshotManifest): void {
+		this.lastCaptureFailed = false;
+		this.lastCaptureFailureMessage = undefined;
+		this.historyPaused = false;
+		this.staged = { rawPrompt: text, before, sourceLogicalLeaf: this.dependencies.getLogicalLeafId() };
+	}
+
+	private recordCaptureFailure(error: unknown): void {
+		this.lastCaptureFailed = true;
+		this.lastCaptureFailureMessage = truncateReason(error instanceof Error ? error.message : String(error));
 	}
 
 	async agentSettled(): Promise<void> {
