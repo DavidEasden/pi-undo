@@ -9,7 +9,7 @@ import type {
 	SessionTreeEvent as PiSessionTreeEvent,
 } from "@earendil-works/pi-coding-agent";
 
-import type { UndoController } from "../src/controller.ts";
+import type { OperationResult, UndoController } from "../src/controller.ts";
 import { browseDiff } from "../src/diff-ui.ts";
 import { computeCheckpointDiff, type DiffSource, formatDiffSummary, sanitizeDisplayText } from "../src/diff-view.ts";
 import { createPiUndoRuntime } from "../src/pi-runtime.ts";
@@ -19,7 +19,7 @@ export interface PiUndoRuntime {
 	readonly controller: UndoController;
 	readonly reporter: StatusReporter;
 	readonly diffSource?: DiffSource;
-	readonly recovery?: { readonly files?: number; readonly opId?: string };
+	readonly recovery?: { readonly reason?: string; readonly files?: number; readonly opId?: string };
 	setCommandContext?(context: ExtensionCommandContext | undefined): void;
 	isInternalNavigation?(): boolean;
 }
@@ -63,8 +63,12 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 				runtime = next;
 				await next.controller.recover();
 				const history = next.controller.history();
-				if (history.locked) next.reporter.setRecoveryRequired("pending journal", next.recovery);
-				else next.reporter.setReady(history.undoCount, history.redoCount);
+				if (history.locked) {
+					next.reporter.setRecoveryRequired(
+						next.controller.recoveryReason?.() ?? next.recovery?.reason ?? "pending journal",
+						next.recovery,
+					);
+				} else next.reporter.setReady(history.undoCount, history.redoCount);
 				// 后台预热快照缓存，把新会话首次冷 capture 移出第一条 prompt 的关键路径。
 				next.controller.warmUp();
 			} catch (error) {
@@ -117,7 +121,9 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 			if (expectedGeneration !== generation || runtime !== active) return;
 			const history = active.controller.history();
 			if (history.locked) {
-				active.reporter.setRecoveryRequired(lockedReason);
+				active.reporter.setRecoveryRequired(
+					active.controller.recoveryReason?.() ?? lockedReason,
+				);
 				restoreDeferredPrompts(runtimeContext);
 			} else {
 				active.reporter.setReady(history.undoCount, history.redoCount);
@@ -144,7 +150,7 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 			active.reporter.setPhase(action === "undo" ? "undoing" : "redoing");
 			if (ownsCommandContext) active.setCommandContext?.(context);
 			const commandStarted = performance.now();
-			let result;
+			let result: OperationResult;
 			try {
 				result = action === "undo"
 					? await active.controller.undo()
@@ -155,6 +161,14 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 				if (commandSet === activeCommands && commandSet.size === 0) activeAction = undefined;
 			}
 			if (commandGeneration !== generation || runtime !== active) return;
+			const history = active.controller.history();
+			if (history.locked && result.code === "busy") {
+				result = {
+					...result,
+					code: "recovery_required",
+					message: active.controller.recoveryReason?.() ?? "pending journal",
+				};
+			}
 			active.reporter.result(result, performance.now() - commandStarted);
 			const hasDeferredPrompt = deferredPrompts.length > 0 || replaying !== undefined;
 			if (
@@ -307,7 +321,11 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 			if (active === undefined) return;
 			await active.controller.agentSettled();
 			if (runtime !== active || generation !== settledGeneration) return;
-			resumeDeferredPrompts(active, settledGeneration, "session state ambiguous");
+			resumeDeferredPrompts(
+				active,
+				settledGeneration,
+				active.controller.recoveryReason?.() ?? "session state ambiguous",
+			);
 		});
 		pi.on("session_before_tree", async (event: PiSessionBeforeTreeEvent) => {
 			if (runtime === undefined) return { cancel: true };
@@ -328,7 +346,11 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 				navigationTargetLeafId: event.summaryEntry?.parentId ?? event.newLeafId,
 			});
 			if (active !== undefined && runtime === active && generation === treeGeneration) {
-				resumeDeferredPrompts(active, treeGeneration, "session state ambiguous");
+				resumeDeferredPrompts(
+					active,
+					treeGeneration,
+					active.controller.recoveryReason?.() ?? "session state ambiguous",
+				);
 			}
 		});
 		pi.on("session_shutdown", async () => {

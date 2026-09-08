@@ -9,6 +9,8 @@ export interface JournalRecoveryDependencies {
 	readonly workspaceIdentity: string;
 	readonly getLogicalLeafId: () => string | null;
 	readonly loadPending: () => Promise<readonly PendingJournal[]>;
+	/** 仅允许严格证明无工作区 mutation 的 foreign PREPARED 空事务被忽略。 */
+	readonly assessForeignTransaction?: (journal: PendingJournal) => Promise<boolean>;
 	readonly inspectCursor: (journal: PendingJournal) => Promise<CursorMarkerInspection>;
 	readonly finalizeCursor: (journal: PendingJournal, inspection: Extract<CursorMarkerInspection, { kind: "match" }>) => Promise<void>;
 	readonly recoverMutations: (
@@ -65,6 +67,7 @@ export class JournalRecovery {
 		for (const journal of pending) {
 			const identityError = this.identityError(journal);
 			if (identityError !== null) {
+				if (identityError === "session_identity_mismatch" && await this.canIgnoreForeignTransaction(journal)) continue;
 				return { kind: "locked", reason: identityError, operations: recovered };
 			}
 			let inspection: CursorMarkerInspection;
@@ -129,6 +132,17 @@ export class JournalRecovery {
 			}
 		}
 		return { kind: "recovered", operations: recovered };
+	}
+
+	private async canIgnoreForeignTransaction(journal: PendingJournal): Promise<boolean> {
+		const assess = this.dependencies.assessForeignTransaction;
+		if (assess === undefined) return false;
+		try {
+			return await assess(journal);
+		} catch {
+			// 评估失败等同于证据不足，保留 foreign identity lock。
+			return false;
+		}
 	}
 
 	private identityError(journal: PendingJournal): string | null {

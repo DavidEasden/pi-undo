@@ -32,11 +32,12 @@ export class StatusReporter {
 		reason: string,
 		details?: { readonly files?: number; readonly opId?: string },
 	): void {
+		const safeReason = sanitize(reason) || "recovery_required";
 		if (details?.files !== undefined && details.opId !== undefined) {
-			this.setStatus(`recovery_required files:${details.files} op:${sanitize(details.opId)}`);
+			this.setStatus(`recovery_required reason:${safeReason} files:${details.files} op:${sanitize(details.opId)}`);
 			return;
 		}
-		this.setStatus(`recovery required: ${sanitize(reason)}`);
+		this.setStatus(`recovery required: ${safeReason}`);
 	}
 
 	clear(): void {

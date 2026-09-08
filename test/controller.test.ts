@@ -132,6 +132,76 @@ describe("UndoController", () => {
 		expect(locked.history().locked).toBe(true);
 	});
 
+	it("locked 状态优先于空栈，并透传稳定 recovery reason", async () => {
+		const controller = new UndoControllerImpl(dependencies(), {
+			locked: true,
+			recoveryReason: "cursor_conflict",
+		});
+
+		expect(await controller.undo()).toEqual({
+			code: "recovery_required",
+			changedFiles: 0,
+			message: "cursor_conflict",
+		});
+		expect(await controller.redo()).toEqual({
+			code: "recovery_required",
+			changedFiles: 0,
+			message: "cursor_conflict",
+		});
+		expect(await controller.prepareInput("继续输入", { streaming: false })).toEqual({ action: "continue" });
+	});
+
+	it("首次 recovery reason 保留，异常文本截断并清理控制字符", async () => {
+		const first = new UndoControllerImpl(dependencies({
+			recoverPending: async () => ({ kind: "locked", reason: "later_reason", operations: 0 }),
+		}), {
+			locked: true,
+			recoveryReason: "first_reason",
+		});
+		await first.recover();
+		expect(first.recoveryReason()).toBe("first_reason");
+
+		const rawReason = `${"x".repeat(140)}\nsecret`;
+		const truncated = new UndoControllerImpl(dependencies({
+			recoverPending: async () => ({ kind: "locked", reason: rawReason, operations: 0 }),
+		}));
+		await truncated.recover();
+		expect(truncated.recoveryReason()).toBe(rawReason.replace(/[\u0000-\u001F\u007F]+/g, " ").trim().slice(0, 120));
+	});
+
+	it("workspace lock 获取失败返回 busy，不进入 recovery lock", async () => {
+		const deps = dependencies({
+			acquireWorkspaceLock: async () => { throw new Error("workspace lock busy"); },
+		});
+		const controller = new UndoControllerImpl(deps, { undoStack: [restoredCheckpoint()] });
+
+		expect(await controller.undo()).toEqual({ code: "busy", changedFiles: 0 });
+		expect(controller.history()).toEqual({ undoCount: 1, redoCount: 0, locked: false });
+		expect(controller.recoveryReason()).toBeUndefined();
+	});
+
+	it("第二个并发 undo 返回 busy，首个操作完成后正常提交", async () => {
+		let markCaptureStarted: (() => void) | undefined;
+		let releaseCapture: (() => void) | undefined;
+		const captureStarted = new Promise<void>((resolve) => { markCaptureStarted = resolve; });
+		const captureGate = new Promise<void>((resolve) => { releaseCapture = resolve; });
+		const deps = dependencies({
+			capture: async () => {
+				markCaptureStarted!();
+				await captureGate;
+				return manifest("c");
+			},
+		});
+		const controller = new UndoControllerImpl(deps, { undoStack: [restoredCheckpoint()] });
+
+		const undo = controller.undo();
+		await captureStarted;
+		expect(await controller.undo()).toEqual({ code: "busy", changedFiles: 0 });
+		releaseCapture!();
+		expect((await undo).code).toBe("ok");
+		expect(controller.history()).toEqual({ undoCount: 0, redoCount: 1, locked: false });
+	});
+
 	it("没有 checkpoint 的 undo/redo 是 noop，且不会快照或恢复", async () => {
 		const deps = dependencies();
 		const controller = new UndoControllerImpl(deps);
