@@ -133,6 +133,27 @@ export class JournalStore {
 		return result;
 	}
 
+	/**
+	 * 判断 foreign PREPARED transaction 是否是严格意义上的 session-only 空操作。
+	 * 这是纯只读检查；任何目录、控制文件或 plan 证据不确定时都返回 false。
+	 */
+	async isInertForeignPrepared(pending: PendingJournal): Promise<boolean> {
+		if (
+			pending.state.phase !== "PREPARED" ||
+			pending.descriptor.scopePaths.length !== 0 ||
+			!isInertRestorePlan(pending.plan, pending.descriptor)
+		) return false;
+		try {
+			const current = await this.load(pending.descriptor.opId);
+			if (!samePendingJournal(current, pending) || !isInertRestorePlan(current.plan, current.descriptor)) return false;
+			if (!await hasOnlyControlFiles(this.operationDirectory(pending.descriptor.opId))) return false;
+			const verified = await this.load(pending.descriptor.opId);
+			return samePendingJournal(verified, current) && await hasOnlyControlFiles(this.operationDirectory(pending.descriptor.opId));
+		} catch {
+			return false;
+		}
+	}
+
 	async assertLogicalCommitReady(opId: string, allowPendingMutations = false): Promise<void> {
 		if (!allowPendingMutations) await this.mutationJournal(opId).assertCleaned();
 		const pending = await this.load(opId);
@@ -317,6 +338,84 @@ function isCursorEntry(value: unknown): value is { type: "custom"; customType: "
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isInertRestorePlan(value: unknown, descriptor: OperationDescriptor): boolean {
+	if (!isRecord(value)) return false;
+	const expectedKeys = [
+		"boundaryRoots",
+		"currentManifestId",
+		"deletePaths",
+		"planDigest",
+		"scopePaths",
+		"targetManifestId",
+		"writePaths",
+	].sort();
+	if (canonicalJson(Object.keys(value).sort()) !== canonicalJson(expectedKeys)) return false;
+	if (
+		value.currentManifestId !== descriptor.rollbackManifestId ||
+		value.targetManifestId !== descriptor.targetManifestId ||
+		!isEmptyArray(value.boundaryRoots) ||
+		!isEmptyArray(value.deletePaths) ||
+		!isEmptyArray(value.writePaths) ||
+		!isEmptyArray(value.scopePaths) ||
+		typeof value.planDigest !== "string" ||
+		!/^[0-9a-f]{64}$/.test(value.planDigest)
+	) return false;
+	try {
+		return checksum(canonicalJson({
+			currentManifestId: value.currentManifestId,
+			targetManifestId: value.targetManifestId,
+			boundaryRoots: value.boundaryRoots,
+			deletePaths: value.deletePaths,
+			writePaths: value.writePaths,
+			scopePaths: value.scopePaths,
+		})) === value.planDigest;
+	} catch {
+		return false;
+	}
+}
+
+async function hasOnlyControlFiles(directory: string): Promise<boolean> {
+	const expected = ["descriptor.json", "restore-plan.json", "state.json"];
+	try {
+		const metadata = await lstat(directory);
+		if (!metadata.isDirectory() || metadata.isSymbolicLink()) return false;
+	} catch {
+		return false;
+	}
+	let entries;
+	try {
+		entries = await readdir(directory, { withFileTypes: true });
+	} catch {
+		return false;
+	}
+	if (entries.length !== expected.length || !expected.every((name) => entries.some((entry) => entry.name === name))) {
+		return false;
+	}
+	try {
+		for (const name of expected) {
+			const entry = entries.find((candidate) => candidate.name === name);
+			if (entry === undefined || !entry.isFile() || entry.isSymbolicLink()) return false;
+			const stats = await lstat(join(directory, name));
+			if (!stats.isFile() || stats.isSymbolicLink()) return false;
+		}
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function samePendingJournal(left: PendingJournal, right: PendingJournal): boolean {
+	try {
+		return canonicalJson(left) === canonicalJson(right);
+	} catch {
+		return false;
+	}
+}
+
+function isEmptyArray(value: unknown): value is readonly unknown[] {
+	return Array.isArray(value) && value.length === 0;
 }
 
 function hasErrorCode(error: unknown, code: string): error is NodeJS.ErrnoException {

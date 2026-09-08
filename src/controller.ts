@@ -150,6 +150,8 @@ export interface UndoController {
 	cancelTree?(): Promise<void>;
 	recover(): Promise<void>;
 	history(): HistoryState;
+	/** 当前 recovery lock 的原因；未锁定时返回 undefined。 */
+	recoveryReason?(): string | undefined;
 	/** 后台预热快照缓存：立即返回，失败静默；后续 capture 会先等预热完成。 */
 	warmUp(): void;
 	/** 最近一次输入前快照是否失败（此时本次 run 不可 undo，但输入不受影响）。 */
@@ -175,6 +177,7 @@ export interface ControllerInitialState {
 	readonly redoStack?: readonly ControllerRedoEntry[];
 	readonly historyPaused?: boolean;
 	readonly locked?: boolean;
+	readonly recoveryReason?: string;
 	readonly recoveryCompleted?: boolean;
 }
 
@@ -198,6 +201,7 @@ export class UndoControllerImpl implements UndoController {
 	private staged: StagedRun | undefined;
 	private pendingTree: PendingTree | undefined;
 	private locked = false;
+	private lockedReason: string | undefined;
 	private historyPaused = false;
 	private operationInFlight = false;
 	private operationAction: "undo" | "redo" | undefined;
@@ -219,11 +223,32 @@ export class UndoControllerImpl implements UndoController {
 		this.redoStack.push(...(initialState.redoStack ?? []));
 		this.historyPaused = initialState.historyPaused ?? false;
 		this.locked = initialState.locked ?? false;
+		this.lockedReason = initialState.recoveryReason;
 		this.recoveryCompleted = initialState.recoveryCompleted ?? false;
 	}
 
 	history(): HistoryState {
 		return { undoCount: this.undoStack.length, redoCount: this.redoStack.length, locked: this.locked };
+	}
+
+	recoveryReason(): string | undefined {
+		return this.locked ? this.lockedReason ?? "pending journal" : undefined;
+	}
+
+	private lock(reason: string): void {
+		this.locked = true;
+		if (this.lockedReason === undefined) {
+			const normalized = truncateReason(reason);
+			this.lockedReason = normalized.length === 0 ? "recovery_required" : normalized;
+		}
+	}
+
+	private recoveryResult(changedFiles = 0): OperationResult {
+		return {
+			code: "recovery_required",
+			changedFiles,
+			message: this.recoveryReason(),
+		};
 	}
 
 	captureFailed(): boolean {
@@ -306,13 +331,13 @@ export class UndoControllerImpl implements UndoController {
 				sourceLogicalLeaf: this.staged.sourceLogicalLeaf,
 			});
 			if (this.staged.startEntryId === null) {
-				this.locked = true;
+				this.lock("start_entry_missing");
 				this.staged = undefined;
 				await this.dependencies.appendControl("pi-undo:barrier", { reason: "start_entry_missing" }).catch(() => {});
 				return;
 			}
 		} catch {
-			this.locked = true;
+			this.lock("start_entry_append_failed");
 			this.staged = undefined;
 			return;
 		}
@@ -361,13 +386,13 @@ export class UndoControllerImpl implements UndoController {
 		if (this.locked || staged === undefined) return;
 		if (staged.startEntryId === undefined || staged.startEntryId === null) {
 			// Pi 没有提供已落盘的 start entry ID，不能把后续 assistant 输出归属到该 checkpoint。
-			this.locked = true;
+			this.lock("start_entry_missing");
 			await this.dependencies.appendControl("pi-undo:barrier", { reason: "start_entry_missing" }).catch(() => {});
 			return;
 		}
 		const userEntryId = this.dependencies.findUserEntryAfter(staged.startEntryId);
 		if (userEntryId === null) {
-			this.locked = true;
+			this.lock("user_entry_missing");
 			await this.dependencies.appendControl("pi-undo:barrier", { reason: "user_entry_missing" }).catch(() => {});
 			return;
 		}
@@ -397,7 +422,7 @@ export class UndoControllerImpl implements UndoController {
 			const checkpointEntryId = await measure("settled.checkpoint", () =>
 				this.dependencies.appendControl("pi-undo:checkpoint", checkpoint));
 			if (checkpointEntryId === null) {
-				this.locked = true;
+				this.lock("checkpoint_entry_missing");
 				await this.dependencies.appendControl("pi-undo:barrier", { reason: "checkpoint_entry_missing" }).catch(() => {});
 				return;
 			}
@@ -411,11 +436,13 @@ export class UndoControllerImpl implements UndoController {
 	}
 
 	async undo(): Promise<OperationResult> {
+		if (this.locked) return this.recoveryResult();
 		if (this.historyPaused) return { code: "history_paused", changedFiles: 0 };
 		return this.runOperation("undo");
 	}
 
 	async redo(): Promise<OperationResult> {
+		if (this.locked) return this.recoveryResult();
 		if (this.historyPaused) return { code: "history_paused", changedFiles: 0 };
 		// 新 run 开始时 redo frontier 已失效；空栈命令不得为了确认 noop 而中断正在运行的 Agent。
 		if (this.redoStack.length === 0) return noop();
@@ -442,7 +469,7 @@ export class UndoControllerImpl implements UndoController {
 			return undefined;
 		} catch {
 			if (lease !== undefined) {
-				await lease.release().catch(() => { this.locked = true; });
+				await lease.release().catch(() => { this.lock("workspace_lock_release_failed"); });
 			}
 			this.operationInFlight = false;
 			return { cancel: true };
@@ -455,7 +482,7 @@ export class UndoControllerImpl implements UndoController {
 		this.pendingTree = undefined;
 		try {
 			if ((event.navigationTargetLeafId ?? event.newLeafId) !== pending.descriptor.toLogicalLeaf) {
-				this.locked = true;
+				this.lock("session_navigation_diverged");
 				await this.dependencies.journal.setPhase(pending.descriptor.opId, "RECOVERY_REQUIRED");
 				return;
 			}
@@ -469,7 +496,7 @@ export class UndoControllerImpl implements UndoController {
 				{ opId: pending.descriptor.opId },
 			);
 			if (applied.code !== "ok") {
-				this.locked = true;
+				this.lock("restore_failed");
 				await this.dependencies.journal.setPhase(pending.descriptor.opId, "RECOVERY_REQUIRED");
 				return;
 			}
@@ -478,7 +505,7 @@ export class UndoControllerImpl implements UndoController {
 				this.createTreeCursor(pending.descriptor, event.newLeafId, pending.undoStack),
 			);
 			if (cursorResult.kind !== "durable") {
-				this.locked = true;
+				this.lock(cursorResult.kind === "recovery_required" ? cursorResult.reason : "cursor_recovery_required");
 				await this.dependencies.journal.setPhase(pending.descriptor.opId, "RECOVERY_REQUIRED");
 				return;
 			}
@@ -487,9 +514,9 @@ export class UndoControllerImpl implements UndoController {
 			this.undoStack.splice(0, this.undoStack.length, ...pending.undoStack);
 			this.redoStack.length = 0;
 		} catch {
-			this.locked = true;
+			this.lock("tree_recovery_failed");
 		} finally {
-			await pending.lease.release().catch(() => { this.locked = true; });
+			await pending.lease.release().catch(() => { this.lock("workspace_lock_release_failed"); });
 			this.operationInFlight = false;
 		}
 	}
@@ -502,9 +529,9 @@ export class UndoControllerImpl implements UndoController {
 			await this.dependencies.journal.setPhase(pending.descriptor.opId, "ABORTING");
 			await this.dependencies.journal.setPhase(pending.descriptor.opId, "ABORTED");
 		} catch {
-			this.locked = true;
+			this.lock("tree_cancel_failed");
 		} finally {
-			await pending.lease.release().catch(() => { this.locked = true; });
+			await pending.lease.release().catch(() => { this.lock("workspace_lock_release_failed"); });
 			this.operationInFlight = false;
 		}
 	}
@@ -519,9 +546,9 @@ export class UndoControllerImpl implements UndoController {
 		const recovery = (async (): Promise<void> => {
 			try {
 				const result = await this.dependencies.recoverPending();
-				if (result.kind === "locked") this.locked = true;
+				if (result.kind === "locked") this.lock(result.reason ?? "recovery_failed");
 			} catch {
-				this.locked = true;
+				this.lock("recovery_failed");
 			} finally {
 				this.recoveryCompleted = true;
 			}
@@ -531,7 +558,8 @@ export class UndoControllerImpl implements UndoController {
 	}
 
 	private async runOperation(action: "undo" | "redo"): Promise<OperationResult> {
-		if (this.locked || this.operationInFlight) return { code: "busy", changedFiles: 0 };
+		if (this.locked) return this.recoveryResult();
+		if (this.operationInFlight) return { code: "busy", changedFiles: 0 };
 		const profile = new OperationProfiler();
 		const done = (result: OperationResult): OperationResult => profile.attach(result);
 		this.operationInFlight = true;
@@ -601,7 +629,7 @@ export class UndoControllerImpl implements UndoController {
 				return done({ code: "restore_failed_safe", changedFiles: 0 });
 			}
 			if (navigation.logicalLeafId !== descriptor.toLogicalLeaf) {
-				this.locked = true;
+				this.lock("session_navigation_diverged");
 				await profile.measure("journal", () =>
 					this.dependencies.journal.setPhase(descriptor.opId, "RECOVERY_REQUIRED"));
 				return done({ code: "recovery_required", changedFiles: 0 });
@@ -621,7 +649,7 @@ export class UndoControllerImpl implements UndoController {
 			const cursor = this.createCursor(descriptor, action, checkpoint);
 			const cursorResult = await profile.measure("cursor", () => this.dependencies.appendCursor(cursor));
 			if (cursorResult.kind === "recovery_required") {
-				this.locked = true;
+				this.lock(cursorResult.reason);
 				await profile.measure("journal", () =>
 					this.dependencies.journal.setPhase(descriptor.opId, "RECOVERY_REQUIRED").catch(() => {}));
 				return done({ code: "recovery_required", changedFiles: applied.verifiedPaths });
@@ -640,13 +668,13 @@ export class UndoControllerImpl implements UndoController {
 			this.lastSafetyManifestId = rollback.manifestId;
 			return done(this.advanceHistory(action, checkpoint, { code: "ok", changedFiles: applied.verifiedPaths }));
 		} catch {
-			this.locked = true;
-			return done({ code: "recovery_required", changedFiles: 0 });
+			this.lock("operation_failed");
+			return done(this.recoveryResult());
 		} finally {
 			const activeLease = lease;
 			if (activeLease !== undefined) {
 				await profile.measure("unlock", () =>
-					activeLease.release().catch(() => { this.locked = true; }));
+					activeLease.release().catch(() => { this.lock("workspace_lock_release_failed"); }));
 			}
 			if (this.operationProfiler === profile) this.operationProfiler = undefined;
 			this.operationAction = undefined;
@@ -704,7 +732,7 @@ export class UndoControllerImpl implements UndoController {
 			return { code: "restore_failed_safe", changedFiles: 0 };
 		}
 		if (navigation.logicalLeafId !== descriptor.toLogicalLeaf) {
-			this.locked = true;
+			this.lock("session_navigation_diverged");
 			await profile.measure("journal", () =>
 				this.dependencies.journal.setPhase(descriptor.opId, "RECOVERY_REQUIRED"));
 			return { code: "recovery_required", changedFiles: 0 };
@@ -717,7 +745,7 @@ export class UndoControllerImpl implements UndoController {
 		const cursorResult = await profile.measure("cursor", () =>
 			this.dependencies.appendCursor(this.createCursor(descriptor, action, checkpoint)));
 		if (cursorResult.kind === "recovery_required") {
-			this.locked = true;
+			this.lock(cursorResult.reason);
 			await profile.measure("journal", () =>
 				this.dependencies.journal.setPhase(descriptor.opId, "RECOVERY_REQUIRED").catch(() => {}));
 			return { code: "recovery_required", changedFiles: 0 };
@@ -742,9 +770,9 @@ export class UndoControllerImpl implements UndoController {
 			await this.dependencies.journal.setPhase(descriptor.opId, "ABORTED");
 			return { code: "restore_failed_safe", changedFiles: 0 };
 		} catch {
-			this.locked = true;
+			this.lock("session_only_recovery_failed");
 			await this.dependencies.journal.setPhase(descriptor.opId, "RECOVERY_REQUIRED").catch(() => {});
-			return { code: "recovery_required", changedFiles: 0 };
+			return this.recoveryResult();
 		}
 	}
 
@@ -826,9 +854,9 @@ export class UndoControllerImpl implements UndoController {
 		} catch {
 			// 下面统一进入 recovery lock。
 		}
-		this.locked = true;
+		this.lock("compensation_failed");
 		await this.dependencies.journal.setPhase(descriptor.opId, "RECOVERY_REQUIRED").catch(() => {});
-		return { code: "recovery_required", changedFiles: failure.verifiedPaths };
+		return this.recoveryResult(failure.verifiedPaths);
 	}
 
 	private createCheckpoint(

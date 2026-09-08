@@ -1,4 +1,4 @@
-import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -65,6 +65,36 @@ function cursor(path: string, overrides: Partial<CursorState> = {}): CursorState
 	const next = { ...payload, ...overrides };
 	const { checksum: _checksum, ...content } = next as typeof next & { checksum?: string };
 	return { ...next, checksum: overrides.checksum ?? checksum(canonicalJson(content)) };
+}
+
+function inertPlan() {
+	const payload = {
+		boundaryRoots: [],
+		currentManifestId: "b".repeat(64) as ManifestId,
+		deletePaths: [],
+		scopePaths: [],
+		targetManifestId: "a".repeat(64) as ManifestId,
+		writePaths: [],
+	};
+	return { ...payload, planDigest: checksum(canonicalJson(payload)) };
+}
+
+function inertDescriptor(path: string, planDigest: string): OperationDescriptor {
+	return descriptor(path, {
+		coverage: `paths:${checksum(canonicalJson([]))}`,
+		scopePaths: [],
+		planDigest,
+	});
+}
+
+async function inertFixture(plan = inertPlan()) {
+	const root = await temporaryRoot("pi-undo-inert-journal-");
+	const store = new JournalStore({ transactionsRoot: join(root, "transactions") });
+	const operation = inertDescriptor(join(root, "session.jsonl"), plan.planDigest);
+	await store.prepare(operation, plan);
+	const [pending] = await store.loadPending();
+	if (pending === undefined) throw new Error("测试 fixture 未生成 pending journal");
+	return { root, store, operation, plan, pending };
 }
 
 afterEach(async () => {
@@ -164,6 +194,101 @@ describe("JournalStore", () => {
 
 		const store = new JournalStore({ transactionsRoot: join(root, "transactions") });
 		expect(await store.loadPending()).toEqual([]);
+	});
+});
+
+describe("foreign PREPARED transaction", () => {
+	it("严格空 plan 即使存在 transaction 目录外 artifact 也可证明 inert", async () => {
+		const { root, store, pending } = await inertFixture();
+		await mkdir(join(root, "durable-cache", "shared"), { recursive: true });
+		await writeFile(join(root, "durable-cache", "shared", "durable-pack-v1.bin"), "unrelated cache");
+		await writeFile(join(root, "native-request-v1.json"), "unrelated request");
+
+		expect(await store.isInertForeignPrepared(pending)).toBe(true);
+	});
+
+	it("transaction 目录中的 mutation、durable pack 或额外文件都会 fail closed", async () => {
+		const extras = ["durable-pack-v1.bin", "native-request-v1.json", "unexpected.txt"];
+		for (const extra of extras) {
+			const { root, operation, store, pending } = await inertFixture();
+			await writeFile(join(root, "transactions", operation.opId, extra), "unexpected");
+			expect(await store.isInertForeignPrepared(pending)).toBe(false);
+		}
+	});
+
+	it("mutation journal evidence 和 transaction 内符号链接都不能被忽略", async () => {
+		const mutation = await inertFixture();
+		await mutation.store.mutationJournal(mutation.operation.opId).begin({
+			kind: "delete",
+			path: "a.txt",
+			sourceArtifact: ".pi-undo-q1-source",
+			targetArtifact: null,
+			sourceFingerprint: "c".repeat(64),
+			targetFingerprint: "d".repeat(64),
+		});
+		expect(await mutation.store.isInertForeignPrepared(mutation.pending)).toBe(false);
+
+		const linked = await inertFixture();
+		const descriptorPath = join(linked.root, "transactions", linked.operation.opId, "descriptor.json");
+		const externalDescriptor = join(linked.root, "outside.json");
+		await writeFile(externalDescriptor, canonicalJson(linked.operation));
+		await rm(descriptorPath);
+		await symlink(externalDescriptor, descriptorPath);
+		expect(await linked.store.isInertForeignPrepared(linked.pending)).toBe(false);
+	});
+
+	it("transaction 目录被外部目录符号链接替换时 fail closed", async () => {
+		const { root, store, operation, pending } = await inertFixture();
+		const directory = join(root, "transactions", operation.opId);
+		const external = join(root, "moved-transaction");
+		await rename(directory, external);
+		await symlink(external, directory);
+
+		expect(await store.isInertForeignPrepared(pending)).toBe(false);
+	});
+
+	it("非空 scope、phase 变化和 plan 内容变化都不能通过 inert 检查", async () => {
+		const scopedRoot = await temporaryRoot("pi-undo-scoped-journal-");
+		const scopedStore = new JournalStore({ transactionsRoot: join(scopedRoot, "transactions") });
+		const scopedOperation = descriptor(join(scopedRoot, "session.jsonl"));
+		await scopedStore.prepare(scopedOperation, { planDigest: scopedOperation.planDigest });
+		const [scopedPending] = await scopedStore.loadPending();
+		if (scopedPending === undefined) throw new Error("测试 fixture 未生成 scoped pending journal");
+		expect(await scopedStore.isInertForeignPrepared(scopedPending)).toBe(false);
+
+		const phased = await inertFixture();
+		await phased.store.setPhase(phased.operation.opId, "SESSION_MOVED");
+		expect(await phased.store.isInertForeignPrepared(phased.pending)).toBe(false);
+
+		const { scopePaths: _scopePaths, ...unscopedPlan } = inertPlan();
+		for (const plan of [
+			{ ...inertPlan(), writePaths: ["changed.txt"] },
+			{ ...inertPlan(), currentManifestId: "c".repeat(64) },
+			{ ...inertPlan(), unexpected: [] },
+			unscopedPlan,
+		]) {
+			const changed = await inertFixture();
+			await writeFile(
+				join(changed.root, "transactions", changed.operation.opId, "restore-plan.json"),
+				canonicalJson(plan),
+			);
+			const [current] = await changed.store.loadPending();
+			if (current === undefined) throw new Error("测试 fixture 未生成篡改后的 pending journal");
+			expect(await changed.store.isInertForeignPrepared(current)).toBe(false);
+		}
+
+		const invalidDigest = await inertFixture({ ...inertPlan(), planDigest: "e".repeat(64) });
+		expect(await invalidDigest.store.isInertForeignPrepared(invalidDigest.pending)).toBe(false);
+	});
+
+	it("控制文件读取失败或 pending 已过期时返回 false 而不是抛错", async () => {
+		const missing = await inertFixture();
+		await rm(join(missing.root, "transactions", missing.operation.opId, "state.json"));
+		expect(await missing.store.isInertForeignPrepared(missing.pending)).toBe(false);
+
+		const stale = await inertFixture();
+		await stale.store.setPhase(stale.operation.opId, "SESSION_MOVED");
+		expect(await stale.store.isInertForeignPrepared(stale.pending)).toBe(false);
 	});
 });
 

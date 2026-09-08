@@ -596,7 +596,7 @@ describe("StatusReporter", () => {
 		expect(fake.statuses.map(([key]) => key)).toEqual(["pi-undo", "pi-undo", "pi-undo", "pi-undo", "pi-undo"]);
 		expect(fake.statuses[0]![1]).toContain("undo:2");
 		expect(fake.statuses[1]![1]).not.toMatch(/[\n\r\u0007]|private|secret|TOKEN/);
-		expect(fake.statuses[3]![1]).toBe("recovery_required files:2 op:operation-1");
+		expect(fake.statuses[3]![1]).toBe("recovery_required reason:mutation_conflict files:2 op:operation-1");
 		expect(fake.statuses.at(-1)).toEqual(["pi-undo", undefined]);
 	});
 

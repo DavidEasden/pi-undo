@@ -64,6 +64,7 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 		workspaceIdentity: initialTopology.workspaceIdentity,
 		getLogicalLeafId: () => sessionStateFor(manager).getLogicalLeafId(),
 		loadPending: () => journal.loadPending(),
+		assessForeignTransaction: (pending) => journal.isInertForeignPrepared(pending),
 		inspectCursor: (pending) => inspectCursorMarkers(pending.descriptor.sessionIdentity.path, pending.descriptor),
 		finalizeCursor: (pending, inspection) => finalizeCursorMarker(
 			pending.descriptor.sessionIdentity.path,
@@ -259,6 +260,7 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 	const controller = new UndoControllerImpl(dependencies, {
 		...rebuildControllerState(manager, sessionIdentity),
 		locked: startupRecovery.kind === "locked",
+		recoveryReason: startupRecovery.kind === "locked" ? startupRecovery.reason : undefined,
 		recoveryCompleted: true,
 	});
 	return {
@@ -266,7 +268,7 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 		reporter: new StatusReporter(context),
 		diffSource: store,
 		recovery: startupRecovery.kind === "locked"
-			? { files: startupRecovery.files, opId: startupRecovery.opId }
+			? { reason: startupRecovery.reason, files: startupRecovery.files, opId: startupRecovery.opId }
 			: undefined,
 		setCommandContext(next: ExtensionCommandContext | undefined): void {
 			commandContext = next;

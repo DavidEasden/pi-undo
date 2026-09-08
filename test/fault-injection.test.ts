@@ -38,12 +38,17 @@ function manifest(seed: string): SnapshotManifest {
 	};
 }
 
-function pending(scopePaths: readonly string[] = ["file.txt"]): PendingJournal {
+interface PendingOptions {
+	readonly sessionIdentity?: SessionFileIdentity;
+	readonly workspaceIdentity?: string;
+}
+
+function pending(scopePaths: readonly string[] = ["file.txt"], options: PendingOptions = {}): PendingJournal {
 	const descriptorPayload = {
 		schemaVersion: 1 as const,
 		opId: "operation-1",
-		sessionIdentity: identity,
-		workspaceIdentity: "/workspace",
+		sessionIdentity: options.sessionIdentity ?? identity,
+		workspaceIdentity: options.workspaceIdentity ?? "/workspace",
 		action: "undo" as const,
 		fromLogicalLeaf: "after",
 		toLogicalLeaf: "before",
@@ -73,17 +78,25 @@ function pending(scopePaths: readonly string[] = ["file.txt"]): PendingJournal {
 	};
 }
 
+interface FixtureOptions extends PendingOptions {
+	readonly assessForeignTransaction?: (journal: PendingJournal) => Promise<boolean>;
+}
+
 function fixture(
 	marker: "absent" | "match" | "conflict",
 	leaf: string | null,
 	mutationResult: "clean" | "conflict" = "clean",
 	scopePaths: readonly string[] = ["file.txt"],
+	options: FixtureOptions = {},
 ) {
-	let journals: PendingJournal[] = [pending(scopePaths)];
+	let journals: PendingJournal[] = [pending(scopePaths, options)];
 	const calls: string[] = [];
 	const recovery = new JournalRecovery({
 		sessionIdentity: identity,
 		workspaceIdentity: "/workspace",
+		...(options.assessForeignTransaction === undefined
+			? {}
+			: { assessForeignTransaction: options.assessForeignTransaction }),
 		getLogicalLeafId: () => leaf,
 		loadPending: async () => journals,
 		inspectCursor: async () => marker === "match"
@@ -178,6 +191,59 @@ describe("JournalRecovery fault injection", () => {
 
 		expect(await recovery.recover()).toMatchObject({ kind: "locked", reason: "session_leaf_mismatch" });
 		expect(calls).toEqual([]);
+	});
+
+	it("严格证明 foreign session-only transaction 时跳过且不触碰 mutation 或 workspace", async () => {
+		let assessed = 0;
+		const { recovery, calls } = fixture("absent", "after", "clean", [], {
+			sessionIdentity: { ...identity, path: "/sessions/old-session.jsonl" },
+			assessForeignTransaction: async () => {
+				assessed += 1;
+				return true;
+			},
+		});
+
+		expect(await recovery.recover()).toEqual({ kind: "recovered", operations: 0 });
+		expect(assessed).toBe(1);
+		expect(calls).toEqual([]);
+	});
+
+	it("foreign identity 证据不足或 workspace 不匹配时保持 recovery lock", async () => {
+		const foreign = { ...identity, path: "/sessions/old-session.jsonl" };
+		const rejected = fixture("absent", "after", "clean", [], {
+			sessionIdentity: foreign,
+			assessForeignTransaction: async () => false,
+		});
+		expect(await rejected.recovery.recover()).toMatchObject({
+			kind: "locked",
+			reason: "session_identity_mismatch",
+		});
+		expect(rejected.calls).toEqual([]);
+
+		const failed = fixture("absent", "after", "clean", [], {
+			sessionIdentity: foreign,
+			assessForeignTransaction: async () => { throw new Error("assessment failed"); },
+		});
+		expect(await failed.recovery.recover()).toMatchObject({
+			kind: "locked",
+			reason: "session_identity_mismatch",
+		});
+		expect(failed.calls).toEqual([]);
+
+		let assessed = false;
+		const wrongWorkspace = fixture("absent", "after", "clean", [], {
+			workspaceIdentity: "/other-workspace",
+			assessForeignTransaction: async () => {
+				assessed = true;
+				return true;
+			},
+		});
+		expect(await wrongWorkspace.recovery.recover()).toMatchObject({
+			kind: "locked",
+			reason: "workspace_identity_mismatch",
+		});
+		expect(assessed).toBe(false);
+		expect(wrongWorkspace.calls).toEqual([]);
 	});
 });
 
