@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import { GitRunner, type GitRunOptions, type GitRunResult } from "../src/git-runner.ts";
 import { MutationJournal } from "../src/mutation-journal.ts";
+import type { ManifestId } from "../src/model.ts";
 import type { NativeMetadataEntry, NativeMetadataPort } from "../src/native-metadata.ts";
 import { RestoreEngine } from "../src/restore-engine.ts";
 import { RootDiscovery } from "../src/root-discovery.ts";
@@ -541,6 +542,101 @@ describe("undo/redo restore performance", () => {
 			await rm(journalRoot, { recursive: true, force: true });
 		}
 	}, 180_000);
+
+	it("完整 restore 冷 blob 按 root 批量预取，不产生每文件 cat-file blob", async () => {
+		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-complete-prefetch-"));
+		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-complete-prefetch-store-"));
+		const journalRoot = await mkdtemp(join(tmpdir(), "pi-undo-complete-prefetch-journal-"));
+		try {
+			const files = Array.from(
+				{ length: 48 },
+				(_, index) => `file-${String(index).padStart(2, "0")}.txt`,
+			);
+			await Promise.all(files.map((path, index) => writeFile(join(workspace, path), `before ${index}\n`)));
+			const git = new CountingGitRunner();
+			const discovery = new RootDiscovery(git);
+			const store = new SnapshotStore({ storeRoot, git, discovery });
+			const restore = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+			const topology = await discovery.discover(workspace);
+			const target = await store.capture(topology);
+			await Promise.all(files.map((path, index) => writeFile(join(workspace, path), `after ${index}\n`)));
+			const current = await store.capture(topology);
+			const plan = await restore.plan(current, target);
+			git.calls.length = 0;
+
+			const result = await restore.apply(plan, target, {
+				opId: "op-complete-prefetch",
+				mutationJournal: new MutationJournal(join(journalRoot, "mutations.jsonl"), "op-complete-prefetch"),
+			});
+
+			expect(result.code).toBe("ok");
+			expect(plan.scopePaths).toBeUndefined();
+			expect(plan.writePaths).toHaveLength(48);
+			const singleBlobReads = git.calls.filter((args) =>
+				args.includes("cat-file") && args.includes("blob") && !args.includes("--batch")).length;
+			expect(singleBlobReads).toBe(0);
+			expect(git.calls.filter((args) => args.includes("cat-file") && args.includes("--batch")).length)
+				.toBeGreaterThanOrEqual(1);
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+			await rm(journalRoot, { recursive: true, force: true });
+		}
+	}, 120_000);
+
+	it("restore 校验并发读取 blob 且不超过上限", async () => {
+		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-verify-concurrency-"));
+		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-verify-concurrency-store-"));
+		const journalRoot = await mkdtemp(join(tmpdir(), "pi-undo-verify-concurrency-journal-"));
+		class CountingReadBlobStore extends SnapshotStore {
+			active = 0;
+			maxActive = 0;
+			override async readBlob(
+				id: ManifestId,
+				root: string,
+				blobId: string,
+				relativePath?: string,
+			): Promise<Uint8Array> {
+				this.active += 1;
+				this.maxActive = Math.max(this.maxActive, this.active);
+				try {
+					await new Promise((resolve) => setTimeout(resolve, 5));
+					return await super.readBlob(id, root, blobId, relativePath);
+				} finally {
+					this.active -= 1;
+				}
+			}
+		}
+		try {
+			const files = Array.from(
+				{ length: 40 },
+				(_, index) => `file-${String(index).padStart(2, "0")}.txt`,
+			);
+			await Promise.all(files.map((path, index) => writeFile(join(workspace, path), `before ${index}\n`)));
+			const discovery = new RootDiscovery();
+			const store = new CountingReadBlobStore({ storeRoot, discovery });
+			const restore = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+			const topology = await discovery.discover(workspace);
+			const target = await store.capture(topology);
+			await Promise.all(files.map((path, index) => writeFile(join(workspace, path), `after ${index}\n`)));
+			const current = await store.capture(topology);
+			const plan = await restore.plan(current, target);
+			store.maxActive = 0;
+
+			const result = await restore.apply(plan, target, {
+				opId: "op-verify-concurrency",
+				mutationJournal: new MutationJournal(join(journalRoot, "mutations.jsonl"), "op-verify-concurrency"),
+			});
+
+			expect(result.code).toBe("ok");
+			expect(store.maxActive).toBeGreaterThanOrEqual(2);
+			expect(store.maxActive).toBeLessThanOrEqual(32);
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+			await rm(journalRoot, { recursive: true, force: true });
+		}
+	}, 120_000);
 
 	it("scoped restore 的 Git 调用数不随未改动文件线性增长", async () => {
 		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-perf-"));

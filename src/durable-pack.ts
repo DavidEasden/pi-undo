@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { copyFile, link, lstat, open, readFile, rename, rm, type FileHandle } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 
@@ -194,7 +194,12 @@ export async function createDurablePack(
 		await rm(temporary, { force: true }).catch(() => {});
 		throw error;
 	}
-	const packChecksum = checksum(Buffer.concat([MAGIC, lengthBytes, headerBytes, ...payloads]));
+	const digest = createHash("sha256");
+	digest.update(MAGIC);
+	digest.update(lengthBytes);
+	digest.update(headerBytes);
+	for (const payload of payloads) digest.update(payload);
+	const packChecksum = digest.digest("hex");
 	return durablePackFromInput(input.opId, input.planDigest, packPath, packChecksum, entries);
 }
 
