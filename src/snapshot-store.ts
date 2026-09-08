@@ -210,6 +210,8 @@ export class SnapshotStore {
 	private readonly blobCache = new Map<string, CachedBlob>();
 	private readonly visibleLeafCache = new Map<string, Map<string, CachedVisibleLeaf>>();
 	private readonly leafCacheDirectoriesLoaded = new Set<string>();
+	private readonly configuredPrivateRepositories = new Set<string>();
+	private readonly leafCacheDirtyDirectories = new Set<string>();
 	private blobCacheBytes = 0;
 
 	constructor(options: SnapshotStoreOptions = {}) {
@@ -741,6 +743,61 @@ export class SnapshotStore {
 		return (await this.readBlobOperation(id, [{ rootPath, blobId, relativePath }], false))[0]!;
 	}
 
+	/** 按 root 批量预取普通文件 blob；membership 与 manifest 校验仍走只读路径。 */
+	async prefetchBlobs(id: ManifestId, requests: readonly SnapshotBlobRequest[]): Promise<void> {
+		if (requests.length === 0) return;
+		for (const request of requests) {
+			relativeSafePath("/", request.rootPath);
+			if (!isObjectId(request.blobId)) {
+				throw new SnapshotStoreError("object_missing", "blob ID 无效");
+			}
+			if (request.relativePath === undefined) {
+				throw new SnapshotStoreError("object_missing", "blob 预取必须提供 root-relative path");
+			}
+		}
+		const manifestPath = await this.findManifestPath(id);
+		const manifest = await this.loadManifest(id);
+		const roots = new Map(manifest.roots.map((root) => [root.relativeRoot, root]));
+		const storeDirectory = dirname(dirname(manifestPath));
+		const byRoot = new Map<string, SnapshotBlobRequest[]>();
+		for (const request of requests) {
+			const grouped = byRoot.get(request.rootPath) ?? [];
+			grouped.push(request);
+			byRoot.set(request.rootPath, grouped);
+		}
+		try {
+			const grouped = new Map<string, Map<string, CapturedTreeEntry>>();
+			for (const [rootPath, rootRequests] of byRoot) {
+				const root = roots.get(rootPath);
+				if (root === undefined) {
+					throw new SnapshotStoreError("root_not_found", "manifest 中不存在指定 root");
+				}
+				if (root.state !== "active" || root.treeId === null) {
+					throw new SnapshotStoreError("object_missing", "指定 root 没有可读取的 tree");
+				}
+				const gitDirectory = this.rootGitDirectory(storeDirectory, root);
+				const entries = await this.readTreeEntries(gitDirectory, root.treeId);
+				const byPath = new Map(entries.map((entry) => [entry.relativePath, entry]));
+				const unique = grouped.get(gitDirectory) ?? new Map<string, CapturedTreeEntry>();
+				for (const request of rootRequests) {
+					const safeRelativePath = relativeSafePath("/", request.relativePath!);
+					const entry = byPath.get(safeRelativePath);
+					if (entry === undefined || entry.objectId !== request.blobId) {
+						throw new SnapshotStoreError("object_missing", "blob 不属于指定 root tree path");
+					}
+					unique.set(entry.objectId, entry);
+				}
+				grouped.set(gitDirectory, unique);
+			}
+			for (const [gitDirectory, unique] of grouped) {
+				await this.preloadBlobBytes(gitDirectory, [...unique.values()]);
+			}
+		} catch (error) {
+			if (error instanceof SnapshotStoreError) throw error;
+			throw new SnapshotStoreError("object_missing", "blob 无法预取", { cause: error });
+		}
+	}
+
 	private readBlobsValidated(
 		id: ManifestId,
 		requests: readonly SnapshotBlobRequest[],
@@ -1155,9 +1212,10 @@ export class SnapshotStore {
 
 	private rememberVisibleLeaves(update: VisibleLeafCacheUpdate): void {
 		const { gitDirectory, staged, inclusions } = update;
+		const previous = this.visibleLeafCache.get(gitDirectory);
 		const cache = inclusions !== null && inclusions.length === 0
 			? new Map<string, CachedVisibleLeaf>()
-			: new Map(this.visibleLeafCache.get(gitDirectory));
+			: new Map(previous);
 		if (inclusions !== null && inclusions.length > 0) {
 			for (const relativePath of cache.keys()) {
 				if (inclusions.some((inclusion) => isPathAtOrBelow(inclusion, relativePath))) {
@@ -1173,6 +1231,9 @@ export class SnapshotStore {
 				continue;
 			}
 			cache.set(leaf.relativePath, { ...leaf, objectId, verifiedAtNs: staged.verifiedAtNs });
+		}
+		if (!samePersistedLeafCache(previous, cache)) {
+			this.leafCacheDirtyDirectories.add(storeDirectoryForGitDirectory(gitDirectory));
 		}
 		this.visibleLeafCache.set(gitDirectory, cache);
 	}
@@ -1210,6 +1271,7 @@ export class SnapshotStore {
 
 	/** 把当前 storeDirectory 范围内的叶子缓存原子写入磁盘（best-effort）。 */
 	private async persistLeafCache(storeDirectory: string): Promise<void> {
+		if (!this.leafCacheDirtyDirectories.has(storeDirectory)) return;
 		const prefix = `${storeDirectory}${sep}`;
 		const entries: Record<string, Record<string, PersistedLeafCacheEntry>> = {};
 		for (const [gitDirectory, cache] of this.visibleLeafCache) {
@@ -1235,6 +1297,7 @@ export class SnapshotStore {
 				Buffer.from(JSON.stringify({ schemaVersion: 1, entries }), "utf8"),
 				0o600,
 			);
+			this.leafCacheDirtyDirectories.delete(storeDirectory);
 		} catch {
 			// 缓存写入是 best-effort：失败只影响下次性能，不影响正确性。
 		}
@@ -1428,9 +1491,11 @@ export class SnapshotStore {
 	}
 
 	private async configurePrivateRepository(gitDirectory: string): Promise<void> {
+		if (this.configuredPrivateRepositories.has(gitDirectory)) return;
 		const environment = cleanGitEnvironment();
 		await this.runGit(["--git-dir", gitDirectory, "config", "gc.auto", "0"], { env: environment });
 		await this.runGit(["--git-dir", gitDirectory, "config", "maintenance.auto", "false"], { env: environment });
+		this.configuredPrivateRepositories.add(gitDirectory);
 	}
 
 	private async assertNoAlternates(gitDirectory: string): Promise<void> {
@@ -1980,6 +2045,35 @@ function treeBlobMembershipKey(gitDirectory: string, treeId: string, relativePat
 
 function blobCacheKey(gitDirectory: string, objectId: string): string {
 	return `${gitDirectory}\0${objectId}`;
+}
+
+function storeDirectoryForGitDirectory(gitDirectory: string): string {
+	return dirname(dirname(dirname(gitDirectory)));
+}
+
+function samePersistedLeafCache(
+	left: ReadonlyMap<string, CachedVisibleLeaf> | undefined,
+	right: ReadonlyMap<string, CachedVisibleLeaf>,
+): boolean {
+	if (left === undefined) return right.size === 0;
+	if (left.size !== right.size) return false;
+	for (const [path, entry] of right) {
+		const existing = left.get(path);
+		const existingTrusted = existing !== undefined &&
+			existing.verifiedAtNs > existing.changedAtNs + RACY_CLEAN_WINDOW_NS;
+		const entryTrusted = entry.verifiedAtNs > entry.changedAtNs + RACY_CLEAN_WINDOW_NS;
+		if (
+			existing === undefined ||
+			existing.kind !== entry.kind ||
+			existing.mode !== entry.mode ||
+			existing.fingerprint !== entry.fingerprint ||
+			existing.cacheable !== entry.cacheable ||
+			existing.objectId !== entry.objectId ||
+			existing.changedAtNs !== entry.changedAtNs ||
+			existingTrusted !== entryTrusted
+		) return false;
+	}
+	return true;
 }
 
 function blobReadBatches(entries: readonly CapturedTreeEntry[]): CapturedTreeEntry[][] {

@@ -79,6 +79,27 @@ describe("DurablePack", () => {
 		});
 	});
 
+	it("packChecksum 等于 pack 文件内容的增量 sha256", async () => {
+		const { journal } = await fixture();
+		const planDigest = "b".repeat(64);
+		const fingerprint = fingerprintBytes("a.txt", Buffer.from("payload\n"), 0o644);
+		const pack = await createDurablePack(journal, {
+			opId: "operation-1",
+			planDigest,
+			entries: [{
+				path: "a.txt",
+				sourceArtifact: ".pi-undo-q2-55555555555555555555555555555555-source",
+				targetArtifact: ".pi-undo-q2-55555555555555555555555555555555-target",
+				sourceFingerprint: fingerprint,
+				targetFingerprint: fingerprint,
+				variants: [{ kind: "file", fingerprint, mode: 0o644, bytes: Buffer.from("payload\n") }],
+			}],
+		});
+
+		const bytes = await readFile(durablePackPath(journal));
+		expect(pack.packChecksum).toBe(checksum(bytes));
+	});
+
 	it("payload 或 planDigest 被篡改时拒绝启用 pack", async () => {
 		const { journal } = await fixture();
 		const planDigest = "e".repeat(64);

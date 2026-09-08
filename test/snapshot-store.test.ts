@@ -1,4 +1,4 @@
-import { access, chmod, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -469,6 +469,62 @@ describe("SnapshotStore", () => {
 		expect(refreshed.manifestId).not.toBe(baseline.manifestId);
 		expect(git.calls.some((call) => call.args[0] === "write-tree")).toBe(true);
 		expect(git.missing).toBe(false);
+	});
+
+	it("无变化时跳过 leaf-cache 原子写，且私有 Git 配置只执行一次", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, "file.txt", "stable\n");
+		await new Promise((resolve) => setTimeout(resolve, 2_100));
+		const git = new RecordingGitRunner();
+		const discovery = new RootDiscovery(git);
+		const store = new SnapshotStore({ storeRoot, git, discovery });
+		const topology = await discovery.discover(workspace);
+
+		await store.capture(topology);
+		const storesDirectory = join(storeRoot, "stores");
+		const storeDirectory = join(storesDirectory, (await readdir(storesDirectory))[0]!);
+		const cachePath = join(storeDirectory, "leaf-cache.json");
+		const before = await stat(cachePath, { bigint: true });
+		const configCalls = git.calls.filter((call) => call.args.includes("gc.auto")).length;
+		expect(configCalls).toBeGreaterThan(0);
+
+		git.calls.length = 0;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		await store.capture(topology);
+		const after = await stat(cachePath, { bigint: true });
+
+		expect(after.mtimeNs).toBe(before.mtimeNs);
+		expect(git.calls.filter((call) => call.args.includes("gc.auto"))).toEqual([]);
+		expect(git.calls.filter((call) => call.args.includes("maintenance.auto"))).toEqual([]);
+	});
+
+	it("racy-clean 窗口结束后持久化新的可信 leaf-cache 时间", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, "file.txt", "stable\n");
+		const store = new SnapshotStore({ storeRoot });
+		const topology = await new RootDiscovery().discover(workspace);
+
+		await store.capture(topology);
+		const storesDirectory = join(storeRoot, "stores");
+		const storeDirectory = join(storesDirectory, (await readdir(storesDirectory))[0]!);
+		const cachePath = join(storeDirectory, "leaf-cache.json");
+		await new Promise((resolve) => setTimeout(resolve, 2_100));
+		await store.capture(topology);
+
+		const cache = JSON.parse(await readFile(cachePath, "utf8")) as {
+			readonly entries: Record<string, Record<string, {
+				readonly changedAtNs: string;
+				readonly verifiedAtNs: string;
+			}>>;
+		};
+		const rootEntries = Object.values(cache.entries)[0];
+		const file = rootEntries?.["file.txt"];
+		expect(file).toBeDefined();
+		expect(BigInt(file!.verifiedAtNs)).toBeGreaterThan(
+			BigInt(file!.changedAtNs) + 2_000_000_000n,
+		);
 	});
 
 	it("损坏的 leaf-cache.json 被忽略，capture 正常走冷路径", async () => {

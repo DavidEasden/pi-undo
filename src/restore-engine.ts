@@ -38,6 +38,7 @@ const PREPARED_PLAN_CACHE_LIMIT = 16;
 const RESTORE_FILE_BATCH_MAX_ENTRIES = 1_024;
 const RESTORE_FILE_BATCH_MAX_BYTES = 64 * 1024 * 1024;
 const RESTORE_FILE_PREPARE_CONCURRENCY = 32;
+const RESTORE_FILE_VERIFY_CONCURRENCY = 32;
 
 export interface RestorePlan {
 	currentManifestId: ManifestId;
@@ -519,9 +520,20 @@ export class RestoreEngine {
 			return { code: "recovery_required", verifiedPaths: 0, totalPaths: currentPaths.size };
 		}
 		try {
-			await this.assertCompleteVisibleSubset(topologyBefore, [current, target], options.mutationJournal);
+			await this.assertCompleteVisibleSubset(
+				topologyBefore,
+				[current, target],
+				options.mutationJournal,
+				[],
+				this.completeCoverageOwnedPaths(plan.scopePaths, [currentPaths, targetPaths]),
+			);
 		} catch {
 			return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
+		}
+		try {
+			await this.prefetchCompleteRestoreBlobs(plan, current, target, currentPaths, targetPaths);
+		} catch {
+			// 预取是性能优化；失败时继续走原有逐文件校验和可恢复 mutation 路径。
 		}
 		let durablePack: DurablePack | undefined;
 		if (
@@ -625,7 +637,13 @@ export class RestoreEngine {
 
 			const topologyAfter = await this.discovery.discover(this.workspaceRoot);
 			assertUnchangedTopology(topologyBefore, topologyAfter);
-			await this.assertCompleteVisibleSubset(topologyAfter, [target], options.mutationJournal);
+			await this.assertCompleteVisibleSubset(
+				topologyAfter,
+				[target],
+				options.mutationJournal,
+				[],
+				this.completeCoverageOwnedPaths(plan.scopePaths, [targetPaths]),
+			);
 			const verification = await this.verifyTarget(
 				target,
 				currentPaths,
@@ -702,6 +720,7 @@ export class RestoreEngine {
 						? []
 						: [artifacts.source, ...(artifacts.target === null ? [] : [artifacts.target])];
 				}),
+				this.completeCoverageOwnedPaths(plan.scopePaths, [targetPaths]),
 			);
 			const totalPaths = plan.deletePaths.length + plan.writePaths.length;
 			if ((await options.mutationJournal.load()).length !== 0) {
@@ -887,6 +906,41 @@ export class RestoreEngine {
 		return result;
 	}
 
+	private completeCoverageOwnedPaths(
+		scopePaths: readonly string[] | undefined,
+		ownedPaths: readonly ReadonlyMap<string, OwnedPath>[],
+	): readonly ReadonlyMap<string, OwnedPath>[] | undefined {
+		return scopePaths === undefined ? ownedPaths : undefined;
+	}
+
+	private async prefetchCompleteRestoreBlobs(
+		plan: RestorePlan,
+		current: SnapshotManifest,
+		target: SnapshotManifest,
+		currentPaths: ReadonlyMap<string, OwnedPath>,
+		targetPaths: ReadonlyMap<string, OwnedPath>,
+	): Promise<void> {
+		if (plan.scopePaths !== undefined || !SnapshotStore.supportsValidatedBlobBatch(this.store)) return;
+		const requestsFor = (paths: ReadonlyMap<string, OwnedPath>, extraPaths: readonly string[] = []) => {
+			const requests = [];
+			const requested = new Set([...plan.writePaths, ...extraPaths]);
+			for (const path of requested) {
+				const owned = paths.get(path);
+				if (owned === undefined || owned.entry.kind !== "file" || owned.entry.blobId === null) continue;
+				requests.push({
+					rootPath: owned.root.relativeRoot,
+					blobId: owned.entry.blobId,
+					relativePath: owned.entry.relativePath,
+				});
+			}
+			return requests;
+		};
+		await Promise.all([
+			this.store.prefetchBlobs(current.manifestId, requestsFor(currentPaths, plan.deletePaths)),
+			this.store.prefetchBlobs(target.manifestId, requestsFor(targetPaths)),
+		]);
+	}
+
 	private assertCurrentTopology(
 		current: SnapshotManifest,
 		target: SnapshotManifest,
@@ -926,12 +980,13 @@ export class RestoreEngine {
 		const paths = [...new Set([...currentPaths.keys(), ...targetPaths.keys()])]
 			.filter((path) => scope === undefined || scope.has(path))
 			.sort(comparePaths);
-		let verifiedPaths = 0;
-		for (const path of paths) {
-			if (await this.pathIsShadowedByTarget(target.manifestId, path, targetPaths)) {
-				verifiedPaths += 1;
-				continue;
-			}
+		const results: Array<boolean | undefined> = new Array(paths.length);
+		let nextIndex = 0;
+		let stop = false;
+		let failure: unknown;
+		let failureIndex: number | undefined;
+		const verifyPath = async (path: string): Promise<boolean> => {
+			if (await this.pathIsShadowedByTarget(target.manifestId, path, targetPaths)) return true;
 			const currentPath = currentPaths.get(path);
 			const targetPath = targetPaths.get(path);
 			const matchesCurrent = currentPath !== undefined &&
@@ -941,7 +996,37 @@ export class RestoreEngine {
 			const matchesAbsentSide = !matchesCurrent && !matchesTarget &&
 				(currentPath === undefined || targetPath === undefined) &&
 				await this.pathIsAbsent(path);
-			if (!matchesCurrent && !matchesTarget && !matchesAbsentSide) {
+			return matchesCurrent || matchesTarget || matchesAbsentSide;
+		};
+		const worker = async (): Promise<void> => {
+			while (!stop && nextIndex < paths.length) {
+				const index = nextIndex;
+				nextIndex += 1;
+				try {
+					const ok = await verifyPath(paths[index]!);
+					results[index] = ok;
+					if (!ok) stop = true;
+				} catch (error) {
+					if (failureIndex === undefined || index < failureIndex) {
+						failure = error;
+						failureIndex = index;
+					}
+					stop = true;
+				}
+			}
+		};
+		if (paths.length > 0) {
+			await Promise.all(Array.from(
+				{ length: Math.min(RESTORE_FILE_VERIFY_CONCURRENCY, paths.length) },
+				() => worker(),
+			));
+		}
+		let verifiedPaths = 0;
+		for (let index = 0; index < results.length; index += 1) {
+			const ok = results[index];
+			if (ok === false) return { ok: false, verifiedPaths, totalPaths: paths.length };
+			if (ok === undefined) {
+				if (failureIndex === index && failure !== undefined) throw failure;
 				return { ok: false, verifiedPaths, totalPaths: paths.length };
 			}
 			verifiedPaths += 1;
@@ -1168,7 +1253,13 @@ export class RestoreEngine {
 			await this.writePlannedPaths(current.manifestId, currentPaths, rollbackPlan.writePaths, context);
 			const topologyAfter = await this.discovery.discover(this.workspaceRoot);
 			assertUnchangedTopology(topologyBefore, topologyAfter);
-			await this.assertCompleteVisibleSubset(topologyAfter, [current], options.mutationJournal);
+			await this.assertCompleteVisibleSubset(
+				topologyAfter,
+				[current],
+				options.mutationJournal,
+				[],
+				this.completeCoverageOwnedPaths(scopePaths, [currentPaths]),
+			);
 			const verification = await this.verifyTarget(
 				current,
 				targetPaths,
@@ -1205,7 +1296,13 @@ export class RestoreEngine {
 				try {
 					const topologyAfter = await this.discovery.discover(this.workspaceRoot);
 					assertUnchangedTopology(topologyBefore, topologyAfter);
-					await this.assertCompleteVisibleSubset(topologyAfter, [current], options.mutationJournal);
+					await this.assertCompleteVisibleSubset(
+						topologyAfter,
+						[current],
+						options.mutationJournal,
+						[],
+						this.completeCoverageOwnedPaths(scopePaths, [currentPaths]),
+					);
 					const verification = await this.verifyTarget(
 						current,
 						targetPaths,
@@ -1397,16 +1494,17 @@ export class RestoreEngine {
 		allowedManifests: readonly SnapshotManifest[],
 		mutationJournal?: MutationJournal,
 		extraExclusions: readonly string[] = [],
+		ownedPaths?: readonly (ReadonlyMap<string, OwnedPath> | undefined)[],
 	): Promise<void> {
 		if (allowedManifests.some((manifest) => manifest.coverage !== "complete")) {
 			return;
 		}
 		const allowedPaths = new Set<string>();
-		for (const manifest of allowedManifests) {
+		for (const [index, manifest] of allowedManifests.entries()) {
 			for (const path of ignoredWorkspacePaths(manifest)) {
 				allowedPaths.add(path);
 			}
-			const paths = await this.readOwnedPaths(manifest);
+			const paths = ownedPaths?.[index] ?? await this.readOwnedPaths(manifest);
 			for (const [path, owned] of paths) {
 				if (owned.entry.kind !== "directory") {
 					allowedPaths.add(path);
@@ -1435,23 +1533,18 @@ export class RestoreEngine {
 		deletePaths: readonly string[],
 		scopePaths?: readonly string[],
 	): Promise<{ verifiedPaths: number; totalPaths: number; pathFingerprints: string[] }> {
-		const pathFingerprints: string[] = [];
 		const scope = scopePaths === undefined ? undefined : new Set(scopePaths);
-		for (const [path, owned] of targetPaths) {
-			if (scope !== undefined && !scope.has(path)) continue;
-			pathFingerprints.push(await this.verifyEntry(target.manifestId, owned));
-		}
-		let verifiedPaths = pathFingerprints.length;
-		let totalPaths = pathFingerprints.length;
-		for (const path of deletePaths) {
-			if (
-				targetPaths.has(path) ||
-				currentPaths.get(path)?.entry.kind === "directory" ||
-				hasNonDirectoryAncestor(path, targetPaths)
-			) {
-				continue;
-			}
-			totalPaths += 1;
+		const scopedTargets = [...targetPaths].filter(([path]) => scope === undefined || scope.has(path));
+		const pathFingerprints = await mapConcurrentOrdered(
+			scopedTargets,
+			RESTORE_FILE_VERIFY_CONCURRENCY,
+			([, owned]) => this.verifyEntry(target.manifestId, owned),
+		);
+		const remainingDeletes = deletePaths.filter((path) =>
+			!targetPaths.has(path) &&
+			currentPaths.get(path)?.entry.kind !== "directory" &&
+			!hasNonDirectoryAncestor(path, targetPaths));
+		await mapConcurrentOrdered(remainingDeletes, RESTORE_FILE_VERIFY_CONCURRENCY, async (path) => {
 			try {
 				await lstat(this.absolutePath(path));
 				throw new Error(`目标应删除的路径仍然存在：${path}`);
@@ -1460,11 +1553,10 @@ export class RestoreEngine {
 					throw error;
 				}
 			}
-			verifiedPaths += 1;
-		}
+		});
 		return {
-			verifiedPaths,
-			totalPaths,
+			verifiedPaths: pathFingerprints.length + remainingDeletes.length,
+			totalPaths: pathFingerprints.length + remainingDeletes.length,
 			pathFingerprints,
 		};
 	}
