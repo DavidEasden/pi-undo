@@ -166,6 +166,39 @@ describe("pi-undo extension", () => {
 		expect(sent).toEqual([]);
 	});
 
+	it("session 初始化不启动全量 warmUp", async () => {
+		const handlers = new Map<string, (event: any, context: any) => any>();
+		const calls: string[] = [];
+		const controller = {
+			history: () => ({ undoCount: 0, redoCount: 0, locked: false }),
+			listCheckpoints: () => [],
+			recover: async () => { calls.push("recover"); },
+			captureFailed: () => false,
+			captureFailureReason: () => undefined,
+			warmUp: () => { calls.push("warmUp"); },
+			prepareInput: async () => ({ action: "continue" as const }),
+			beforeAgentStart: async () => {},
+			agentSettled: async () => {},
+			undo: async () => ({ code: "noop" as const, changedFiles: 0 }),
+			redo: async () => ({ code: "noop" as const, changedFiles: 0 }),
+			beforeTree: async () => undefined,
+			afterTree: async () => {},
+		};
+		const pi = {
+			registerCommand() {},
+			on(name: string, handler: (event: any, context: any) => any) { handlers.set(name, handler); },
+		} as unknown as ExtensionAPI;
+		createPiUndoExtension(async (context) => ({ controller, reporter: new StatusReporter(context) }))(pi);
+		const context = {
+			mode: "tui" as const,
+			ui: { setStatus: () => {}, notify: () => {}, getEditorText: () => "", setEditorText: () => {} },
+		};
+
+		await handlers.get("session_start")!({ type: "session_start" }, context);
+
+		expect(calls).toEqual(["recover"]);
+	});
+
 	it("快速输入路径在用户 message_end 后提交快照事务", async () => {
 		const handlers = new Map<string, (event: any, context: any) => any>();
 		const calls: string[] = [];

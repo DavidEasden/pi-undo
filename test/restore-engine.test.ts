@@ -1,8 +1,9 @@
-import { access, chmod, lstat, mkdtemp, readFile, readdir, readlink, rename, rm, symlink } from "node:fs/promises";
+import { access, chmod, lstat, mkdtemp, readFile, readdir, readlink, rename, rm, symlink, writeFile as writeRawFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as atomicFs from "../src/atomic-fs.ts";
 import { hasDurablePack } from "../src/durable-pack.ts";
 import { canonicalJson, checksum, topologyFingerprint } from "../src/encoding.ts";
 import { MutationJournal } from "../src/mutation-journal.ts";
@@ -430,6 +431,359 @@ describe("RestoreEngine", () => {
 		expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("target\n");
 		expect(await journal.assertCleaned()).toBeUndefined();
 		expect(await hasDurablePack(journal)).toBe(false);
+	});
+
+	it("新 RestoreEngine 可通过持久化索引复用同一 store 的 durable pack", async () => {
+		const workspace = await temporaryRoot("pi-undo-cache-index-workspace-");
+		await writeFile(workspace, "a.txt", "target\n");
+		const storeRoot = await temporaryRoot("pi-undo-cache-index-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "a.txt", "source\n");
+		const current = await store.capture(await discovery.discover(workspace), ["a.txt"]);
+		const engine1 = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+		await engine1.prepareDurableRestore(current, target, ["a.txt"]);
+
+		const engine2 = new RestoreEngine({
+			workspaceRoot: workspace,
+			store: new SnapshotStore({ storeRoot, discovery }),
+			discovery,
+		});
+		const reused = await engine2.canReuseDurableSource(current, target, ["a.txt"]);
+		const index = JSON.parse(await readFile(join(storeRoot, "durable-cache", "index.json"), "utf8")) as {
+			readonly schemaVersion: number;
+			readonly entries: readonly { readonly planDigest: string }[];
+		};
+		expect(index.schemaVersion).toBe(1);
+		expect(index.entries).toHaveLength(1);
+		expect(reused).toBe(true);
+
+		const transactionRoot = await temporaryRoot("pi-undo-cache-index-apply-");
+		const journal = new MutationJournal(join(transactionRoot, "mutations.jsonl"), "indexed-apply-1");
+		const result = await engine2.apply(await engine2.plan(current, target, ["a.txt"]), target, {
+			opId: journal.operationId,
+			mutationJournal: journal,
+			deferDurability: true,
+		});
+		expect(result.code).toBe("ok");
+		expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("target\n");
+		expect(await hasDurablePack(journal)).toBe(true);
+	});
+
+	it("索引损坏或 pack 被篡改时跨会话复用失败并回退", async () => {
+		const workspace = await temporaryRoot("pi-undo-cache-index-fail-workspace-");
+		await writeFile(workspace, "a.txt", "target\n");
+		const storeRoot = await temporaryRoot("pi-undo-cache-index-fail-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "a.txt", "source\n");
+		const current = await store.capture(await discovery.discover(workspace), ["a.txt"]);
+		const engine1 = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+		await engine1.prepareDurableRestore(current, target, ["a.txt"]);
+		const plan = await engine1.plan(current, target, ["a.txt"]);
+
+		await writeRawFile(join(storeRoot, "durable-cache", "index.json"), "{invalid");
+		const brokenIndex = new RestoreEngine({
+			workspaceRoot: workspace,
+			store: new SnapshotStore({ storeRoot, discovery }),
+			discovery,
+		});
+		expect(await brokenIndex.canReuseDurableSource(current, target, ["a.txt"])).toBe(false);
+
+		const engineRewrite = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+		await engineRewrite.prepareDurableRestore(current, target, ["a.txt"]);
+		await writeRawFile(join(storeRoot, "durable-cache", plan.planDigest, "durable-pack-v1.bin"), "tampered pack");
+		const tampered = new RestoreEngine({
+			workspaceRoot: workspace,
+			store: new SnapshotStore({ storeRoot, discovery }),
+			discovery,
+		});
+		expect(await tampered.canReuseDurableSource(current, target, ["a.txt"])).toBe(false);
+	});
+
+	it("索引写入失败不影响本进程已准备的 durable pack", async () => {
+		const workspace = await temporaryRoot("pi-undo-cache-index-write-workspace-");
+		await writeFile(workspace, "a.txt", "target\n");
+		const storeRoot = await temporaryRoot("pi-undo-cache-index-write-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "a.txt", "source\n");
+		const current = await store.capture(await discovery.discover(workspace), ["a.txt"]);
+		const originalWrite = atomicFs.writeJsonAtomic;
+		const spy = vi.spyOn(atomicFs, "writeJsonAtomic").mockImplementation(async (file, value) => {
+			if (String(file).endsWith("index.json")) throw new Error("注入 durable cache index 写入失败");
+			return originalWrite(file, value);
+		});
+		try {
+			const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+			await expect(engine.prepareDurableRestore(current, target, ["a.txt"])).resolves.toBeUndefined();
+			expect(await engine.canReuseDurableSource(current, target, ["a.txt"])).toBe(true);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("并发 prepareDurableRestore 不会互相覆盖持久化索引", async () => {
+		const workspace = await temporaryRoot("pi-undo-cache-index-concurrent-workspace-");
+		await writeFile(workspace, "a.txt", "a-target\n");
+		await writeFile(workspace, "b.txt", "b-target\n");
+		const storeRoot = await temporaryRoot("pi-undo-cache-index-concurrent-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "a.txt", "a-source\n");
+		await writeFile(workspace, "b.txt", "b-source\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+		await Promise.all([
+			engine.prepareDurableRestore(current, target, ["a.txt"]),
+			engine.prepareDurableRestore(current, target, ["b.txt"]),
+		]);
+
+		const engine2 = new RestoreEngine({
+			workspaceRoot: workspace,
+			store: new SnapshotStore({ storeRoot, discovery }),
+			discovery,
+		});
+		expect(await engine2.canReuseDurableSource(current, target, ["a.txt"])).toBe(true);
+		expect(await engine2.canReuseDurableSource(current, target, ["b.txt"])).toBe(true);
+	});
+
+	it("两个 RestoreEngine 并发更新索引时不丢失 entries", async () => {
+		const workspace = await temporaryRoot("pi-undo-cache-index-engines-workspace-");
+		await writeFile(workspace, "a.txt", "a-target\n");
+		await writeFile(workspace, "b.txt", "b-target\n");
+		const storeRoot = await temporaryRoot("pi-undo-cache-index-engines-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "a.txt", "a-source\n");
+		await writeFile(workspace, "b.txt", "b-source\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		const engineA = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+		const engineB = new RestoreEngine({
+			workspaceRoot: workspace,
+			store: new SnapshotStore({ storeRoot, discovery }),
+			discovery,
+		});
+		await Promise.all([
+			engineA.prepareDurableRestore(current, target, ["a.txt"]),
+			engineB.prepareDurableRestore(current, target, ["b.txt"]),
+		]);
+
+		const index = JSON.parse(await readFile(join(storeRoot, "durable-cache", "index.json"), "utf8")) as {
+			readonly entries: readonly { readonly planDigest: string }[];
+		};
+		expect(index.entries).toHaveLength(2);
+		const engine3 = new RestoreEngine({
+			workspaceRoot: workspace,
+			store: new SnapshotStore({ storeRoot, discovery }),
+			discovery,
+		});
+		expect(await engine3.canReuseDurableSource(current, target, ["a.txt"])).toBe(true);
+		expect(await engine3.canReuseDurableSource(current, target, ["b.txt"])).toBe(true);
+	});
+
+	it("索引读取会等待同一 engine 的持久化更新完成，避免覆盖新 entry", async () => {
+		const workspace = await temporaryRoot("pi-undo-cache-index-queue-workspace-");
+		await writeFile(workspace, "a.txt", "a-target\n");
+		await writeFile(workspace, "b.txt", "b-target\n");
+		const storeRoot = await temporaryRoot("pi-undo-cache-index-queue-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "a.txt", "a-source\n");
+		await writeFile(workspace, "b.txt", "b-source\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		const engine = new RestoreEngine({
+			workspaceRoot: workspace,
+			store,
+			discovery,
+			durablePackCacheMaxBytes: 1,
+		});
+		await engine.prepareDurableRestore(current, target, ["a.txt"]);
+
+		const internals = engine as unknown as {
+			evictPersistedDurablePacks(keepPlanDigest: string): Promise<void>;
+			readDurableIndexFromDisk(): Promise<unknown>;
+		};
+		const originalEvict = internals.evictPersistedDurablePacks.bind(engine);
+		let allowEviction!: () => void;
+		const evictionBlocked = new Promise<void>((resolve) => { allowEviction = resolve; });
+		let evictionReached!: () => void;
+		const evictionStarted = new Promise<void>((resolve) => { evictionReached = resolve; });
+		internals.evictPersistedDurablePacks = async (keepPlanDigest) => {
+			evictionReached();
+			await evictionBlocked;
+			return originalEvict(keepPlanDigest);
+		};
+		const secondPrepare = engine.prepareDurableRestore(current, target, ["b.txt"]);
+		await evictionStarted;
+
+		const originalRead = internals.readDurableIndexFromDisk.bind(engine);
+		let indexReadStarted!: () => void;
+		const indexRead = new Promise<void>((resolve) => { indexReadStarted = resolve; });
+		internals.readDurableIndexFromDisk = async () => {
+			indexReadStarted();
+			return originalRead();
+		};
+		const reuse = engine.canReuseDurableSource(current, target, ["a.txt"]);
+		const readWhilePersisting = await Promise.race([
+			indexRead.then(() => true),
+			new Promise<false>((resolve) => setTimeout(() => resolve(false), 50)),
+		]);
+		expect(readWhilePersisting).toBe(false);
+
+		allowEviction();
+		expect(await reuse).toBe(true);
+		await secondPrepare;
+		const index = JSON.parse(await readFile(join(storeRoot, "durable-cache", "index.json"), "utf8")) as {
+			readonly entries: readonly { readonly planDigest: string }[];
+		};
+		expect(index.entries).toHaveLength(2);
+	});
+
+	it("队列中的旧索引读取不会在后续写入后回退内存索引", async () => {
+		const workspace = await temporaryRoot("pi-undo-cache-index-order-workspace-");
+		await writeFile(workspace, "a.txt", "a-target\n");
+		await writeFile(workspace, "b.txt", "b-target\n");
+		const storeRoot = await temporaryRoot("pi-undo-cache-index-order-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "a.txt", "a-source\n");
+		await writeFile(workspace, "b.txt", "b-source\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		const engine = new RestoreEngine({
+			workspaceRoot: workspace,
+			store,
+			discovery,
+			durablePackCacheMaxBytes: 1,
+		});
+		await engine.prepareDurableRestore(current, target, ["a.txt"]);
+
+		const internals = engine as unknown as {
+			evictPersistedDurablePacks(keepPlanDigest: string): Promise<void>;
+			readDurableIndexFromDisk(): Promise<unknown>;
+		};
+		const originalRead = internals.readDurableIndexFromDisk.bind(engine);
+		let allowRead!: () => void;
+		const readBlocked = new Promise<void>((resolve) => { allowRead = resolve; });
+		let readReached!: () => void;
+		const readStarted = new Promise<void>((resolve) => { readReached = resolve; });
+		let blockNextRead = true;
+		internals.readDurableIndexFromDisk = async () => {
+			const result = await originalRead();
+			if (!blockNextRead) return result;
+			blockNextRead = false;
+			readReached();
+			await readBlocked;
+			return result;
+		};
+		const originalEvict = internals.evictPersistedDurablePacks.bind(engine);
+		let allowEviction!: () => void;
+		const evictionBlocked = new Promise<void>((resolve) => { allowEviction = resolve; });
+		let evictionReached!: () => void;
+		const evictionStarted = new Promise<void>((resolve) => { evictionReached = resolve; });
+		internals.evictPersistedDurablePacks = async (keepPlanDigest) => {
+			evictionReached();
+			await evictionBlocked;
+			return originalEvict(keepPlanDigest);
+		};
+
+		const reuse = engine.canReuseDurableSource(current, target, ["a.txt"]);
+		await readStarted;
+		const secondPrepare = engine.prepareDurableRestore(current, target, ["b.txt"]);
+		allowRead();
+		await evictionStarted;
+		await Promise.resolve();
+		allowEviction();
+		expect(await reuse).toBe(true);
+		await secondPrepare;
+
+		const index = JSON.parse(await readFile(join(storeRoot, "durable-cache", "index.json"), "utf8")) as {
+			readonly entries: readonly { readonly planDigest: string }[];
+		};
+		expect(index.entries).toHaveLength(2);
+	});
+
+	it("durable pack 超过内存预算时按需重新加载且保留持久化索引", async () => {
+		const workspace = await temporaryRoot("pi-undo-cache-budget-workspace-");
+		await writeFile(workspace, "a.txt", "a-target\n");
+		await writeFile(workspace, "b.txt", "b-target\n");
+		const storeRoot = await temporaryRoot("pi-undo-cache-budget-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "a.txt", "a-source\n");
+		await writeFile(workspace, "b.txt", "b-source\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		const engine = new RestoreEngine({
+			workspaceRoot: workspace,
+			store,
+			discovery,
+			durablePackCacheMaxBytes: 1,
+		});
+		await engine.prepareDurableRestore(current, target, ["a.txt"]);
+		await engine.prepareDurableRestore(current, target, ["b.txt"]);
+
+		const index = JSON.parse(await readFile(join(storeRoot, "durable-cache", "index.json"), "utf8")) as {
+			readonly entries: readonly { readonly planDigest: string }[];
+		};
+		expect(index.entries).toHaveLength(2);
+		expect(await engine.canReuseDurableSource(current, target, ["a.txt"])).toBe(true);
+		expect(await engine.canReuseDurableSource(current, target, ["b.txt"])).toBe(true);
+
+		const nextEngine = new RestoreEngine({
+			workspaceRoot: workspace,
+			store: new SnapshotStore({ storeRoot, discovery }),
+			discovery,
+			durablePackCacheMaxBytes: 1,
+		});
+		expect(await nextEngine.canReuseDurableSource(current, target, ["a.txt"])).toBe(true);
+		expect(await nextEngine.canReuseDurableSource(current, target, ["b.txt"])).toBe(true);
+	});
+
+	it("索引临时不可用时不覆盖磁盘旧 entries，且不影响当前内存复用", async () => {
+		const workspace = await temporaryRoot("pi-undo-cache-index-read-workspace-");
+		await writeFile(workspace, "a.txt", "a-target\n");
+		await writeFile(workspace, "b.txt", "b-target\n");
+		const storeRoot = await temporaryRoot("pi-undo-cache-index-read-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "a.txt", "a-source\n");
+		await writeFile(workspace, "b.txt", "b-source\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+		await engine.prepareDurableRestore(current, target, ["a.txt"]);
+		const before = await readFile(join(storeRoot, "durable-cache", "index.json"), "utf8");
+
+		const originalDirectory = store.durableCacheDirectory.bind(store);
+		let calls = 0;
+		(store as unknown as { durableCacheDirectory(): Promise<string> }).durableCacheDirectory = async () => {
+			calls += 1;
+			if (calls === 3) throw new Error("注入 durable cache index 读取失败");
+			return originalDirectory();
+		};
+		try {
+			await expect(engine.prepareDurableRestore(current, target, ["b.txt"])).resolves.toBeUndefined();
+			expect(await engine.canReuseDurableSource(current, target, ["a.txt"])).toBe(true);
+			expect(await engine.canReuseDurableSource(current, target, ["b.txt"])).toBe(true);
+			expect(await readFile(join(storeRoot, "durable-cache", "index.json"), "utf8")).toBe(before);
+		} finally {
+			(store as unknown as { durableCacheDirectory(): Promise<string> }).durableCacheDirectory = originalDirectory;
+		}
+
+		const engine2 = new RestoreEngine({
+			workspaceRoot: workspace,
+			store: new SnapshotStore({ storeRoot, discovery }),
+			discovery,
+		});
+		expect(await engine2.canReuseDurableSource(current, target, ["a.txt"])).toBe(true);
 	});
 
 	it("target ignored-present proof 保留 current-only 叶子但不豁免真实删除", async () => {

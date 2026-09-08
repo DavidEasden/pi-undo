@@ -4,8 +4,11 @@ import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, rmdir } from "
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
+import { writeJsonAtomic } from "./atomic-fs.ts";
 import {
 	createDurablePack,
+	hasDurablePack,
+	loadDurablePack,
 	publishCachedDurablePack,
 	removeDurablePack,
 	type DurableLeafInput,
@@ -33,8 +36,11 @@ import {
 	type ReplaceFileRequest,
 } from "./quarantine.ts";
 import { SnapshotStore, SnapshotStoreError } from "./snapshot-store.ts";
+import { WorkspaceLock } from "./workspace-lock.ts";
 
 const PREPARED_PLAN_CACHE_LIMIT = 16;
+const DURABLE_CACHE_INDEX_FILE = "index.json";
+const DURABLE_PACK_MEMORY_MAX_BYTES = 64 * 1024 * 1024;
 const RESTORE_FILE_BATCH_MAX_ENTRIES = 1_024;
 const RESTORE_FILE_BATCH_MAX_BYTES = 64 * 1024 * 1024;
 const RESTORE_FILE_PREPARE_CONCURRENCY = 32;
@@ -74,6 +80,8 @@ export interface RestoreEngineOptions {
 	readonly store: SnapshotStore;
 	readonly discovery?: RootDiscovery;
 	readonly beforeMutation?: (mutation: RestoreMutation) => void | Promise<void>;
+	/** 仅用于测试：覆盖进程内已加载 durable pack 的内存预算。 */
+	readonly durablePackCacheMaxBytes?: number;
 }
 
 export interface RestoreMutation {
@@ -95,6 +103,40 @@ interface PreparedRestorePlan {
 	readonly targetPaths: ReadonlyMap<string, OwnedPath>;
 }
 
+interface DurableCacheIndexEntry {
+	readonly currentManifestId: ManifestId;
+	readonly targetManifestId: ManifestId;
+	readonly scopePaths: readonly string[];
+	readonly planDigest: string;
+	readonly packChecksum: string;
+}
+
+interface DurableCacheIndex {
+	readonly schemaVersion: 1;
+	entries: DurableCacheIndexEntry[];
+}
+
+interface CachedDurablePack {
+	readonly currentManifestId: ManifestId;
+	readonly targetManifestId: ManifestId;
+	readonly path: string;
+	readonly packChecksum: string;
+	readonly pinReason: string;
+	readonly pinsDeferred: boolean;
+}
+
+interface CachedDurablePair {
+	readonly planDigest: string;
+	readonly pack: DurablePack;
+	readonly bytes: number;
+}
+
+type DurableIndexDisk =
+	| { readonly kind: "ok"; readonly index: DurableCacheIndex }
+	| { readonly kind: "missing" }
+	| { readonly kind: "corrupt" }
+	| { readonly kind: "unavailable" };
+
 interface MutationContext {
 	readonly phase: RestoreMutation["phase"];
 	readonly sourceManifestId: ManifestId;
@@ -115,17 +157,17 @@ export class RestoreEngine {
 	private readonly discovery: RootDiscovery;
 	private readonly beforeMutation: RestoreEngineOptions["beforeMutation"];
 	private readonly preparedPlans = new Map<string, PreparedRestorePlan>();
-	private readonly durablePackCache = new Map<string, {
-		readonly currentManifestId: ManifestId;
-		readonly targetManifestId: ManifestId;
-		readonly path: string;
-		readonly packChecksum: string;
-		readonly pinReason: string;
-	}>();
-	private readonly durablePackByPair = new Map<string, {
-		readonly planDigest: string;
-		readonly pack: DurablePack;
-	}>();
+	private readonly durablePackCache = new Map<string, CachedDurablePack>();
+	private readonly durablePackByPair = new Map<string, CachedDurablePair>();
+	private readonly durableIndexLock = new WorkspaceLock({
+		leaseMs: 10_000,
+		retryMs: 25,
+		acquireTimeoutMs: 1_000,
+	});
+	private readonly durablePackCacheMaxBytes: number;
+	private durableIndex: DurableCacheIndex | undefined;
+	private durableIndexQueue: Promise<void> = Promise.resolve();
+	private durablePackMemoryBytes = 0;
 
 	constructor(options: RestoreEngineOptions) {
 		this.requestedWorkspaceRoot = resolve(options.workspaceRoot);
@@ -133,6 +175,10 @@ export class RestoreEngine {
 		this.store = options.store;
 		this.discovery = options.discovery ?? new RootDiscovery();
 		this.beforeMutation = options.beforeMutation;
+		this.durablePackCacheMaxBytes = options.durablePackCacheMaxBytes ?? DURABLE_PACK_MEMORY_MAX_BYTES;
+		if (!Number.isSafeInteger(this.durablePackCacheMaxBytes) || this.durablePackCacheMaxBytes <= 0) {
+			throw new Error("durable pack 内存预算必须是正整数");
+		}
 	}
 
 	private async compatibleApplyOptions(): Promise<{
@@ -226,14 +272,27 @@ export class RestoreEngine {
 		target: SnapshotManifest,
 		scopePaths: readonly string[],
 	): Promise<boolean> {
-		const cached = this.durablePackByPair.get(durablePairKey(current.manifestId, target.manifestId, scopePaths));
-		if (cached === undefined) return false;
+		const pairKey = durablePairKey(current.manifestId, target.manifestId, scopePaths);
+		let cached = this.durablePackByPair.get(pairKey);
+		if (cached !== undefined && !this.durablePackCache.has(cached.planDigest)) {
+			this.dropResidentDurablePack(pairKey);
+			cached = undefined;
+		}
+		const fromPersistentIndex = cached === undefined;
+		if (cached === undefined) {
+			cached = await this.readIndexedDurablePack(current.manifestId, target.manifestId, scopePaths);
+		}
+		if (cached === undefined || cached.pack.opId !== `cache-${cached.planDigest}`) return false;
 		const cacheJournal = new MutationJournal(
 			join(dirname(cached.pack.storagePath), "mutations.jsonl"),
 			`cache-${cached.planDigest}`,
 		);
 		try {
 			if (await this.assertWorkspaceRootIdentity() !== current.workspaceIdentity) return false;
+			if (fromPersistentIndex) {
+				const expected = await this.plan(current, target, scopePaths);
+				if (expected.planDigest !== cached.planDigest) return false;
+			}
 			const topology = await this.discovery.discover(this.workspaceRoot);
 			this.assertCurrentTopology(current, target, topology);
 			const native = await createNativeFileBatch({
@@ -241,7 +300,19 @@ export class RestoreEngine {
 				planDigest: cached.planDigest,
 				journal: cacheJournal,
 			});
-			return native !== undefined && await native.verifySource(cached.pack);
+			if (native === undefined || !await native.verifySource(cached.pack)) return false;
+			if (fromPersistentIndex) {
+				await this.rememberDurablePackInMemory(
+					cached.planDigest,
+					current,
+					target,
+					scopePaths,
+					cached.pack,
+					`durable-cache:${cached.planDigest}`,
+					false,
+				);
+			}
+			return true;
 		} catch {
 			return false;
 		}
@@ -287,7 +358,7 @@ export class RestoreEngine {
 			throw error;
 		}
 		await this.rememberDurablePack(
-			plan,
+			plan.planDigest,
 			current,
 			target,
 			scopePaths,
@@ -298,39 +369,243 @@ export class RestoreEngine {
 	}
 
 	private async rememberDurablePack(
-		plan: RestorePlan,
+		planDigest: string,
 		current: SnapshotManifest,
 		target: SnapshotManifest,
 		scopePaths: readonly string[],
 		pack: DurablePack,
 		pinReason: string,
 	): Promise<void> {
-		this.durablePackCache.set(plan.planDigest, {
+		await this.rememberDurablePackInMemory(planDigest, current, target, scopePaths, pack, pinReason, true);
+		await this.enqueueDurableIndex(async () => {
+			const lease = await this.acquireDurableIndexLease();
+			if (lease === undefined) return;
+			try {
+				const disk = await this.readDurableIndexFromDisk();
+				if (disk.kind === "unavailable") return;
+				this.durableIndex = disk.kind === "ok"
+					? disk.index
+					: { schemaVersion: 1, entries: [] };
+				this.upsertDurableIndexEntry({
+					currentManifestId: current.manifestId,
+					targetManifestId: target.manifestId,
+					scopePaths: [...scopePaths],
+					planDigest,
+					packChecksum: pack.packChecksum,
+				});
+				await this.evictPersistedDurablePacks(planDigest);
+				await this.persistDurableIndex();
+			} finally {
+				await lease.release().catch(() => {});
+			}
+		});
+	}
+
+	private async rememberDurablePackInMemory(
+		planDigest: string,
+		current: SnapshotManifest,
+		target: SnapshotManifest,
+		scopePaths: readonly string[],
+		pack: DurablePack,
+		pinReason: string,
+		pinsDeferred: boolean,
+	): Promise<void> {
+		this.durablePackCache.delete(planDigest);
+		this.durablePackCache.set(planDigest, {
 			currentManifestId: current.manifestId,
 			targetManifestId: target.manifestId,
 			path: pack.storagePath,
 			packChecksum: pack.packChecksum,
 			pinReason,
+			pinsDeferred,
 		});
-		this.durablePackByPair.set(durablePairKey(current.manifestId, target.manifestId, scopePaths), {
-			planDigest: plan.planDigest,
+		this.trimDurablePackMetadata();
+		await this.rememberResidentDurablePack(
+			durablePairKey(current.manifestId, target.manifestId, scopePaths),
+			planDigest,
 			pack,
-		});
+		);
+	}
+
+	private trimDurablePackMetadata(): void {
 		while (this.durablePackCache.size > PREPARED_PLAN_CACHE_LIMIT) {
-			const oldest = this.durablePackCache.entries().next().value as
-				| readonly [string, { readonly currentManifestId: ManifestId; readonly targetManifestId: ManifestId; readonly path: string; readonly packChecksum: string; readonly pinReason: string }]
-				| undefined;
+			const oldest = this.durablePackCache.keys().next().value as string | undefined;
 			if (oldest === undefined) break;
-			const [digest, entry] = oldest;
-			this.durablePackCache.delete(digest);
-			for (const [key, pair] of this.durablePackByPair) {
-				if (pair.planDigest === digest) this.durablePackByPair.delete(key);
-			}
-			await Promise.all([...new Set([entry.currentManifestId, entry.targetManifestId])].map(
-				(manifestId) => this.store.unpin(manifestId, entry.pinReason).catch(() => {}),
-			));
-			await rm(dirname(entry.path), { recursive: true, force: true }).catch(() => {});
+			this.durablePackCache.delete(oldest);
+			this.dropResidentDurablePacks(oldest);
 		}
+	}
+
+	private async rememberResidentDurablePack(
+		pairKey: string,
+		planDigest: string,
+		pack: DurablePack,
+	): Promise<void> {
+		const bytes = await this.durablePackFileBytes(pack.storagePath);
+		const previous = this.durablePackByPair.get(pairKey);
+		if (previous !== undefined) {
+			this.durablePackMemoryBytes -= previous.bytes;
+			this.durablePackByPair.delete(pairKey);
+		}
+		this.durablePackByPair.set(pairKey, { planDigest, pack, bytes });
+		this.durablePackMemoryBytes += bytes;
+		while (this.durablePackMemoryBytes > this.durablePackCacheMaxBytes) {
+			const oldest = this.durablePackByPair.keys().next().value as string | undefined;
+			if (oldest === undefined) break;
+			this.dropResidentDurablePack(oldest);
+		}
+	}
+
+	private dropResidentDurablePack(pairKey: string): void {
+		const cached = this.durablePackByPair.get(pairKey);
+		if (cached === undefined) return;
+		this.durablePackByPair.delete(pairKey);
+		this.durablePackMemoryBytes = Math.max(0, this.durablePackMemoryBytes - cached.bytes);
+	}
+
+	private dropResidentDurablePacks(planDigest: string): void {
+		for (const [pairKey, cached] of this.durablePackByPair) {
+			if (cached.planDigest === planDigest) this.dropResidentDurablePack(pairKey);
+		}
+	}
+
+	private async readIndexedDurablePack(
+		currentManifestId: ManifestId,
+		targetManifestId: ManifestId,
+		scopePaths: readonly string[],
+	): Promise<CachedDurablePair | undefined> {
+		const pairKey = durablePairKey(currentManifestId, targetManifestId, scopePaths);
+		const existing = this.durablePackByPair.get(pairKey);
+		if (existing !== undefined && this.durablePackCache.has(existing.planDigest)) return existing;
+		if (existing !== undefined) this.dropResidentDurablePack(pairKey);
+		const disk = await this.enqueueDurableIndex(async () => {
+			const result = await this.readDurableIndexFromDisk();
+			if (result.kind === "ok") this.durableIndex = result.index;
+			return result;
+		});
+		const entries = disk.kind === "ok"
+			? disk.index.entries
+			: disk.kind === "unavailable" ? this.durableIndex?.entries : undefined;
+		const entry = entries?.find((candidate) =>
+			durablePairKey(candidate.currentManifestId, candidate.targetManifestId, candidate.scopePaths) === pairKey);
+		if (entry === undefined || !isDigest(entry.planDigest) || !isDigest(entry.packChecksum)) return undefined;
+		try {
+			const cacheRoot = await this.store.durableCacheDirectory();
+			const journal = new MutationJournal(
+				join(cacheRoot, entry.planDigest, "mutations.jsonl"),
+				`cache-${entry.planDigest}`,
+			);
+			if (!await hasDurablePack(journal)) return undefined;
+			const pack = await loadDurablePack(journal, entry.planDigest, true);
+			if (pack.packChecksum !== entry.packChecksum || pack.planDigest !== entry.planDigest) return undefined;
+			return {
+				planDigest: entry.planDigest,
+				pack,
+				bytes: await this.durablePackFileBytes(pack.storagePath),
+			};
+		} catch {
+			return undefined;
+		}
+	}
+
+	private enqueueDurableIndex<T>(operation: () => Promise<T>): Promise<T> {
+		const run = this.durableIndexQueue.then(operation, operation);
+		this.durableIndexQueue = run.then(() => undefined, () => undefined);
+		return run;
+	}
+
+	private async acquireDurableIndexLease(): Promise<{ release(): Promise<void> } | undefined> {
+		try {
+			return await this.durableIndexLock.acquire(await this.durableIndexLockIdentity());
+		} catch {
+			return undefined;
+		}
+	}
+
+	private async durableIndexLockIdentity(): Promise<string> {
+		const cacheRoot = await this.store.durableCacheDirectory();
+		try {
+			return `durable-cache:${await realpath(cacheRoot)}`;
+		} catch {
+			return `durable-cache:${resolve(cacheRoot)}`;
+		}
+	}
+
+	private async readDurableIndexFromDisk(): Promise<DurableIndexDisk> {
+		try {
+			const cacheRoot = await this.store.durableCacheDirectory();
+			const raw = await readFile(join(cacheRoot, DURABLE_CACHE_INDEX_FILE), "utf8");
+			try {
+				return { kind: "ok", index: parseDurableCacheIndex(JSON.parse(raw)) };
+			} catch {
+				return { kind: "corrupt" };
+			}
+		} catch (error) {
+			if (hasErrorCode(error, "ENOENT")) return { kind: "missing" };
+			return { kind: "unavailable" };
+		}
+	}
+
+	private upsertDurableIndexEntry(entry: DurableCacheIndexEntry): void {
+		const index = this.durableIndex ?? { schemaVersion: 1, entries: [] };
+		const pairKey = durablePairKey(entry.currentManifestId, entry.targetManifestId, entry.scopePaths);
+		index.entries = index.entries.filter((candidate) =>
+			candidate.planDigest !== entry.planDigest &&
+			durablePairKey(candidate.currentManifestId, candidate.targetManifestId, candidate.scopePaths) !== pairKey);
+		index.entries.push(entry);
+		this.durableIndex = index;
+	}
+
+	private async persistDurableIndex(): Promise<void> {
+		if (this.durableIndex === undefined) return;
+		try {
+			const cacheRoot = await this.store.durableCacheDirectory();
+			await writeJsonAtomic(join(cacheRoot, DURABLE_CACHE_INDEX_FILE), {
+				schemaVersion: 1,
+				entries: this.durableIndex.entries,
+			});
+		} catch {
+			// 索引只是跨会话候选提示；写入失败不得让已经 pin 成功的 pack 准备失败。
+		}
+	}
+
+	private async evictPersistedDurablePacks(keepPlanDigest: string): Promise<void> {
+		while (this.durableIndex !== undefined && this.durableIndex.entries.length > PREPARED_PLAN_CACHE_LIMIT) {
+			const oldest = this.durableIndex.entries.find((entry) => entry.planDigest !== keepPlanDigest);
+			if (oldest === undefined) break;
+			await this.dropPersistedDurablePack(oldest.planDigest);
+		}
+	}
+
+	private async dropPersistedDurablePack(planDigest: string): Promise<void> {
+		const cached = this.durablePackCache.get(planDigest);
+		const indexed = this.durableIndex?.entries.find((entry) => entry.planDigest === planDigest);
+		this.durablePackCache.delete(planDigest);
+		this.dropResidentDurablePacks(planDigest);
+		if (this.durableIndex !== undefined) {
+			this.durableIndex.entries = this.durableIndex.entries.filter((entry) => entry.planDigest !== planDigest);
+		}
+		const pinReason = cached?.pinReason ?? `durable-cache:${planDigest}`;
+		const manifests = [...new Set([
+			...(cached === undefined ? [] : [cached.currentManifestId, cached.targetManifestId]),
+			...(indexed === undefined ? [] : [indexed.currentManifestId, indexed.targetManifestId]),
+		])];
+		await Promise.all(manifests.map((manifestId) => this.store.unpin(manifestId, pinReason).catch(() => {})));
+		try {
+			await rm(join(await this.store.durableCacheDirectory(), planDigest), { recursive: true, force: true });
+		} catch {
+			// 淘汰失败只影响缓存占用，不影响当前 restore 正确性。
+		}
+	}
+
+	private async durablePackFileBytes(path: string): Promise<number> {
+		try {
+			const stats = await lstat(path);
+			if (stats.isFile() && !stats.isSymbolicLink() && stats.size > 0) return Number(stats.size);
+		} catch {
+			// 文件可能在加载后被其他进程淘汰；不能把已加载的 pack 当作零字节常驻。
+		}
+		return this.durablePackCacheMaxBytes + 1;
 	}
 
 	private rememberPreparedPlan(
@@ -391,8 +666,9 @@ export class RestoreEngine {
 		if (!hasValidPlanDigest(plan)) {
 			throw new Error("restore plan digest 与语义字段不匹配");
 		}
+		const cachedDurablePack = this.durablePackCache.get(plan.planDigest);
 		const pinsDeferred = effectiveOptions.deferDurability === true &&
-			this.durablePackCache.has(plan.planDigest);
+			cachedDurablePack?.pinsDeferred === true;
 		const recoveryReason = `restore:${plan.planDigest}`;
 		const attemptReason = `${recoveryReason}:attempt:${randomUUID()}`;
 		const pinned = [...new Set([plan.currentManifestId, target.manifestId])];
@@ -1993,6 +2269,40 @@ function durablePairKey(
 	scopePaths: readonly string[],
 ): string {
 	return `${currentManifestId}\0${targetManifestId}\0${checksum(canonicalJson([...scopePaths].sort(comparePaths)))}`;
+}
+
+function isDigest(value: unknown): value is string {
+	return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
+function parseDurableCacheIndex(value: unknown): DurableCacheIndex {
+	if (!isRecord(value) || value.schemaVersion !== 1 || !Array.isArray(value.entries)) {
+		throw new Error("durable cache index 无效");
+	}
+	const entries: DurableCacheIndexEntry[] = [];
+	for (const entry of value.entries) {
+		if (
+			!isRecord(entry) ||
+			!isDigest(entry.currentManifestId) ||
+			!isDigest(entry.targetManifestId) ||
+			!isDigest(entry.planDigest) ||
+			!isDigest(entry.packChecksum) ||
+			!Array.isArray(entry.scopePaths) ||
+			entry.scopePaths.some((path) => typeof path !== "string")
+		) continue;
+		entries.push({
+			currentManifestId: entry.currentManifestId as ManifestId,
+			targetManifestId: entry.targetManifestId as ManifestId,
+			scopePaths: entry.scopePaths.filter((path): path is string => typeof path === "string"),
+			planDigest: entry.planDigest,
+			packChecksum: entry.packChecksum,
+		});
+	}
+	return { schemaVersion: 1, entries };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function hasErrorCode(error: unknown, code: string): error is NodeJS.ErrnoException {
