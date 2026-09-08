@@ -137,10 +137,12 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 			}
 			const commandToken = Symbol(action);
 			const commandSet = activeCommands;
+			// 只有当前执行命令能安装/清理导航上下文；busy 的第二个命令不得覆盖或清空它。
+			const ownsCommandContext = commandSet.size === 0;
 			commandSet.add(commandToken);
 			activeAction = action;
 			active.reporter.setPhase(action === "undo" ? "undoing" : "redoing");
-			active.setCommandContext?.(context);
+			if (ownsCommandContext) active.setCommandContext?.(context);
 			const commandStarted = performance.now();
 			let result;
 			try {
@@ -148,7 +150,7 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 					? await active.controller.undo()
 					: await active.controller.redo();
 			} finally {
-				active.setCommandContext?.(undefined);
+				if (ownsCommandContext) active.setCommandContext?.(undefined);
 				commandSet.delete(commandToken);
 				if (commandSet === activeCommands && commandSet.size === 0) activeAction = undefined;
 			}
