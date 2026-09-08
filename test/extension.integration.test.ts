@@ -352,6 +352,80 @@ describe("pi-undo extension", () => {
 		expect([beforeTreeCalls, afterTreeCalls]).toEqual([1, 1]);
 	});
 
+	it("并发 undo 不会覆盖或清空第一个命令的 commandContext", async () => {
+		const handlers = new Map<string, (event: any, context: any) => any>();
+		const commands = new Map<string, (args: string, context: any) => Promise<void>>();
+		const notifications: Array<[string, string | undefined]> = [];
+		const assigned: Array<unknown> = [];
+		let currentContext: unknown;
+		let finishFirst: ((value: OperationResult) => void) | undefined;
+		let markStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => { markStarted = resolve; });
+		let operationInFlight = false;
+		const sessionContext = {
+			mode: "tui" as const,
+			ui: {
+				setStatus: () => {},
+				notify: (message: string, type?: string) => { notifications.push([message, type]); },
+				getEditorText: () => "",
+				setEditorText: () => {},
+			},
+		};
+		const firstCommandContext = { ...sessionContext, id: "first" };
+		const secondCommandContext = { ...sessionContext, id: "second" };
+		const pi = {
+			registerCommand(name: string, options: { handler: (args: string, context: any) => Promise<void> }) {
+				commands.set(name, options.handler);
+			},
+			on(name: string, handler: (event: any, context: any) => any) { handlers.set(name, handler); },
+		} as unknown as ExtensionAPI;
+		createPiUndoExtension(async () => ({
+			controller: {
+				history: () => ({ undoCount: 1, redoCount: 0, locked: false }),
+				listCheckpoints: () => [],
+				recover: async () => {}, captureFailed: () => false, captureFailureReason: () => undefined, warmUp: () => {},
+				prepareInput: async () => ({ action: "continue" as const }),
+				beforeAgentStart: async () => {},
+				agentSettled: async () => {},
+				undo: async () => {
+					if (operationInFlight) return { code: "busy" as const, changedFiles: 0 };
+					operationInFlight = true;
+					markStarted!();
+					const result = await new Promise<OperationResult>((resolve) => { finishFirst = resolve; });
+					operationInFlight = false;
+					return result;
+				},
+				redo: async () => ({ code: "noop" as const, changedFiles: 0 }),
+				beforeTree: async () => undefined,
+				afterTree: async () => {},
+			},
+			reporter: new StatusReporter(sessionContext),
+			setCommandContext(next) {
+				currentContext = next;
+				assigned.push(next);
+			},
+		}))(pi);
+		await handlers.get("session_start")!({}, sessionContext);
+
+		const first = commands.get("undo")!("", firstCommandContext);
+		await started;
+		expect(currentContext).toBe(firstCommandContext);
+
+		await commands.get("undo")!("", secondCommandContext);
+		expect(currentContext).toBe(firstCommandContext);
+		expect(assigned).toEqual([firstCommandContext]);
+		expect(notifications).toEqual([["busy files:0", "warning"]]);
+
+		finishFirst!({ code: "ok", changedFiles: 1 });
+		await first;
+		expect(currentContext).toBeUndefined();
+		expect(assigned).toEqual([firstCommandContext, undefined]);
+		expect(notifications).toEqual([
+			["busy files:0", "warning"],
+			["ok files:1", "info"],
+		]);
+	});
+
 	it("成功 undo 在空 TUI editor 中回填原始 prompt", async () => {
 		const handlers = new Map<string, (event: any, context: any) => any>();
 		const commands = new Map<string, (args: string, context: any) => Promise<void>>();
