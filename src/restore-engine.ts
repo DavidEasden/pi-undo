@@ -530,11 +530,6 @@ export class RestoreEngine {
 		} catch {
 			return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
 		}
-		try {
-			await this.prefetchCompleteRestoreBlobs(plan, current, target, currentPaths, targetPaths);
-		} catch {
-			// 预取是性能优化；失败时继续走原有逐文件校验和可恢复 mutation 路径。
-		}
 		let durablePack: DurablePack | undefined;
 		if (
 			!compatibilityMode &&
@@ -599,6 +594,11 @@ export class RestoreEngine {
 				nativeFileBatch.run,
 			);
 			return result;
+		}
+		try {
+			await this.prefetchCompleteRestoreBlobs(plan, current, target, currentPaths, targetPaths);
+		} catch {
+			// 预取是性能优化；失败时继续走原有逐文件校验和可恢复 mutation 路径。
 		}
 		const preflight = await this.verifyKnownState(current, target, currentPaths, targetPaths, plan.scopePaths);
 		if (!preflight.ok) {
