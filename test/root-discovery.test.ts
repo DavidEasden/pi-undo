@@ -140,6 +140,44 @@ describe("RootDiscovery", () => {
 		expect(states.get("modules/nested-skeleton")).toBe("uninitialized");
 	});
 
+	it("失效 gitdir 指针的 worktree 按未初始化处理，不产生 broken root", async () => {
+		const outer = await createGitRepo();
+		temporaryRoots.push(outer.root);
+		// 模拟项目从其他机器搬移：.git 指针指向本机不存在的 gitdir。
+		await writeFixtureFile(outer.root, ".worktrees/migrated/src/main.py", "print('stale')\n");
+		await writeFixtureFile(
+			outer.root,
+			".worktrees/migrated/.git",
+			"gitdir: /nonexistent/.git/worktrees/migrated\n",
+		);
+
+		const topology = await new RootDiscovery().discover(outer.root);
+		const states = new Map(topology.roots.map((root) => [root.relativeRoot, root.state]));
+
+		expect(states.get(".worktrees/migrated")).toBe("uninitialized");
+		expect([...states.values()]).not.toContain("broken");
+	});
+
+	it("有效 git worktree 仍识别为 active root，指针目标存在但非 gitdir 仍为 broken", async () => {
+		const outer = await createGitRepo();
+		temporaryRoots.push(outer.root);
+		await runGit(outer.root, ["worktree", "add", ".worktrees/live", "-b", "live"]);
+		await writeFixtureFile(outer.root, "junk/garbage/.git", "not a worktree pointer\n");
+		await mkdir(join(outer.root, "junk", "plain-directory"), { recursive: true });
+		await writeFixtureFile(
+			outer.root,
+			"junk/points-to-plain/.git",
+			`gitdir: ${join(outer.root, "junk", "plain-directory")}\n`,
+		);
+
+		const topology = await new RootDiscovery().discover(outer.root);
+		const states = new Map(topology.roots.map((root) => [root.relativeRoot, root.state]));
+
+		expect(states.get(".worktrees/live")).toBe("active");
+		expect(states.get("junk/garbage")).toBe("broken");
+		expect(states.get("junk/points-to-plain")).toBe("broken");
+	});
+
 	it("initialized submodule 合并父 index 的 gitlinkOid，gitlink 删除会改变 fingerprint", async () => {
 		const outer = await createGitRepo();
 		temporaryRoots.push(outer.root);

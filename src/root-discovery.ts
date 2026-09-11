@@ -1,4 +1,4 @@
-import { lstat, readdir, realpath } from "node:fs/promises";
+import { lstat, readdir, readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { checksum, topologyFingerprint } from "./encoding.ts";
@@ -6,6 +6,7 @@ import { GitRunner } from "./git-runner.ts";
 import type { DiscoveryRoot } from "./model.ts";
 
 const DIRECTORY_SCAN_CONCURRENCY = 16;
+const GIT_POINTER_MAX_BYTES = 4096;
 
 interface RepositoryInfo {
 	readonly absoluteRoot: string;
@@ -17,6 +18,7 @@ interface RepositoryInfo {
 type RepositoryInspection =
 	| { readonly kind: "active"; readonly repository: RepositoryInfo }
 	| { readonly kind: "broken"; readonly absoluteRoot: string }
+	| { readonly kind: "stale"; readonly absoluteRoot: string }
 	| { readonly kind: "absent" };
 
 interface DiscoveredRoot {
@@ -68,7 +70,7 @@ export class RootDiscovery {
 				outerRepository.repository.absoluteRoot,
 				this.activeRoot(workspaceIdentity, outerRepository.repository),
 			);
-		} else if (outerRepository.kind === "broken") {
+		} else if (outerRepository.kind === "broken" || outerRepository.kind === "stale") {
 			activeRoots.set(outerRepository.absoluteRoot, brokenRoot(workspaceIdentity, outerRepository.absoluteRoot));
 		} else {
 			activeRoots.set(workspaceIdentity, syntheticRoot(workspaceIdentity));
@@ -117,6 +119,8 @@ export class RootDiscovery {
 				);
 			} else if (inspection.kind === "broken") {
 				activeRoots.set(inspection.absoluteRoot, brokenRoot(workspaceIdentity, inspection.absoluteRoot));
+			} else if (inspection.kind === "stale") {
+				activeRoots.set(inspection.absoluteRoot, staleWorktreeRoot(workspaceIdentity, inspection.absoluteRoot));
 			}
 			if (!await isSafeDirectory(candidate.path, workspaceIdentity)) return [];
 		}
@@ -144,6 +148,9 @@ export class RootDiscovery {
 		}
 		if (marker === "invalid") {
 			return { kind: "broken", absoluteRoot };
+		}
+		if (await deadWorktreePointer(absoluteRoot)) {
+			return { kind: "stale", absoluteRoot };
 		}
 
 		const details = await this.gitOutput([
@@ -268,6 +275,46 @@ function brokenRoot(workspaceIdentity: string, absoluteRoot: string): Discovered
 		relativeRoot,
 		gitBacked: false,
 		state: "broken",
+		sourceIdentity,
+		privateRepositoryId: checksum(sourceIdentity),
+		treeId: null,
+	};
+}
+
+// git worktree 的 .git 文件是 "gitdir: <path>" 指针；项目从其他机器/位置搬移后，
+// 指针常指向本机不存在的 gitdir（例如虚拟机共享目录的绝对路径）。这种可证明失效的
+// 指针不再代表可用仓库，按未初始化根处理：内容不进入快照，也不会被 restore 触碰。
+async function deadWorktreePointer(absoluteRoot: string): Promise<boolean> {
+	const pointerPath = join(absoluteRoot, ".git");
+	let content: string;
+	try {
+		const marker = await lstat(pointerPath);
+		if (!marker.isFile()) return false;
+		content = await readFile(pointerPath, "utf8");
+	} catch {
+		return false;
+	}
+	if (content.length > GIT_POINTER_MAX_BYTES) return false;
+	const firstLine = content.split("\n", 1)[0] ?? "";
+	const match = /^gitdir: (.+)$/.exec(firstLine.trimEnd());
+	if (match === null) return false;
+	const gitDirectory = isAbsolute(match[1]) ? resolve(match[1]) : resolve(absoluteRoot, match[1]);
+	try {
+		await stat(gitDirectory);
+		return false;
+	} catch (error) {
+		return hasErrorCode(error, "ENOENT");
+	}
+}
+
+function staleWorktreeRoot(workspaceIdentity: string, absoluteRoot: string): DiscoveredRoot {
+	const relativeRoot = workspaceRelativePath(workspaceIdentity, absoluteRoot);
+	const sourceIdentity = `stale-worktree:${absoluteRoot}`;
+	return {
+		absoluteRoot,
+		relativeRoot,
+		gitBacked: true,
+		state: "uninitialized",
 		sourceIdentity,
 		privateRepositoryId: checksum(sourceIdentity),
 		treeId: null,
