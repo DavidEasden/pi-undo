@@ -1222,10 +1222,7 @@ export class RestoreEngine {
 		target: SnapshotManifest,
 		actual: RootTopology,
 	): void {
-		if (
-			actual.workspaceIdentity !== current.workspaceIdentity ||
-			actual.fingerprint !== current.topologyFingerprint
-		) {
+		if (!sameTopologyModuloIdentity(actual, current)) {
 			throw new Error("apply 前 workspace topology 与 current manifest 不一致");
 		}
 		const currentRoots = new Map(current.roots.map((root) => [root.relativeRoot, root]));
@@ -1233,14 +1230,6 @@ export class RestoreEngine {
 			const currentRoot = currentRoots.get(targetRoot.relativeRoot);
 			if (currentRoot !== undefined && targetRoot.state === "active" && currentRoot.state !== "active") {
 				throw new Error(`restore 不能把 inactive root 物化为 active：${targetRoot.relativeRoot}`);
-			}
-			if (
-				currentRoot !== undefined &&
-				targetRoot.state === "active" &&
-				(currentRoot.sourceIdentity !== targetRoot.sourceIdentity ||
-					currentRoot.privateRepositoryId !== targetRoot.privateRepositoryId)
-			) {
-				throw new Error(`restore boundary root identity 冲突：${targetRoot.relativeRoot}`);
 			}
 		}
 	}
@@ -2018,6 +2007,28 @@ function sameEntry(left: RestorePath, right: RestorePath): boolean {
 		left.blobId === right.blobId &&
 		left.size === right.size &&
 		left.linkText === right.linkText;
+}
+
+// sourceIdentity/privateRepositoryId 会随 git remote 配置漂移（例如后来补充 remote origin），
+// 它们是仓库元数据而非工作区内容；restore 的内容安全由逐文件校验
+// （verifyKnownState、assertCompleteVisibleSubset、verifyTarget）保证。
+// 因此这里只比较结构性拓扑字段：root 集合、parentRoot、state 与 gitlinkOid。
+function sameTopologyModuloIdentity(actual: RootTopology, expected: SnapshotManifest): boolean {
+	if (actual.workspaceIdentity !== expected.workspaceIdentity) return false;
+	const expectedRoots = new Map(expected.roots.map((root) => [root.relativeRoot, root]));
+	if (actual.roots.length !== expectedRoots.size) return false;
+	for (const root of actual.roots) {
+		const expectedRoot = expectedRoots.get(root.relativeRoot);
+		if (
+			expectedRoot === undefined ||
+			expectedRoot.parentRoot !== root.parentRoot ||
+			expectedRoot.state !== root.state ||
+			(expectedRoot.gitlinkOid ?? null) !== (root.gitlinkOid ?? null)
+		) {
+			return false;
+		}
+	}
+	return true;
 }
 
 function assertCompatibleManifests(

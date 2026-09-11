@@ -16,6 +16,7 @@ import {
 	createLocalSubmodule,
 	createNestedRepo,
 	readGitMetadata,
+	runGit,
 	writeFile,
 } from "./fixtures.ts";
 
@@ -431,6 +432,47 @@ describe("RestoreEngine", () => {
 		expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("target\n");
 		expect(await journal.assertCleaned()).toBeUndefined();
 		expect(await hasDurablePack(journal)).toBe(false);
+	});
+
+	it("git remote origin 变更导致 root identity 漂移后 restore 双向仍可用", async () => {
+		const repository = await createGitRepo();
+		temporaryRoots.push(repository.root);
+		const storeRoot = await temporaryRoot("pi-undo-remote-identity-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		// target 在添加 remote 之前捕获：sourceIdentity = git:<commonGitDir>。
+		const target = await store.capture(await discovery.discover(repository.root));
+		await runGit(repository.root, ["remote", "add", "origin", "https://github.com/example/repo.git"]);
+		await writeFile(repository.root, "LICENSE", "MIT\n");
+		// current 在添加 remote 之后捕获：sourceIdentity = remote URL，topology fingerprint 漂移。
+		const current = await store.capture(await discovery.discover(repository.root), ["LICENSE"]);
+		const engine = new RestoreEngine({ workspaceRoot: repository.root, store, discovery });
+
+		const transactionRoot = await temporaryRoot("pi-undo-remote-identity-apply-");
+		const forwardJournal = new MutationJournal(
+			join(transactionRoot, "mutations-forward.jsonl"),
+			"remote-identity-forward",
+		);
+		const forward = await engine.apply(await engine.plan(current, target, ["LICENSE"]), target, {
+			opId: forwardJournal.operationId,
+			mutationJournal: forwardJournal,
+			deferDurability: true,
+		});
+		expect(forward.code).toBe("ok");
+		await expect(access(join(repository.root, "LICENSE"))).rejects.toThrow();
+
+		// 补偿方向：current 为旧 identity manifest，实际拓扑为新 identity。
+		const reverseJournal = new MutationJournal(
+			join(transactionRoot, "mutations-reverse.jsonl"),
+			"remote-identity-reverse",
+		);
+		const reverse = await engine.apply(await engine.plan(target, current, ["LICENSE"]), current, {
+			opId: reverseJournal.operationId,
+			mutationJournal: reverseJournal,
+			deferDurability: true,
+		});
+		expect(reverse.code).toBe("ok");
+		expect(await readFile(join(repository.root, "LICENSE"), "utf8")).toBe("MIT\n");
 	});
 
 	it("新 RestoreEngine 可通过持久化索引复用同一 store 的 durable pack", async () => {
