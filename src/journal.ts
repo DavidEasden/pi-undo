@@ -2,6 +2,7 @@ import { appendFile, lstat, readFile, readdir, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { fsyncDirectory, fsyncFile, writeContentAddressed, writeJsonAtomic } from "./atomic-fs.ts";
+import { hasDurablePack } from "./durable-pack.ts";
 import {
 	assertCursor,
 	assertJournalState,
@@ -13,6 +14,7 @@ import type {
 	CursorState,
 	JournalPhase,
 	JournalState,
+	MutationRecord,
 	OperationDescriptor,
 } from "./model.ts";
 import { MutationJournal } from "./mutation-journal.ts";
@@ -149,6 +151,31 @@ export class JournalStore {
 			if (!await hasOnlyControlFiles(this.operationDirectory(pending.descriptor.opId))) return false;
 			const verified = await this.load(pending.descriptor.opId);
 			return samePendingJournal(verified, current) && await hasOnlyControlFiles(this.operationDirectory(pending.descriptor.opId));
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * 判断 transaction 的 mutation 义务是否已全部履行且净效果回到操作前状态：
+	 * 所有记录都达到 CLEANED，且按路径折叠的 fingerprint 链首尾相接（前向变更
+	 * 被补偿变更精确抵消）；没有任何 mutation 记录且无 durable pack 时视为从未发生。
+	 * 这是纯只读检查；评估期间 journal 发生变化或任何证据不确定时都返回 false。
+	 */
+	async isFullyCompensated(pending: PendingJournal): Promise<boolean> {
+		try {
+			const current = await this.load(pending.descriptor.opId);
+			if (!samePendingJournal(current, pending)) return false;
+			const mutationJournal = this.mutationJournal(pending.descriptor.opId);
+			const records = await mutationJournal.load();
+			const compensated = records.length === 0
+				? !await hasDurablePack(mutationJournal)
+				: fingerprintChainsFoldToIdentity(records);
+			if (!compensated) return false;
+			const verified = await this.load(pending.descriptor.opId);
+			if (!samePendingJournal(verified, current)) return false;
+			const reloaded = await mutationJournal.load();
+			return reloaded.length === records.length && fingerprintChainsFoldToIdentity(reloaded);
 		} catch {
 			return false;
 		}
@@ -412,6 +439,24 @@ function samePendingJournal(left: PendingJournal, right: PendingJournal): boolea
 	} catch {
 		return false;
 	}
+}
+
+function fingerprintChainsFoldToIdentity(records: readonly MutationRecord[]): boolean {
+	const chains = new Map<string, { source: string; target: string }>();
+	for (const record of records) {
+		if (record.state !== "CLEANED") return false;
+		const chain = chains.get(record.path);
+		if (chain === undefined) {
+			chains.set(record.path, { source: record.sourceFingerprint, target: record.targetFingerprint });
+			continue;
+		}
+		if (record.sourceFingerprint !== chain.target) return false;
+		chain.target = record.targetFingerprint;
+	}
+	for (const chain of chains.values()) {
+		if (chain.target !== chain.source) return false;
+	}
+	return true;
 }
 
 function isEmptyArray(value: unknown): value is readonly unknown[] {

@@ -11,6 +11,7 @@ import {
 	inspectCursorMarkers,
 } from "../src/journal.ts";
 import type { CursorState, ManifestId, OperationDescriptor, SessionFileIdentity } from "../src/model.ts";
+import type { MutationJournal } from "../src/mutation-journal.ts";
 
 const temporaryRoots: string[] = [];
 
@@ -289,6 +290,105 @@ describe("foreign PREPARED transaction", () => {
 		const stale = await inertFixture();
 		await stale.store.setPhase(stale.operation.opId, "SESSION_MOVED");
 		expect(await stale.store.isInertForeignPrepared(stale.pending)).toBe(false);
+	});
+});
+
+describe("完全补偿 transaction 评估", () => {
+	async function compensatedFixture() {
+		const root = await temporaryRoot("pi-undo-compensated-journal-");
+		const store = new JournalStore({ transactionsRoot: join(root, "transactions") });
+		const operation = descriptor(join(root, "session.jsonl"));
+		await store.prepare(operation, { paths: [], planDigest: operation.planDigest });
+		await store.setPhase(operation.opId, "SESSION_MOVED", { observedLogicalLeaf: "before" });
+		await store.setPhase(operation.opId, "APPLYING");
+		await store.setPhase(operation.opId, "RECOVERY_REQUIRED");
+		const [pending] = await store.loadPending();
+		if (pending === undefined) throw new Error("测试 fixture 未生成 pending journal");
+		return { root, store, operation, pending };
+	}
+
+	async function cleanedRecord(
+		journal: MutationJournal,
+		intent: Parameters<MutationJournal["begin"]>[0],
+	): Promise<void> {
+		const record = await journal.begin(intent);
+		await journal.advanceMany(record.ordinal, [
+			"SOURCE_QUARANTINED",
+			"SOURCE_VERIFIED",
+			"TARGET_INSTALLED",
+			"TARGET_VERIFIED",
+			"CLEANED",
+		]);
+	}
+
+	it("零 mutation 且无 durable pack 时视为完全补偿", async () => {
+		const { store, pending } = await compensatedFixture();
+		expect(await store.isFullyCompensated(pending)).toBe(true);
+	});
+
+	it("零 mutation 但存在 durable pack 时 fail closed", async () => {
+		const { root, store, pending } = await compensatedFixture();
+		await writeFile(join(root, "transactions", pending.descriptor.opId, "durable-pack-v1.bin"), "pack");
+		expect(await store.isFullyCompensated(pending)).toBe(false);
+	});
+
+	it("前向 delete 与补偿 write 的 CLEANED 记录链视为完全补偿", async () => {
+		const { store, operation, pending } = await compensatedFixture();
+		const journal = store.mutationJournal(operation.opId);
+		await cleanedRecord(journal, {
+			kind: "delete",
+			path: "a.txt",
+			sourceArtifact: ".pi-undo-q1-forward-source",
+			targetArtifact: null,
+			sourceFingerprint: "a".repeat(64),
+			targetFingerprint: "b".repeat(64),
+		});
+		await cleanedRecord(journal, {
+			kind: "write",
+			path: "a.txt",
+			sourceArtifact: ".pi-undo-q1-back-source",
+			targetArtifact: ".pi-undo-q1-back-target",
+			sourceFingerprint: "b".repeat(64),
+			targetFingerprint: "a".repeat(64),
+		});
+
+		expect(await store.isFullyCompensated(pending)).toBe(true);
+	});
+
+	it("仅前向 CLEANED 的净变更链不算完全补偿", async () => {
+		const { store, operation, pending } = await compensatedFixture();
+		const journal = store.mutationJournal(operation.opId);
+		await cleanedRecord(journal, {
+			kind: "delete",
+			path: "a.txt",
+			sourceArtifact: ".pi-undo-q1-forward-source",
+			targetArtifact: null,
+			sourceFingerprint: "a".repeat(64),
+			targetFingerprint: "b".repeat(64),
+		});
+
+		expect(await store.isFullyCompensated(pending)).toBe(false);
+	});
+
+	it("记录未全部 CLEANED 时不算完全补偿", async () => {
+		const { store, operation, pending } = await compensatedFixture();
+		await store.mutationJournal(operation.opId).begin({
+			kind: "delete",
+			path: "a.txt",
+			sourceArtifact: ".pi-undo-q1-source",
+			targetArtifact: null,
+			sourceFingerprint: "a".repeat(64),
+			targetFingerprint: "b".repeat(64),
+		});
+
+		expect(await store.isFullyCompensated(pending)).toBe(false);
+	});
+
+	it("评估期间 journal 发生变化时 fail closed", async () => {
+		const { store, pending } = await compensatedFixture();
+		await store.settleRecovery(pending.descriptor.opId, "ABORTED");
+
+		expect(await store.isFullyCompensated(pending)).toBe(false);
 	});
 });
 

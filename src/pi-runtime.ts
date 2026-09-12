@@ -65,6 +65,7 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 		getLogicalLeafId: () => sessionStateFor(manager).getLogicalLeafId(),
 		loadPending: () => journal.loadPending(),
 		assessForeignTransaction: (pending) => journal.isInertForeignPrepared(pending),
+		assessCompensatedTransaction: (pending) => journal.isFullyCompensated(pending),
 		inspectCursor: (pending) => inspectCursorMarkers(pending.descriptor.sessionIdentity.path, pending.descriptor),
 		finalizeCursor: (pending, inspection) => finalizeCursorMarker(
 			pending.descriptor.sessionIdentity.path,

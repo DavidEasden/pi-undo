@@ -11,6 +11,8 @@ export interface JournalRecoveryDependencies {
 	readonly loadPending: () => Promise<readonly PendingJournal[]>;
 	/** 仅允许严格证明无工作区 mutation 的 foreign PREPARED 空事务被忽略。 */
 	readonly assessForeignTransaction?: (journal: PendingJournal) => Promise<boolean>;
+	/** 判断 transaction 是否已被完全补偿（mutation 全部 CLEANED 且净效果回到操作前状态），可直接 settle。 */
+	readonly assessCompensatedTransaction?: (journal: PendingJournal) => Promise<boolean>;
 	readonly inspectCursor: (journal: PendingJournal) => Promise<CursorMarkerInspection>;
 	readonly finalizeCursor: (journal: PendingJournal, inspection: Extract<CursorMarkerInspection, { kind: "match" }>) => Promise<void>;
 	readonly recoverMutations: (
@@ -67,7 +69,13 @@ export class JournalRecovery {
 		for (const journal of pending) {
 			const identityError = this.identityError(journal);
 			if (identityError !== null) {
-				if (identityError === "session_identity_mismatch" && await this.canIgnoreForeignTransaction(journal)) continue;
+				if (identityError === "session_identity_mismatch") {
+					if (await this.settleCompensated(journal)) {
+						recovered += 1;
+						continue;
+					}
+					if (await this.canIgnoreForeignTransaction(journal)) continue;
+				}
 				return { kind: "locked", reason: identityError, operations: recovered };
 			}
 			let inspection: CursorMarkerInspection;
@@ -143,6 +151,38 @@ export class JournalRecovery {
 			// 评估失败等同于证据不足，保留 foreign identity lock。
 			return false;
 		}
+	}
+
+	/**
+	 * 终结被弃用会话遗留的完全补偿 foreign transaction。调用方持有 workspace lock，
+	 * pending 非终态事务的 owner 操作已确定性结束；mutation 义务全部履行且净效果
+	 * 回到操作前状态时，无需触碰工作区即可 settle。cursor marker 必须缺失——
+	 * marker 存在意味着操作已提交，与补偿证据矛盾，fail closed。
+	 */
+	private async settleCompensated(journal: PendingJournal): Promise<boolean> {
+		const assess = this.dependencies.assessCompensatedTransaction;
+		if (assess === undefined) return false;
+		let compensated: boolean;
+		try {
+			compensated = await assess(journal);
+		} catch {
+			// 评估失败等同于证据不足，退回原有恢复语义。
+			return false;
+		}
+		if (!compensated) return false;
+		let inspection: CursorMarkerInspection;
+		try {
+			inspection = await this.dependencies.inspectCursor(journal);
+		} catch {
+			return false;
+		}
+		if (inspection.kind !== "absent") return false;
+		try {
+			await this.dependencies.settle(journal.descriptor.opId, "ABORTED");
+		} catch {
+			return false;
+		}
+		return true;
 	}
 
 	private identityError(journal: PendingJournal): string | null {

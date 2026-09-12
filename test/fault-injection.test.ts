@@ -80,6 +80,8 @@ function pending(scopePaths: readonly string[] = ["file.txt"], options: PendingO
 
 interface FixtureOptions extends PendingOptions {
 	readonly assessForeignTransaction?: (journal: PendingJournal) => Promise<boolean>;
+	readonly assessCompensatedTransaction?: (journal: PendingJournal) => Promise<boolean>;
+	readonly failingSettle?: boolean;
 }
 
 function fixture(
@@ -97,6 +99,9 @@ function fixture(
 		...(options.assessForeignTransaction === undefined
 			? {}
 			: { assessForeignTransaction: options.assessForeignTransaction }),
+		...(options.assessCompensatedTransaction === undefined
+			? {}
+			: { assessCompensatedTransaction: options.assessCompensatedTransaction }),
 		getLogicalLeafId: () => leaf,
 		loadPending: async () => journals,
 		inspectCursor: async () => marker === "match"
@@ -128,6 +133,7 @@ function fixture(
 			return { code: "ok", verifiedPaths: 1, totalPaths: 1 };
 		},
 		settle: async (_opId, phase) => {
+			if (options.failingSettle === true) throw new Error("注入 settle 失败");
 			calls.push(`settle:${phase}`);
 			journals = [];
 		},
@@ -244,6 +250,73 @@ describe("JournalRecovery fault injection", () => {
 		});
 		expect(assessed).toBe(false);
 		expect(wrongWorkspace.calls).toEqual([]);
+	});
+
+	it("完全补偿的 foreign transaction 直接 settle 为 ABORTED，不触碰 workspace", async () => {
+		const { recovery, calls } = fixture("absent", "after", "clean", ["file.txt"], {
+			sessionIdentity: { ...identity, path: "/sessions/old-session.jsonl" },
+			assessCompensatedTransaction: async () => true,
+		});
+
+		expect(await recovery.recover()).toEqual({ kind: "recovered", operations: 1 });
+		expect(calls).toEqual(["settle:ABORTED"]);
+	});
+
+	it("完全补偿的 foreign transaction 遇到可信 cursor marker 或冲突时 fail closed", async () => {
+		const matched = fixture("match", "before", "clean", ["file.txt"], {
+			sessionIdentity: { ...identity, path: "/sessions/old-session.jsonl" },
+			assessCompensatedTransaction: async () => true,
+		});
+		expect(await matched.recovery.recover()).toMatchObject({
+			kind: "locked",
+			reason: "session_identity_mismatch",
+		});
+		expect(matched.calls).toEqual([]);
+
+		const conflicted = fixture("conflict", "before", "clean", ["file.txt"], {
+			sessionIdentity: { ...identity, path: "/sessions/old-session.jsonl" },
+			assessCompensatedTransaction: async () => true,
+		});
+		expect(await conflicted.recovery.recover()).toMatchObject({
+			kind: "locked",
+			reason: "session_identity_mismatch",
+		});
+		expect(conflicted.calls).toEqual([]);
+	});
+
+	it("补偿评估失败或 settle 失败时保持 recovery lock", async () => {
+		const rejected = fixture("absent", "after", "clean", ["file.txt"], {
+			sessionIdentity: { ...identity, path: "/sessions/old-session.jsonl" },
+			assessCompensatedTransaction: async () => false,
+		});
+		expect(await rejected.recovery.recover()).toMatchObject({
+			kind: "locked",
+			reason: "session_identity_mismatch",
+		});
+		expect(rejected.calls).toEqual([]);
+
+		const thrown = fixture("absent", "after", "clean", ["file.txt"], {
+			sessionIdentity: { ...identity, path: "/sessions/old-session.jsonl" },
+			assessCompensatedTransaction: async () => {
+				throw new Error("注入评估失败");
+			},
+		});
+		expect(await thrown.recovery.recover()).toMatchObject({
+			kind: "locked",
+			reason: "session_identity_mismatch",
+		});
+		expect(thrown.calls).toEqual([]);
+
+		const failed = fixture("absent", "after", "clean", ["file.txt"], {
+			sessionIdentity: { ...identity, path: "/sessions/old-session.jsonl" },
+			assessCompensatedTransaction: async () => true,
+			failingSettle: true,
+		});
+		expect(await failed.recovery.recover()).toMatchObject({
+			kind: "locked",
+			reason: "session_identity_mismatch",
+		});
+		expect(failed.calls).toEqual([]);
 	});
 });
 
