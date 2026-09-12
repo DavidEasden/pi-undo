@@ -78,6 +78,13 @@ export class JournalRecovery {
 				}
 				return { kind: "locked", reason: identityError, operations: recovered };
 			}
+			// 同一会话（重启或第二窗口）内，完全补偿的事务同样可直接 settle：
+			// 工作区义务已全部履行且无 cursor 提交证据，session leaf 位置对
+			// ABORTED 终结不构成安全输入，无需通过 leaf 校验。
+			if (await this.settleCompensated(journal)) {
+				recovered += 1;
+				continue;
+			}
 			let inspection: CursorMarkerInspection;
 			try {
 				inspection = await this.dependencies.inspectCursor(journal);
@@ -154,10 +161,10 @@ export class JournalRecovery {
 	}
 
 	/**
-	 * 终结被弃用会话遗留的完全补偿 foreign transaction。调用方持有 workspace lock，
-	 * pending 非终态事务的 owner 操作已确定性结束；mutation 义务全部履行且净效果
-	 * 回到操作前状态时，无需触碰工作区即可 settle。cursor marker 必须缺失——
-	 * marker 存在意味着操作已提交，与补偿证据矛盾，fail closed。
+	 * 终结完全补偿的 pending transaction（own session 重启/第二窗口与 foreign 会话均适用）。
+	 * 调用方持有 workspace lock，pending 非终态事务的 owner 操作已确定性结束；
+	 * mutation 义务全部履行且净效果回到操作前状态时，无需触碰工作区即可 settle。
+	 * cursor marker 必须缺失——marker 存在意味着操作已提交，与补偿证据矛盾，fail closed。
 	 */
 	private async settleCompensated(journal: PendingJournal): Promise<boolean> {
 		const assess = this.dependencies.assessCompensatedTransaction;

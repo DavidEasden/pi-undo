@@ -318,6 +318,26 @@ describe("JournalRecovery fault injection", () => {
 		});
 		expect(failed.calls).toEqual([]);
 	});
+
+	it("own session leaf 已漂移的完全补偿事务仍可 settle，不触发 session_leaf_mismatch", async () => {
+		const { recovery, calls } = fixture("absent", "moved-on", "clean", ["file.txt"], {
+			assessCompensatedTransaction: async () => true,
+		});
+
+		expect(await recovery.recover()).toEqual({ kind: "recovered", operations: 1 });
+		expect(calls).toEqual(["settle:ABORTED"]);
+	});
+
+	it("own session 存在可信 cursor marker 时不走补偿终结，保持原有恢复语义", async () => {
+		const { recovery, calls } = fixture("match", "before", "clean", ["file.txt"], {
+			assessCompensatedTransaction: async () => true,
+		});
+
+		expect(await recovery.recover()).toEqual({ kind: "recovered", operations: 1 });
+		expect(calls).toEqual([
+			"mutations:roll_forward", "capture", "load:a", "plan:a", "restore:a", "cursor-finalized", "settle:COMMITTED",
+		]);
+	});
 });
 
 describe("Quarantine mutation 真实现场恢复", () => {
