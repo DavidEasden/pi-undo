@@ -1,3 +1,4 @@
+import { constants } from "node:fs";
 import { access, chmod, lstat, mkdtemp, readFile, readdir, readlink, rename, rm, symlink, writeFile as writeRawFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -7,6 +8,7 @@ import * as atomicFs from "../src/atomic-fs.ts";
 import { hasDurablePack } from "../src/durable-pack.ts";
 import { canonicalJson, checksum, topologyFingerprint } from "../src/encoding.ts";
 import { MutationJournal } from "../src/mutation-journal.ts";
+import { nativeExecutable } from "../src/native-restore.ts";
 import { RestoreEngine, type RestoreMutation } from "../src/restore-engine.ts";
 import type { ManifestId, RestorePath, SnapshotManifest } from "../src/model.ts";
 import { RootDiscovery } from "../src/root-discovery.ts";
@@ -21,6 +23,19 @@ import {
 } from "./fixtures.ts";
 
 const temporaryRoots: string[] = [];
+
+// durable pack 复用验证依赖 native helper；未提供二进制的平台跳过这些用例。
+async function nativeRestoreAvailable(): Promise<boolean> {
+	if (process.env.PI_UNDO_DISABLE_NATIVE === "1") return false;
+	const executable = nativeExecutable();
+	if (executable === undefined) return false;
+	try {
+		await access(executable, constants.X_OK);
+		return true;
+	} catch {
+		return false;
+	}
+}
 
 class FailingUnpinSnapshotStore extends SnapshotStore {
 	override unpin(_id: ManifestId, _reason: string): Promise<void> {
@@ -476,6 +491,7 @@ describe("RestoreEngine", () => {
 	});
 
 	it("新 RestoreEngine 可通过持久化索引复用同一 store 的 durable pack", async () => {
+		if (!await nativeRestoreAvailable()) return;
 		const workspace = await temporaryRoot("pi-undo-cache-index-workspace-");
 		await writeFile(workspace, "a.txt", "target\n");
 		const storeRoot = await temporaryRoot("pi-undo-cache-index-store-");
@@ -546,6 +562,7 @@ describe("RestoreEngine", () => {
 	});
 
 	it("索引写入失败不影响本进程已准备的 durable pack", async () => {
+		if (!await nativeRestoreAvailable()) return;
 		const workspace = await temporaryRoot("pi-undo-cache-index-write-workspace-");
 		await writeFile(workspace, "a.txt", "target\n");
 		const storeRoot = await temporaryRoot("pi-undo-cache-index-write-store-");
@@ -569,6 +586,7 @@ describe("RestoreEngine", () => {
 	});
 
 	it("并发 prepareDurableRestore 不会互相覆盖持久化索引", async () => {
+		if (!await nativeRestoreAvailable()) return;
 		const workspace = await temporaryRoot("pi-undo-cache-index-concurrent-workspace-");
 		await writeFile(workspace, "a.txt", "a-target\n");
 		await writeFile(workspace, "b.txt", "b-target\n");
@@ -595,6 +613,7 @@ describe("RestoreEngine", () => {
 	});
 
 	it("两个 RestoreEngine 并发更新索引时不丢失 entries", async () => {
+		if (!await nativeRestoreAvailable()) return;
 		const workspace = await temporaryRoot("pi-undo-cache-index-engines-workspace-");
 		await writeFile(workspace, "a.txt", "a-target\n");
 		await writeFile(workspace, "b.txt", "b-target\n");
@@ -630,6 +649,7 @@ describe("RestoreEngine", () => {
 	});
 
 	it("索引读取会等待同一 engine 的持久化更新完成，避免覆盖新 entry", async () => {
+		if (!await nativeRestoreAvailable()) return;
 		const workspace = await temporaryRoot("pi-undo-cache-index-queue-workspace-");
 		await writeFile(workspace, "a.txt", "a-target\n");
 		await writeFile(workspace, "b.txt", "b-target\n");
@@ -689,6 +709,7 @@ describe("RestoreEngine", () => {
 	});
 
 	it("队列中的旧索引读取不会在后续写入后回退内存索引", async () => {
+		if (!await nativeRestoreAvailable()) return;
 		const workspace = await temporaryRoot("pi-undo-cache-index-order-workspace-");
 		await writeFile(workspace, "a.txt", "a-target\n");
 		await writeFile(workspace, "b.txt", "b-target\n");
@@ -753,6 +774,7 @@ describe("RestoreEngine", () => {
 	});
 
 	it("durable pack 超过内存预算时按需重新加载且保留持久化索引", async () => {
+		if (!await nativeRestoreAvailable()) return;
 		const workspace = await temporaryRoot("pi-undo-cache-budget-workspace-");
 		await writeFile(workspace, "a.txt", "a-target\n");
 		await writeFile(workspace, "b.txt", "b-target\n");
@@ -790,6 +812,7 @@ describe("RestoreEngine", () => {
 	});
 
 	it("索引临时不可用时不覆盖磁盘旧 entries，且不影响当前内存复用", async () => {
+		if (!await nativeRestoreAvailable()) return;
 		const workspace = await temporaryRoot("pi-undo-cache-index-read-workspace-");
 		await writeFile(workspace, "a.txt", "a-target\n");
 		await writeFile(workspace, "b.txt", "b-target\n");
