@@ -95,9 +95,71 @@ describe("pi-undo extension", () => {
 
 		extension(pi);
 
-		expect([...commandDescriptions.keys()].sort()).toEqual(["diff", "redo", "undo"]);
+		expect([...commandDescriptions.keys()].sort()).toEqual(["diff", "redo", "undo", "undo-recover"]);
 		expect(commandDescriptions.get("undo")).toContain("last completed Agent run");
 		expect(commandDescriptions.get("diff")).toContain("Review files changed");
+		expect(commandDescriptions.get("undo-recover")).toContain("Re-run pi-undo recovery");
+	});
+
+	it("/undo-recover 重建 runtime 并在恢复成功后解除锁定", async () => {
+		const handlers = new Map<string, (event: any, eventContext: any) => any>();
+		const commands = new Map<string, (args: string, context: any) => Promise<void>>();
+		const notifications: string[] = [];
+		const statuses: string[] = [];
+		let factoryCalls = 0;
+		const pi = {
+			registerCommand(name: string, options: { handler: (args: string, commandContext: any) => Promise<void> }) {
+				commands.set(name, options.handler);
+			},
+			on(name: string, handler: (event: any, eventContext: any) => any) { handlers.set(name, handler); },
+			sendUserMessage(): void {},
+		} as unknown as ExtensionAPI;
+		const bind = createPiUndoExtension(async (context) => {
+			factoryCalls += 1;
+			const locked = factoryCalls === 1;
+			return {
+				controller: {
+					history: () => ({ undoCount: 1, redoCount: 0, locked }),
+					listCheckpoints: () => [],
+					recover: async () => {}, captureFailed: () => false, captureFailureReason: () => undefined, warmUp: () => {},
+					prepareInput: async () => ({ action: "continue" as const }),
+					beforeAgentStart: async () => {},
+					agentSettled: async () => {},
+					undo: async () => ({ code: locked ? "recovery_required" as const : "ok" as const, changedFiles: 0 }),
+					redo: async () => ({ code: "noop" as const, changedFiles: 0 }),
+					beforeTree: async () => undefined,
+					afterTree: async () => {},
+					...(locked ? { recoveryReason: () => "session_identity_mismatch" } : {}),
+				},
+				reporter: new StatusReporter(context),
+			};
+		});
+		bind(pi);
+		const context = {
+			mode: "tui" as const,
+			ui: {
+				setStatus: (_key: string, text: string | undefined) => {
+					if (text !== undefined) statuses.push(text);
+				},
+				notify: (message: string) => { notifications.push(message); },
+				getEditorText: () => "",
+				setEditorText: () => {},
+			},
+		};
+
+		await handlers.get("session_start")!({ type: "session_start" }, context);
+		expect(factoryCalls).toBe(1);
+		expect(statuses.at(-1)).toContain("recovery required: session_identity_mismatch");
+
+		// 锁定状态下 undo 报错，并提示 /undo-recover 出口。
+		await commands.get("undo")!("", context);
+		expect(notifications.some((message) => message.includes("run /undo-recover to retry recovery"))).toBe(true);
+
+		// /undo-recover 原地重建 runtime：第二次 factory 调用返回未锁定状态。
+		await commands.get("undo-recover")!("", context);
+		expect(factoryCalls).toBe(2);
+		expect(notifications.some((message) => message.includes("recovery complete (undo:1 redo:0)"))).toBe(true);
+		expect(statuses.at(-1)).toBe("ready undo:1 redo:0");
 	});
 
 	it("绑定完整 lifecycle，并在 session replacement 后丢弃 stale command 结果", async () => {

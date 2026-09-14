@@ -68,6 +68,16 @@ pi -e /absolute/path/to/pi-undo/extensions/pi-undo.ts
 
 Work with Pi normally. `pi-undo` automatically records a boundary after each completed agent run.
 
+### Recovery
+
+If an operation fails mid-flight (for example, the process is killed while files are being restored), pi-undo locks undo history and reports `recovery_required`. Run:
+
+```text
+/undo-recover
+```
+
+to re-run recovery in place: it re-verifies pending journals, settles provably-safe transactions, rebuilds the undo/redo stacks, and refreshes the status line — the in-process equivalent of restarting the session window. If the workspace is still locked afterwards, the blocking transaction belongs to another session in the same workspace; open (or restart) that session and run `/undo-recover` there.
+
 ### Diff
 
 ```text

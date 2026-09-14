@@ -47,6 +47,7 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 		let activeCommands = new Set<symbol>();
 		let activeAction: "undo" | "redo" | undefined;
 		let captureFailureNotified = false;
+		let recoveryHintNotified = false;
 
 		const initialize = async (context: ExtensionContext): Promise<void> => {
 			const currentGeneration = ++generation;
@@ -57,6 +58,7 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 			activeCommands = new Set<symbol>();
 			activeAction = undefined;
 			captureFailureNotified = false;
+			recoveryHintNotified = false;
 			try {
 				const next = await runtimeFactory(context, pi);
 				if (currentGeneration !== generation) return;
@@ -168,6 +170,10 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 				};
 			}
 			active.reporter.result(result, performance.now() - commandStarted);
+			if (result.code === "recovery_required" && !recoveryHintNotified) {
+				recoveryHintNotified = true;
+				context.ui.notify("pi-undo: run /undo-recover to retry recovery", "info");
+			}
 			const hasDeferredPrompt = deferredPrompts.length > 0 || replaying !== undefined;
 			if (
 				action === "undo" && result.code === "ok" && result.refillPrompt !== undefined &&
@@ -226,6 +232,28 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 		pi.registerCommand("diff", {
 			description: "Review files changed by an Agent run (latest, or /diff N)",
 			handler: async (args: string, context: ExtensionCommandContext) => runDiff(args, context),
+		});
+		pi.registerCommand("undo-recover", {
+			description: "Re-run pi-undo recovery and refresh undo history",
+			handler: async (_args: string, context: ExtensionCommandContext) => {
+				if (activeCommands.size > 0) {
+					context.ui.notify("pi-undo: wait for the current operation to finish before recovering", "warning");
+					return;
+				}
+				// 原地重建 runtime：等价于重启窗口，复用启动 recovery 语义。
+				await initialize(context);
+				const active = runtime;
+				if (active === undefined) return;
+				const history = active.controller.history();
+				if (history.locked) {
+					context.ui.notify(
+						`pi-undo: still locked (${active.controller.recoveryReason?.() ?? "pending journal"}); resolve the blocking session, then run /undo-recover again`,
+						"warning",
+					);
+					return;
+				}
+				context.ui.notify(`pi-undo: recovery complete (undo:${history.undoCount} redo:${history.redoCount})`, "info");
+			},
 		});
 
 		pi.on("session_start", async (_event: unknown, context: ExtensionContext) => initialize(context));
