@@ -101,6 +101,26 @@ describe("pi-undo extension", () => {
 		expect(commandDescriptions.get("undo-recover")).toContain("Re-run pi-undo recovery");
 	});
 
+	it("PI_SUBAGENT_CHILD=1 的 runner 子进程保持惰性，不注册命令与钩子", () => {
+		const registeredCommands: string[] = [];
+		const registeredEvents: string[] = [];
+		const pi = {
+			registerCommand(name: string): void { registeredCommands.push(name); },
+			on(event: string): void { registeredEvents.push(event); },
+		} as unknown as ExtensionAPI;
+		const previous = process.env.PI_SUBAGENT_CHILD;
+		process.env.PI_SUBAGENT_CHILD = "1";
+		try {
+			extension(pi);
+		} finally {
+			if (previous === undefined) delete process.env.PI_SUBAGENT_CHILD;
+			else process.env.PI_SUBAGENT_CHILD = previous;
+		}
+
+		expect(registeredCommands).toEqual([]);
+		expect(registeredEvents).toEqual([]);
+	});
+
 	it("/undo-recover 重建 runtime 并在恢复成功后解除锁定", async () => {
 		const handlers = new Map<string, (event: any, eventContext: any) => any>();
 		const commands = new Map<string, (args: string, context: any) => Promise<void>>();

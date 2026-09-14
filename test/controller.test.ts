@@ -690,6 +690,76 @@ describe("UndoController", () => {
 		expect(controller.history()).toEqual({ undoCount: 1, redoCount: 0, locked: false });
 	});
 
+	it("settled capture 撞上暂态并发写时重试一次成功，不清空 undo 历史", async () => {
+		let captures = 0;
+		const deps = dependencies({
+			capture: async () => {
+				captures += 1;
+				deps.calls.push("capture");
+				// 第 2 次是 settled 首次尝试：模拟 async subagent 并发写撞上撕裂断言。
+				if (captures === 2) {
+					throw Object.assign(
+						new Error("捕获期间工作区叶子已变化：file.txt"),
+						{ name: "SnapshotStoreError", code: "capture_failed" },
+					);
+				}
+				return manifest(captures === 1 ? "a" : "c");
+			},
+		});
+		const controller = new UndoControllerImpl(deps);
+		await controller.prepareInput("并发写轮", { streaming: false });
+		await controller.beforeAgentStart();
+		await controller.agentSettled();
+
+		expect(captures).toBe(3);
+		expect(deps.calls.filter((item) => item === "capture")).toHaveLength(3);
+		expect(deps.calls).not.toContain("entry:pi-undo:barrier");
+		expect(controller.history()).toEqual({ undoCount: 1, redoCount: 0, locked: false });
+		expect(await controller.undo()).toMatchObject({ code: "ok" });
+	});
+
+	it("settled capture 持续暂态失败时重试一次后仍走 historyPaused", async () => {
+		let captures = 0;
+		const deps = dependencies({
+			capture: async () => {
+				captures += 1;
+				if (captures >= 2) {
+					throw Object.assign(
+						new Error("捕获期间工作区叶子已变化：file.txt"),
+						{ name: "WorkspaceLockError", code: "lock_timeout" },
+					);
+				}
+				return manifest("a");
+			},
+		});
+		const controller = new UndoControllerImpl(deps);
+		await controller.prepareInput("持续冲突轮", { streaming: false });
+		await controller.beforeAgentStart();
+		await controller.agentSettled();
+
+		expect(captures).toBe(3);
+		expect(await controller.undo()).toEqual({ code: "history_paused", changedFiles: 0 });
+		expect(deps.calls).toContain("entry:pi-undo:barrier");
+	});
+
+	it("settled capture 非暂态失败不重试", async () => {
+		let captures = 0;
+		const deps = dependencies({
+			capture: async () => {
+				captures += 1;
+				if (captures === 2) throw new Error("broken root 不能静默进入快照");
+				return manifest(captures === 1 ? "a" : "c");
+			},
+		});
+		const controller = new UndoControllerImpl(deps);
+		await controller.prepareInput("永久失败轮", { streaming: false });
+		await controller.beforeAgentStart();
+		await controller.agentSettled();
+
+		expect(captures).toBe(2);
+		expect(await controller.undo()).toEqual({ code: "history_paused", changedFiles: 0 });
+	});
+
 	it("start entry 未获得物理 ID 时不生成不可信 checkpoint，并写 barrier 锁住历史", async () => {
 		const deps = dependencies();
 		const originalAppend = deps.appendControl;

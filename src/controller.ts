@@ -401,7 +401,9 @@ export class UndoControllerImpl implements UndoController {
 			profiler === undefined ? operation() : profiler.measure(phase, operation);
 		try {
 			// settled 复用 run 开始时的 before；helper 在缺少 captureBaseline 时回退完整 capture。
-			const after = await measure("settled.capture", () => this.captureBaselineWithWorkspaceLock(staged.before));
+			// 撕裂捕获（并发写撞上断言窗口）是暂态的：短暂退避后重试一次，成功则不清空历史。
+			const after = await measure("settled.capture", () =>
+				this.captureSettledBaselineWithRetry(staged.before));
 			const changedPaths = await measure("settled.changedPaths", () =>
 				this.dependencies.changedPaths(staged.before, after));
 			if (changedPaths.length > 0 && this.dependencies.prepareDurableRestore !== undefined) {
@@ -830,6 +832,21 @@ export class UndoControllerImpl implements UndoController {
 		}
 	}
 
+	/**
+	 * settled capture 对暂态失败重试一次：async subagent 等并发写入者可能撞上撕裂断言
+	 * （捕获期间叶子变化）或短暂持有 workspace lock。settled 失败会清空整个 undo 历史，
+	 * 不能因一次暂态冲突就放弃；持续失败仍由调用方走原有 historyPaused 路径。
+	 */
+	private async captureSettledBaselineWithRetry(baseline: SnapshotManifest): Promise<SnapshotManifest> {
+		try {
+			return await this.captureBaselineWithWorkspaceLock(baseline);
+		} catch (error) {
+			if (!isTransientCaptureFailure(error)) throw error;
+			await sleep(250);
+			return await this.captureBaselineWithWorkspaceLock(baseline);
+		}
+	}
+
 	private async compensate(
 		descriptor: OperationDescriptor,
 		rollback: SnapshotManifest,
@@ -1011,4 +1028,21 @@ function noop(): OperationResult {
 
 function truncateReason(reason: string): string {
 	return reason.replace(/[\u0000-\u001F\u007F]+/g, " ").trim().slice(0, 120);
+}
+
+/**
+ * 判断 capture 失败是否为并发写入者导致的暂态失败：撕裂断言
+ * （SnapshotStoreError capture_failed，如“捕获期间工作区叶子已变化”）与
+ * workspace lock 超时（WorkspaceLockError lock_timeout）。用 name/code 鸭子类型
+ * 判断以保持 controller 对存储实现的解耦。
+ */
+function isTransientCaptureFailure(error: unknown): boolean {
+	if (typeof error !== "object" || error === null) return false;
+	const { name, code } = error as { name?: unknown; code?: unknown };
+	return (name === "SnapshotStoreError" && code === "capture_failed") ||
+		(name === "WorkspaceLockError" && code === "lock_timeout");
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
 }

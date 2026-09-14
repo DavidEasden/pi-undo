@@ -38,6 +38,13 @@ interface DeferredPrompt {
 
 export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi: ExtensionAPI) => void {
 	return (pi) => {
+		if (process.env.PI_SUBAGENT_CHILD === "1") {
+			// pi-subagents 的 runner 子进程会加载 ambient extensions，并用该环境变量
+			// 标记自身（其父扩展据此保持惰性）。pi-undo 只在主会话生效：避免子进程
+			// 重复 capture 争用 workspace lock。子代理的工作区变更由父会话的 run 级
+			// before/after 快照覆盖，撤回语义不受影响。
+			return;
+		}
 		let runtime: PiUndoRuntime | undefined;
 		let runtimeContext: ExtensionContext | undefined;
 		let generation = 0;
