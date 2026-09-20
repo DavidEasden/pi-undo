@@ -60,6 +60,15 @@ describe("Pi runtime restart", () => {
 		expect(runtime.controller.history()).toEqual({ undoCount: 1, redoCount: 0, locked: false });
 	});
 
+	it("redo 后继续新 run，重启时保留 detached checkpoint frontier", async () => {
+		const fixture = await runtimeFixture("redo-cursor-then-run");
+		const runtime = await createPiUndoRuntime(fixture.context as any, fixture.pi as any);
+
+		expect(runtime.controller.history()).toEqual({ undoCount: 2, redoCount: 0, locked: false });
+		expect(runtime.controller.listCheckpoints().map((checkpoint) => checkpoint.checkpointId))
+			.toEqual(["checkpoint-1", "checkpoint-2"]);
+	});
+
 	it("runtime 启动阶段完成 recovery 后 controller.recover 不重复执行", async () => {
 		const fixture = await runtimeFixture("checkpoint");
 		const recovery = vi.spyOn(JournalRecovery.prototype, "recover");
@@ -256,7 +265,9 @@ async function liveOperationFixture() {
 	return { workspace, context, pi, manager, commandContext, appendSessionEntry };
 }
 
-async function runtimeFixture(scenario: "checkpoint" | "cursor" | "barrier" | "two-cursors" | "foreign-cursor" | "redo-cursor") {
+async function runtimeFixture(
+	scenario: "checkpoint" | "cursor" | "barrier" | "two-cursors" | "foreign-cursor" | "redo-cursor" | "redo-cursor-then-run",
+) {
 	const root = await mkdtemp(join(tmpdir(), "pi-undo-runtime-"));
 	temporaryRoots.push(root);
 	const workspace = join(root, "workspace");
@@ -342,6 +353,35 @@ async function runtimeFixture(scenario: "checkpoint" | "cursor" | "barrier" | "t
 			}),
 		});
 		leafId = "foreign-cursor-entry";
+	} else if (scenario === "redo-cursor-then-run") {
+		const secondCheckpoint = checkpointRecord(identity, 2);
+		entries.push(
+			{
+				type: "custom",
+				id: "redo-cursor-entry",
+				parentId: "assistant-1",
+				customType: "pi-undo:cursor",
+				data: cursorState(identity, {
+					opId: "redo-operation-1",
+					action: "redo",
+					toLogicalLeaf: "assistant-1",
+					undoHead: checkpoint.checkpointId,
+					redoStack: [],
+					rollbackManifestId: "d".repeat(64) as ManifestId,
+				}),
+			},
+			{
+				type: "custom",
+				id: "start-2",
+				parentId: "redo-cursor-entry",
+				customType: "pi-undo:start",
+				data: { schemaVersion: 1, sourceLogicalLeaf: "assistant-1" },
+			},
+			{ type: "message", id: "user-2", parentId: "start-2", message: { role: "user", content: "prompt 2" } },
+			{ type: "message", id: "assistant-2", parentId: "user-2", message: { role: "assistant", content: [] } },
+			{ type: "custom", id: "checkpoint-entry-2", parentId: "assistant-2", customType: "pi-undo:checkpoint", data: secondCheckpoint },
+		);
+		leafId = "checkpoint-entry-2";
 	} else if (scenario === "redo-cursor") {
 		entries.push({
 			type: "custom",
@@ -359,6 +399,7 @@ async function runtimeFixture(scenario: "checkpoint" | "cursor" | "barrier" | "t
 		});
 		leafId = "redo-cursor-entry";
 	}
+
 	const manager = {
 		getEntries: () => entries,
 		getLeafId: () => leafId,

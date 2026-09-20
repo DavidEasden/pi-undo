@@ -1184,12 +1184,24 @@ describe("UndoController", () => {
 		expect(await controller.prepareInput("下一条", { streaming: false })).toEqual({ action: "continue" });
 	});
 
-	it("streaming tree 只请求 abort 并取消，不发生文件恢复", async () => {
+	it("已记录 run 时树导航只请求 abort 并取消", async () => {
 		const deps = dependencies({ isAgentIdle: () => false });
 		const controller = new UndoControllerImpl(deps);
 
+		await controller.prepareInput("正在运行", { streaming: false });
+		await controller.beforeAgentStart();
+		deps.calls.length = 0;
+
 		expect(await controller.beforeTree({ targetLeafId: "old" })).toEqual({ cancel: true });
 		expect(deps.calls).toEqual(["abort"]);
+	});
+
+	it("树导航期间 isIdle 为 false 仍准备恢复事务", async () => {
+		const deps = dependencies({ isAgentIdle: () => false });
+		const controller = new UndoControllerImpl(deps);
+
+		expect(await controller.beforeTree({ targetLeafId: "old" })).toBeUndefined();
+		expect(deps.calls).toEqual(["capture", "prepare"]);
 	});
 
 	it("tree 在 before 只准备 rescue journal，after 信任 observed leaf 后才恢复", async () => {

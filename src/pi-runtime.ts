@@ -285,7 +285,13 @@ function rebuildControllerState(
 	identity: SessionFileIdentity,
 ): ControllerInitialState {
 	const state = sessionStateFor(manager);
-	const checkpoints = state.getCheckpoints(identity);
+	const branch = physicalBranch(manager, manager.getLeafId());
+	const checkpoints = checkpointFrontierAfterDetachedRun(
+		manager,
+		identity,
+		branch,
+		state.getCheckpoints(identity),
+	);
 	const cursor = state.getCursor(identity);
 	let undoStack = [...checkpoints];
 	if (cursor !== null) {
@@ -305,10 +311,32 @@ function rebuildControllerState(
 		if (sourceCursor === undefined) throw new Error("cursor redo safety manifest 缺失");
 		return { checkpoint, targetManifestId: sourceCursor.rollbackManifestId };
 	});
-	const branch = physicalBranch(manager, manager.getLeafId());
 	const lastBarrier = findLastIndex(branch, (entry) => entry.type === "custom" && entry.customType === "pi-undo:barrier");
 	const lastCheckpoint = findLastIndex(branch, (entry) => entry.type === "custom" && entry.customType === "pi-undo:checkpoint");
 	return { undoStack, redoStack, historyPaused: lastBarrier > lastCheckpoint };
+}
+
+/**
+ * redo 或树导航后的新 run 会挂在 cursor 后面，使前一个 checkpoint 脱离当前物理 branch。
+ * start entry 保存了 run 前的逻辑叶，利用它恢复可信的 checkpoint frontier，再接上当前 branch。
+ */
+function checkpointFrontierAfterDetachedRun(
+	manager: ReadonlySessionManager,
+	identity: SessionFileIdentity,
+	branch: readonly Record<string, unknown>[],
+	current: readonly CheckpointRecord[],
+): CheckpointRecord[] {
+	const start = [...branch].reverse().find((entry) => entry.type === "custom" && entry.customType === "pi-undo:start");
+	if (start === undefined || !isRecord(start.data)) return [...current];
+	const sourceLogicalLeaf = start.data.sourceLogicalLeaf;
+	if (typeof sourceLogicalLeaf !== "string") return [...current];
+	const sourceCheckpoint = findCheckpointByEndLeaf(manager, identity, sourceLogicalLeaf);
+	if (sourceCheckpoint === undefined) return [...current];
+	const inherited = checkpointFrontierById(manager, identity, sourceCheckpoint.checkpointId);
+	return [
+		...inherited,
+		...current.filter((checkpoint) => !inherited.some((candidate) => candidate.checkpointId === checkpoint.checkpointId)),
+	].filter((checkpoint, index, all) => all.findIndex((candidate) => candidate.checkpointId === checkpoint.checkpointId) === index);
 }
 
 function checkpointFrontierById(

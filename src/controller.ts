@@ -452,7 +452,9 @@ export class UndoControllerImpl implements UndoController {
 	}
 
 	async beforeTree(event: SessionBeforeTreeEvent): Promise<SessionBeforeTreeResult | undefined> {
-		if (!this.dependencies.isAgentIdle()) {
+		// Pi 0.86+ 在树导航期间也会让 isIdle() 暂时返回 false；只有 pi-undo
+		// 已经记录了尚未 settle 的 run 时，才需要中止并取消导航。
+		if (this.staged !== undefined) {
 			await this.dependencies.abortAgent();
 			return { cancel: true };
 		}
