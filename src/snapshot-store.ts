@@ -24,7 +24,7 @@ import type { NativeMetadataEntry, NativeMetadataPort } from "./native-metadata.
 import { NativeMetadataInspector } from "./native-metadata.ts";
 import { operationProcessOptions } from "./operation-context.ts";
 import { assertNoSymlinkEscape, assertNoSymlinkParents, pathSetsOverlap, relativeSafePath } from "./path-safety.ts";
-import { RootDiscovery, type RootTopology } from "./root-discovery.ts";
+import { RootDiscovery, type RootDiscoveryReason, type RootTopology } from "./root-discovery.ts";
 import { WorkspaceLock } from "./workspace-lock.ts";
 
 const SCHEMA_VERSION = 1;
@@ -148,7 +148,10 @@ export interface SnapshotStoreOptions {
 
 export interface CaptureOptions {
 	readonly excludePaths?: readonly string[];
-	/** 调用方刚完成 topology discovery 时跳过重复的捕获前校验。捕获后校验仍然执行。 */
+	/**
+	 * 调用方刚完成 topology discovery 时跳过重复的入口校验；枚举或捕获结束后的校验仍然执行，
+	 * 因此校验窗口内出现的漂移依然会被拒绝。仅限调用方与本次枚举之间没有文件变更时使用。
+	 */
 	readonly topologyAlreadyValidated?: boolean;
 }
 
@@ -281,7 +284,7 @@ export class SnapshotStore {
 			const coverage = captureCoverage(topology.workspaceIdentity, scope);
 			const artifactExclusions = captureExclusions(topology.workspaceIdentity, options.excludePaths);
 			if (options.topologyAlreadyValidated !== true) {
-				await this.assertTopology(topology, "捕获前 topology 已变化");
+				await this.assertTopology(topology, "捕获前 topology 已变化", "safety-snapshot");
 			}
 			const brokenRoots = brokenRootPaths(topology);
 			if (brokenRoots.length > 0) {
@@ -330,7 +333,7 @@ export class SnapshotStore {
 			const cacheUpdates = capturedRoots.flatMap((captured) =>
 				captured.cacheUpdate === undefined ? [] : [captured.cacheUpdate]);
 
-			await this.assertTopology(topology, "捕获期间 topology 已变化");
+			await this.assertTopology(topology, "捕获期间 topology 已变化", "safety-snapshot");
 			const content = {
 				schemaVersion: SCHEMA_VERSION as 1,
 				workspaceIdentity: topology.workspaceIdentity,
@@ -389,14 +392,14 @@ export class SnapshotStore {
 				throw new SnapshotStoreError("capture_failed", "topology fingerprint 与 roots 不匹配");
 			}
 			if (options.topologyAlreadyValidated !== true) {
-				await this.assertTopology(topology, "捕获前 topology 已变化");
+				await this.assertTopology(topology, "捕获前 topology 已变化", "safety-snapshot");
 			}
 			const brokenRoots = brokenRootPaths(topology);
 			if (brokenRoots.length > 0) {
 				throw new SnapshotStoreError("capture_failed", `broken root 不能静默进入 baseline 校验: ${brokenRoots.join(", ")}`);
 			}
 			if (await this.isBaselineFresh(topology, baseline, scope, options)) {
-				await this.assertTopology(topology, "捕获期间 topology 已变化");
+				await this.assertTopology(topology, "捕获期间 topology 已变化", "safety-snapshot");
 				await this.touchStore(this.storeDirectory(topology));
 				return baseline;
 			}
@@ -565,7 +568,9 @@ export class SnapshotStore {
 				throw new SnapshotStoreError("capture_failed", "topology fingerprint 与 roots 不匹配");
 			}
 			const artifactExclusions = captureExclusions(topology.workspaceIdentity, options.excludePaths);
-			await this.assertTopology(topology, "可见路径枚举前 topology 已变化");
+			if (options.topologyAlreadyValidated !== true) {
+				await this.assertTopology(topology, "可见路径枚举前 topology 已变化", "visible-paths-pre");
+			}
 			const brokenRoots = brokenRootPaths(topology);
 			if (brokenRoots.length > 0) {
 				throw new SnapshotStoreError("capture_failed", `broken root 不能静默进入可见路径枚举: ${brokenRoots.join(", ")}`);
@@ -602,7 +607,7 @@ export class SnapshotStore {
 					result.add(workspaceRelativePath(root.relativeRoot, relativePath));
 				}
 			}
-			await this.assertTopology(topology, "可见路径枚举期间 topology 已变化");
+			await this.assertTopology(topology, "可见路径枚举期间 topology 已变化", "visible-paths-post");
 			return [...result].sort(comparePaths);
 		} catch (error) {
 			if (error instanceof SnapshotStoreError) throw error;
@@ -1684,8 +1689,12 @@ export class SnapshotStore {
 		return result.stdoutBytes;
 	}
 
-	private async assertTopology(expected: RootTopology, message: string): Promise<void> {
-		const actual = await this.discovery.discover(expected.workspaceIdentity);
+	private async assertTopology(
+		expected: RootTopology,
+		message: string,
+		reason: RootDiscoveryReason,
+	): Promise<void> {
+		const actual = await this.discovery.discover(expected.workspaceIdentity, reason);
 		const rootKindsMatch = actual.roots.length === expected.roots.length && actual.roots.every((root, index) => {
 			const expectedRoot = expected.roots[index];
 			return expectedRoot !== undefined &&

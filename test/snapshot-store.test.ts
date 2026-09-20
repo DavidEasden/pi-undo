@@ -7,7 +7,7 @@ import { canonicalJson, checksum, ignoredPresentClosure } from "../src/encoding.
 import { GitRunner, type GitRunOptions, type GitRunResult } from "../src/git-runner.ts";
 import type { ManifestId, SnapshotManifest } from "../src/model.ts";
 import { createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
-import { RootDiscovery, type RootTopology } from "../src/root-discovery.ts";
+import { RootDiscovery, type RootDiscoveryReason, type RootTopology } from "../src/root-discovery.ts";
 import { SnapshotStore } from "../src/snapshot-store.ts";
 import { WorkspaceLock } from "../src/workspace-lock.ts";
 import {
@@ -51,6 +51,22 @@ class ChangingDiscovery extends RootDiscovery {
 		const topology = await super.discover(workspaceRoot);
 		this.calls += 1;
 		return this.calls < 2 ? topology : { ...topology, fingerprint: "changed-topology" };
+	}
+}
+
+class ReasonRecordingDiscovery extends RootDiscovery {
+	readonly reasons: RootDiscoveryReason[] = [];
+
+	override async discover(
+		workspaceRoot: string,
+		reason: RootDiscoveryReason = "unspecified",
+	): Promise<RootTopology> {
+		this.reasons.push(reason);
+		return super.discover(workspaceRoot, reason);
+	}
+
+	reset(): void {
+		this.reasons.length = 0;
 	}
 }
 
@@ -1624,6 +1640,37 @@ describe("SnapshotStore", () => {
 
 		await expect(store.capture(topology)).rejects.toMatchObject({ code: "capture_failed" });
 		await expectNoPublishedManifest(storeRoot);
+	});
+
+	it("topologyAlreadyValidated 跳过重复的入口校验但保留枚举后校验", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		await writeFixtureFile(workspace, "file.txt", "content\n");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		const discovery = new ReasonRecordingDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		const topology = await discovery.discover(workspace);
+		discovery.reset();
+
+		expect(await store.listVisibleLeafPaths(topology, { topologyAlreadyValidated: true }))
+			.toEqual(["file.txt"]);
+		expect(discovery.reasons).toEqual(["visible-paths-post"]);
+		discovery.reset();
+		expect(await store.listVisibleLeafPaths(topology)).toEqual(["file.txt"]);
+		expect(discovery.reasons).toEqual(["visible-paths-pre", "visible-paths-post"]);
+	});
+
+	it("复用验证窗口时枚举前发生的 topology 漂移仍被枚举后校验拒绝", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		await writeFixtureFile(workspace, "file.txt", "content\n");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		const store = new SnapshotStore({ storeRoot });
+		const topology = await new RootDiscovery().discover(workspace);
+		await createNestedRepo(workspace, "late-nested");
+
+		await expect(store.listVisibleLeafPaths(topology, { topologyAlreadyValidated: true }))
+			.rejects.toMatchObject({ code: "capture_failed" });
+		await expect(store.listVisibleLeafPaths(topology))
+			.rejects.toMatchObject({ code: "capture_failed" });
 	});
 
 	it("拒绝 roots 与 fingerprint 不一致的伪造 topology，且不执行 Git 捕获", async () => {

@@ -1,4 +1,5 @@
-import { lstat, mkdtemp, mkdir, readFile, realpath, rm, unlink, writeFile } from "node:fs/promises";
+import { access, lstat, mkdtemp, mkdir, readFile, realpath, rm, unlink, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,8 +9,9 @@ import { GitRunner, type GitRunOptions, type GitRunResult } from "../src/git-run
 import { MutationJournal } from "../src/mutation-journal.ts";
 import type { ManifestId } from "../src/model.ts";
 import type { NativeMetadataEntry, NativeMetadataPort } from "../src/native-metadata.ts";
+import { nativeExecutable } from "../src/native-restore.ts";
 import { RestoreEngine } from "../src/restore-engine.ts";
-import { RootDiscovery } from "../src/root-discovery.ts";
+import { RootDiscovery, type RootDiscoveryReason, type RootTopology } from "../src/root-discovery.ts";
 import { SnapshotStore } from "../src/snapshot-store.ts";
 import { createGitRepo, createNestedRepo } from "./fixtures.ts";
 
@@ -64,6 +66,35 @@ class RootConcurrencyGitRunner extends CountingGitRunner {
 		} finally {
 			this.activeRootCaptures -= 1;
 		}
+	}
+}
+
+class RecordingRootDiscovery extends RootDiscovery {
+	readonly reasons: RootDiscoveryReason[] = [];
+
+	override async discover(
+		workspaceRoot: string,
+		reason: RootDiscoveryReason = "unspecified",
+	): Promise<RootTopology> {
+		this.reasons.push(reason);
+		return super.discover(workspaceRoot, reason);
+	}
+
+	reset(): void {
+		this.reasons.length = 0;
+	}
+}
+
+// durable 复用验证依赖 native helper；未提供二进制的平台跳过这些用例。
+async function nativeRestoreAvailable(): Promise<boolean> {
+	if (process.env.PI_UNDO_DISABLE_NATIVE === "1") return false;
+	const executable = nativeExecutable();
+	if (executable === undefined) return false;
+	try {
+		await access(executable, constants.X_OK);
+		return true;
+	} catch {
+		return false;
 	}
 }
 
@@ -670,6 +701,54 @@ describe("undo/redo restore performance", () => {
 		} finally {
 			await rm(workspace, { recursive: true, force: true });
 			await rm(storeRoot, { recursive: true, force: true });
+		}
+	}, 120_000);
+
+	// 对应计划的验收目标：单文件原生正常 undo 的完整 RootDiscovery 从 7 次降到不超过 5 次。
+	it("单文件原生 undo 只做不超过 5 次完整拓扑发现", async () => {
+		if (!await nativeRestoreAvailable()) return;
+		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-scan-count-"));
+		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-scan-count-store-"));
+		const journalRoot = await mkdtemp(join(tmpdir(), "pi-undo-scan-count-journal-"));
+		try {
+			await writeFile(join(workspace, "value.txt"), "before\n");
+			const discovery = new RecordingRootDiscovery();
+			const store = new SnapshotStore({ storeRoot, discovery });
+			const restore = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+			const before = await store.capture(await discovery.discover(workspace));
+			await writeFile(join(workspace, "value.txt"), "after\n");
+			// 无 scope 的 capture 产生 complete coverage，因此 apply 内的可见路径子集校验会真正执行枚举。
+			const after = await store.capture(await discovery.discover(workspace));
+			const changedPaths = ["value.txt"];
+			// controller 的 settled 预制：undo 关键路径只预制立即使用的 after → before。
+			await restore.prepareDurableRestore(after, before, changedPaths);
+			discovery.reset();
+
+			// pi-runtime 的 captureSafety → planRestore → applyRestore 顺序。
+			expect(await restore.canReuseDurableSource(after, before, changedPaths)).toBe(true);
+			const journal = new MutationJournal(join(journalRoot, "mutations.jsonl"), "op-scan-count");
+			const plan = await restore.plan(after, before, changedPaths);
+			const result = await restore.apply(plan, before, {
+				opId: journal.operationId,
+				mutationJournal: journal,
+				deferDurability: true,
+			});
+
+			expect(result.code).toBe("ok");
+			expect(await readFile(join(workspace, "value.txt"), "utf8")).toBe("before\n");
+			expect(discovery.reasons.length).toBeLessThanOrEqual(5);
+			// 安全快照 1 次、恢复前 1 次，两次可见路径枚举各只保留枚举后的复核。
+			expect(discovery.reasons).toEqual([
+				"safety-snapshot",
+				"restore-pre",
+				"visible-paths-post",
+				"restore-post",
+				"visible-paths-post",
+			]);
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+			await rm(journalRoot, { recursive: true, force: true });
 		}
 	}, 120_000);
 });

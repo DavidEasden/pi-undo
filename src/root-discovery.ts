@@ -39,6 +39,19 @@ export interface RootTopology {
 	readonly fingerprint: string;
 }
 
+/**
+ * discover 调用原因：区分安全快照、恢复前、可见路径枚举、恢复后与补偿路径。
+ * 扫描行为不依赖该标签，它只作为调用方诊断与调用次数回归的归属标记。
+ */
+export type RootDiscoveryReason =
+	| "safety-snapshot"
+	| "restore-pre"
+	| "visible-paths-pre"
+	| "visible-paths-post"
+	| "restore-post"
+	| "compensation"
+	| "unspecified";
+
 export type RootDiscoveryErrorCode = "workspace_not_found" | "discovery_failed";
 
 export class RootDiscoveryError extends Error {
@@ -52,7 +65,7 @@ export class RootDiscoveryError extends Error {
 }
 
 export interface RootDiscovery {
-	discover(workspaceRoot: string): Promise<RootTopology>;
+	discover(workspaceRoot: string, reason?: RootDiscoveryReason): Promise<RootTopology>;
 }
 
 export class RootDiscovery {
@@ -62,9 +75,9 @@ export class RootDiscovery {
 		this.git = git;
 	}
 
-	async discover(workspaceRoot: string): Promise<RootTopology> {
+	async discover(workspaceRoot: string, reason: RootDiscoveryReason = "unspecified"): Promise<RootTopology> {
 		checkOperation();
-		reportOperationProgress("discover_roots");
+		reportOperationProgress(`discover_roots:${reason}`);
 		const workspaceIdentity = await canonicalWorkspaceRoot(workspaceRoot);
 		checkOperation();
 		const activeRoots = new Map<string, DiscoveredRoot>();

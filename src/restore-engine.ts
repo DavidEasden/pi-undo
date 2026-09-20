@@ -97,6 +97,16 @@ interface OwnedPath {
 	readonly root: SnapshotRoot;
 }
 
+interface VisibleSubsetCheck {
+	/**
+	 * 调用方刚刚完成 topology discovery 且随后没有文件 mutation 时为 true，可跳过枚举入口的重复校验。
+	 * 枚举结束后的校验仍然执行，所以该窗口内的漂移依然被拒绝。
+	 */
+	readonly topologyValidated: boolean;
+	readonly extraExclusions?: readonly string[];
+	readonly ownedPaths?: readonly (ReadonlyMap<string, OwnedPath> | undefined)[];
+}
+
 interface PreparedRestorePlan {
 	readonly plan: RestorePlan;
 	readonly currentPaths: ReadonlyMap<string, OwnedPath>;
@@ -293,7 +303,7 @@ export class RestoreEngine {
 				const expected = await this.plan(current, target, scopePaths);
 				if (expected.planDigest !== cached.planDigest) return false;
 			}
-			const topology = await this.discovery.discover(this.workspaceRoot);
+			const topology = await this.discovery.discover(this.workspaceRoot, "safety-snapshot");
 			this.assertCurrentTopology(current, target, topology);
 			const native = await createNativeFileBatch({
 				workspaceRoot: this.workspaceRoot,
@@ -773,7 +783,7 @@ export class RestoreEngine {
 			if (await this.assertWorkspaceRootIdentity() !== current.workspaceIdentity) {
 				throw new Error("restore workspace root 必须使用 canonical identity");
 			}
-			topologyBefore = await this.discovery.discover(this.workspaceRoot);
+			topologyBefore = await this.discovery.discover(this.workspaceRoot, "restore-pre");
 			this.assertCurrentTopology(current, target, topologyBefore);
 		} catch {
 			return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
@@ -796,12 +806,15 @@ export class RestoreEngine {
 			return { code: "recovery_required", verifiedPaths: 0, totalPaths: currentPaths.size };
 		}
 		try {
+			// 兼容恢复路径会先在此窗口内补偿 pending mutations，因此只有非补偿路径可以跳过枚举入口的重复发现。
 			await this.assertCompleteVisibleSubset(
 				topologyBefore,
 				[current, target],
 				options.mutationJournal,
-				[],
-				this.completeCoverageOwnedPaths(plan.scopePaths, [currentPaths, targetPaths]),
+				{
+					topologyValidated: !compatibilityMode,
+					ownedPaths: this.completeCoverageOwnedPaths(plan.scopePaths, [currentPaths, targetPaths]),
+				},
 			);
 		} catch {
 			return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
@@ -911,14 +924,16 @@ export class RestoreEngine {
 			);
 			await this.writePlannedPaths(target.manifestId, targetPaths, plan.writePaths, mutationContext);
 
-			const topologyAfter = await this.discovery.discover(this.workspaceRoot);
+			const topologyAfter = await this.discovery.discover(this.workspaceRoot, "restore-post");
 			assertUnchangedTopology(topologyBefore, topologyAfter);
 			await this.assertCompleteVisibleSubset(
 				topologyAfter,
 				[target],
 				options.mutationJournal,
-				[],
-				this.completeCoverageOwnedPaths(plan.scopePaths, [targetPaths]),
+				{
+					topologyValidated: true,
+					ownedPaths: this.completeCoverageOwnedPaths(plan.scopePaths, [targetPaths]),
+				},
 			);
 			const verification = await this.verifyTarget(
 				target,
@@ -984,19 +999,22 @@ export class RestoreEngine {
 	): Promise<RestoreResult> {
 		try {
 			await nativeRun(pack);
-			const topologyAfter = await this.discovery.discover(this.workspaceRoot);
+			const topologyAfter = await this.discovery.discover(this.workspaceRoot, "restore-post");
 			assertUnchangedTopology(topologyBefore, topologyAfter);
 			await this.assertCompleteVisibleSubset(
 				topologyAfter,
 				[target],
 				options.mutationJournal,
-				pack.paths().flatMap((path) => {
-					const artifacts = pack.artifacts(path);
-					return artifacts === undefined
-						? []
-						: [artifacts.source, ...(artifacts.target === null ? [] : [artifacts.target])];
-				}),
-				this.completeCoverageOwnedPaths(plan.scopePaths, [targetPaths]),
+				{
+					topologyValidated: true,
+					extraExclusions: pack.paths().flatMap((path) => {
+						const artifacts = pack.artifacts(path);
+						return artifacts === undefined
+							? []
+							: [artifacts.source, ...(artifacts.target === null ? [] : [artifacts.target])];
+					}),
+					ownedPaths: this.completeCoverageOwnedPaths(plan.scopePaths, [targetPaths]),
+				},
 			);
 			const totalPaths = plan.deletePaths.length + plan.writePaths.length;
 			if ((await options.mutationJournal.load()).length !== 0) {
@@ -1516,14 +1534,16 @@ export class RestoreEngine {
 				context,
 			);
 			await this.writePlannedPaths(current.manifestId, currentPaths, rollbackPlan.writePaths, context);
-			const topologyAfter = await this.discovery.discover(this.workspaceRoot);
+			const topologyAfter = await this.discovery.discover(this.workspaceRoot, "restore-post");
 			assertUnchangedTopology(topologyBefore, topologyAfter);
 			await this.assertCompleteVisibleSubset(
 				topologyAfter,
 				[current],
 				options.mutationJournal,
-				[],
-				this.completeCoverageOwnedPaths(scopePaths, [currentPaths]),
+				{
+					topologyValidated: true,
+					ownedPaths: this.completeCoverageOwnedPaths(scopePaths, [currentPaths]),
+				},
 			);
 			const verification = await this.verifyTarget(
 				current,
@@ -1559,14 +1579,16 @@ export class RestoreEngine {
 			}
 			if (rollbackPlan !== undefined) {
 				try {
-					const topologyAfter = await this.discovery.discover(this.workspaceRoot);
+					const topologyAfter = await this.discovery.discover(this.workspaceRoot, "compensation");
 					assertUnchangedTopology(topologyBefore, topologyAfter);
 					await this.assertCompleteVisibleSubset(
 						topologyAfter,
 						[current],
 						options.mutationJournal,
-						[],
-						this.completeCoverageOwnedPaths(scopePaths, [currentPaths]),
+						{
+							topologyValidated: true,
+							ownedPaths: this.completeCoverageOwnedPaths(scopePaths, [currentPaths]),
+						},
 					);
 					const verification = await this.verifyTarget(
 						current,
@@ -1757,9 +1779,8 @@ export class RestoreEngine {
 	private async assertCompleteVisibleSubset(
 		topology: RootTopology,
 		allowedManifests: readonly SnapshotManifest[],
-		mutationJournal?: MutationJournal,
-		extraExclusions: readonly string[] = [],
-		ownedPaths?: readonly (ReadonlyMap<string, OwnedPath> | undefined)[],
+		mutationJournal: MutationJournal | undefined,
+		check: VisibleSubsetCheck,
 	): Promise<void> {
 		if (allowedManifests.some((manifest) => manifest.coverage !== "complete")) {
 			return;
@@ -1769,7 +1790,7 @@ export class RestoreEngine {
 			for (const path of ignoredWorkspacePaths(manifest)) {
 				allowedPaths.add(path);
 			}
-			const paths = ownedPaths?.[index] ?? await this.readOwnedPaths(manifest);
+			const paths = check.ownedPaths?.[index] ?? await this.readOwnedPaths(manifest);
 			for (const [path, owned] of paths) {
 				if (owned.entry.kind !== "directory") {
 					allowedPaths.add(path);
@@ -1777,12 +1798,13 @@ export class RestoreEngine {
 			}
 		}
 
-		const exclusions = new Set(extraExclusions);
+		const exclusions = new Set(check.extraExclusions ?? []);
 		if (mutationJournal !== undefined) {
 			for (const path of await mutationJournal.activeArtifacts()) exclusions.add(path);
 		}
 		const livePaths = await this.store.listVisibleLeafPaths(topology, {
 			excludePaths: exclusions.size === 0 ? undefined : [...exclusions],
+			topologyAlreadyValidated: check.topologyValidated,
 		});
 		for (const path of livePaths) {
 			if (!allowedPaths.has(path)) {

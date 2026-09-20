@@ -11,7 +11,7 @@ import { MutationJournal } from "../src/mutation-journal.ts";
 import { nativeExecutable } from "../src/native-restore.ts";
 import { RestoreEngine, type RestoreMutation } from "../src/restore-engine.ts";
 import type { ManifestId, RestorePath, SnapshotManifest } from "../src/model.ts";
-import { RootDiscovery } from "../src/root-discovery.ts";
+import { RootDiscovery, type RootDiscoveryReason, type RootTopology } from "../src/root-discovery.ts";
 import { SnapshotStore, SnapshotStoreError } from "../src/snapshot-store.ts";
 import {
 	createGitRepo,
@@ -90,6 +90,30 @@ class GitMetadataTreeSnapshotStore extends SnapshotStore {
 			size: 0,
 			rootHash: "0".repeat(64),
 		}];
+	}
+}
+
+/** 记录 discover 调用原因，并可在指定的下一次 discover 返回后注入 topology 漂移。 */
+class DriftInjectingDiscovery extends RootDiscovery {
+	readonly reasons: RootDiscoveryReason[] = [];
+	private drift: (() => Promise<void>) | undefined;
+
+	armDrift(drift: () => Promise<void>): void {
+		this.drift = drift;
+	}
+
+	override async discover(
+		workspaceRoot: string,
+		reason: RootDiscoveryReason = "unspecified",
+	): Promise<RootTopology> {
+		this.reasons.push(reason);
+		const topology = await super.discover(workspaceRoot, reason);
+		const drift = this.drift;
+		if (drift !== undefined) {
+			this.drift = undefined;
+			await drift();
+		}
+		return topology;
 	}
 }
 
@@ -1359,6 +1383,48 @@ describe("RestoreEngine", () => {
 		expect((await discovery.discover(outer.root)).roots.map((root) => root.relativeRoot)).toEqual([
 			".",
 			"drift-root",
+		]);
+	});
+
+	it("复用恢复前验证窗口时窗口内 topology 漂移仍在 mutation 前 fail-safe", async () => {
+		const outer = await createGitRepo();
+		temporaryRoots.push(outer.root);
+		await writeFile(outer.root, "file.txt", "target\n");
+		const storeRoot = await temporaryRoot("pi-undo-restore-store-");
+		const discovery = new DriftInjectingDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		const target = await store.capture(await discovery.discover(outer.root));
+		await writeFile(outer.root, "file.txt", "current\n");
+		const current = await store.capture(await discovery.discover(outer.root));
+		let mutations = 0;
+		const engine = new RestoreEngine({
+			workspaceRoot: outer.root,
+			store,
+			discovery,
+			beforeMutation: () => {
+				mutations += 1;
+			},
+		});
+		const plan = await engine.plan(current, target);
+		discovery.reasons.length = 0;
+		// 漂移发生在恢复前的 discovery 之后：入口校验被复用，必须由枚举结束后的复核发现。
+		discovery.armDrift(async () => {
+			await createNestedRepo(outer.root, "window-drift");
+		});
+		const journal = new MutationJournal(join(storeRoot, "mutations.jsonl"), "op-window-drift");
+
+		const result = await engine.apply(plan, target, {
+			opId: journal.operationId,
+			mutationJournal: journal,
+		});
+
+		expect(result.code).toBe("restore_failed_safe");
+		expect(mutations).toBe(0);
+		expect(discovery.reasons).toEqual(["restore-pre", "visible-paths-post"]);
+		expect(await readFile(join(outer.root, "file.txt"), "utf8")).toBe("current\n");
+		expect((await new RootDiscovery().discover(outer.root)).roots.map((root) => root.relativeRoot)).toEqual([
+			".",
+			"window-drift",
 		]);
 	});
 
