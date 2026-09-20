@@ -151,15 +151,6 @@ jobs:
           test -z "$filtered" || { printf '%s\n' "$filtered"; exit 1; }
       - name: Pack npm package
         run: npm pack
-      - name: Publish npm package
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          package_tag="v$(node -p "require('./package.json').version")"
-          test "$GITHUB_REF_NAME" = "$package_tag" || {
-            echo "Tag $GITHUB_REF_NAME does not match package version $package_tag"
-            exit 1
-          }
-          npm publish ./*.tgz --access public --provenance
       - uses: actions/upload-artifact@v4
         with:
           name: npm-package

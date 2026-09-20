@@ -314,7 +314,7 @@ Install the [Rust toolchain](https://rustup.rs/) before building or updating a n
 npm run build:native
 ```
 
-`npm run build:native` creates `pi-undo-fs` for the current build platform under `native/pi-undo-fs/target/release/`. The release workflow builds arm64 and x64 versions on macOS, Linux, and Windows runners, renames them consistently under `native/bin/`, and packages all six binaries in the npm package.
+`npm run build:native` creates `pi-undo-fs` for the current build platform under `native/pi-undo-fs/target/release/`. The `Native binaries` workflow builds arm64 and x64 versions on macOS, Linux, and Windows runners, verifies the full six-binary matrix, and uploads them as workflow artifacts. The `Publish to npm` workflow publishes the package when a `v*` tag is pushed, using the binaries committed under `native/bin/`.
 
 For local development on the current platform, copy the generated file into `native/bin/` and rename it for the platform. For example, a Windows build must use the corresponding `.exe` filename.
 
@@ -323,7 +323,7 @@ cp native/pi-undo-fs/target/release/pi-undo-fs native/bin/pi-undo-fs-darwin-arm6
 chmod +x native/bin/pi-undo-fs-darwin-arm64
 ```
 
-The published package must contain all six platform binaries listed under Requirements. CI verifies them before packaging and publishes the complete CI-built npm package when a `v*` tag is pushed. The npm package must configure Trusted Publishing (OIDC) for this GitHub Actions workflow. If no binary is available for the current platform, the extension automatically uses the TypeScript fallback.
+Every precompiled binary listed under Requirements must be committed under `native/bin/` to be part of a release. The `Native binaries` workflow verifies the complete six-binary matrix before uploading artifacts, and the `Publish to npm` workflow publishes the package on a `v*` tag push. The npm package must configure Trusted Publishing (OIDC) for the `Publish to npm` workflow. If no binary is available for the current platform, the extension automatically uses the TypeScript fallback.
 
 ### Project Layout
 
