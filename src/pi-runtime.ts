@@ -66,11 +66,15 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 		loadPending: () => journal.loadPending(),
 		assessForeignTransaction: (pending) => journal.isInertForeignPrepared(pending),
 		assessCompensatedTransaction: (pending) => journal.isFullyCompensated(pending),
-		inspectCursor: (pending) => inspectCursorMarkers(pending.descriptor.sessionIdentity.path, pending.descriptor),
+		inspectCursor: (pending) => inspectCursorMarkers(pending.descriptor.sessionIdentity.path, pending.descriptor,
+			pending.descriptor.action === "tree" && pending.state.observedLogicalLeaf !== undefined
+				? pending.state.observedLogicalLeaf : pending.descriptor.toLogicalLeaf),
 		finalizeCursor: (pending, inspection) => finalizeCursorMarker(
 			pending.descriptor.sessionIdentity.path,
 			pending.descriptor,
 			inspection,
+			pending.descriptor.action === "tree" && pending.state.observedLogicalLeaf !== undefined
+				? pending.state.observedLogicalLeaf : pending.descriptor.toLogicalLeaf,
 		),
 		recoverMutations: async (pending, decision) => {
 			const mutationJournal = journal.mutationJournal(pending.descriptor.opId);
@@ -210,10 +214,12 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 			}
 		},
 		restoreSessionLeaf: async (logicalLeafId) => {
-			if (commandContext === undefined || logicalLeafId === null) return false;
+			if (commandContext === undefined) return false;
+			const targetId = sessionNavigationEntry(manager, logicalLeafId);
+			if (targetId === undefined) return false;
 			internalNavigation = true;
 			try {
-				const result = await commandContext.navigateTree(logicalLeafId, { summarize: false });
+				const result = await commandContext.navigateTree(targetId, { summarize: false });
 				return !result.cancelled && sessionStateFor(manager).getLogicalLeafId() === logicalLeafId;
 			} finally {
 				internalNavigation = false;
@@ -276,6 +282,13 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 		},
 		isInternalNavigation(): boolean {
 			return internalNavigation;
+		},
+		normalizeTreeEvent(event: { newLeafId: string | null; summaryEntry?: { parentId: string | null } }) {
+			return {
+				newLeafId: logicalLeafAt(manager, event.newLeafId),
+				navigationTargetLeafId: logicalLeafAt(manager,
+					event.summaryEntry === undefined ? event.newLeafId : event.summaryEntry.parentId),
+			};
 		},
 	};
 }
@@ -401,6 +414,21 @@ function logicalLeafAt(manager: ReadonlySessionManager, leafId: string | null): 
 	return sessionStateFor(manager, leafId).getLogicalLeafId();
 }
 
+function sessionNavigationEntry(manager: ReadonlySessionManager, logicalLeafId: string | null): string | undefined {
+	if (logicalLeafId !== null) {
+		const entry = manager.getEntry(logicalLeafId) as unknown;
+		if (isRecord(entry) && entry.type !== "custom_message" &&
+			!(entry.type === "message" && isRecord(entry.message) && entry.message.role === "user")) return logicalLeafId;
+	}
+	// Pi 的公开导航 API 不接受 null；选择 parent 对应逻辑位置的用户消息。
+	for (const entry of manager.getEntries() as unknown[]) {
+		if (!isRecord(entry) || typeof entry.id !== "string" || entry.type !== "message" ||
+			!isRecord(entry.message) || entry.message.role !== "user") continue;
+		if (logicalLeafAt(manager, entryParent(manager, entry.id)) === logicalLeafId) return entry.id;
+	}
+	return undefined;
+}
+
 async function resolveTreeTarget(
 	manager: ReadonlySessionManager,
 	identity: SessionFileIdentity,
@@ -421,12 +449,24 @@ async function resolveTreeTarget(
 			undoStack: sessionStateFor(manager, physicalLeaf).getCheckpoints(identity),
 		};
 	}
-	let checkpoints = [...sessionStateFor(manager, physicalLeaf).getCheckpoints(identity)];
 	const exact = findCheckpointByEndLeaf(manager, identity, logicalLeafId);
-	if (exact !== undefined) checkpoints = checkpointFrontierById(manager, identity, exact.checkpointId);
-	const checkpoint = exact ?? checkpoints.at(-1);
-	if (checkpoint === undefined) throw new Error("tree target 缺少完整 checkpoint");
-	return { logicalLeafId, targetManifestId: checkpoint.afterManifestId, undoStack: checkpoints };
+	if (exact !== undefined) {
+		return {
+			logicalLeafId,
+			targetManifestId: exact.afterManifestId,
+			undoStack: checkpointFrontierById(manager, identity, exact.checkpointId),
+		};
+	}
+	// cursor 可以证明 summary/撤回后逻辑边界对应的文件状态；不能退回任意旧栈顶。
+	const cursor = sessionStateFor(manager, physicalLeaf).getCursor(identity);
+	if (cursor !== null && cursor.toLogicalLeaf === logicalLeafId) {
+		return {
+			logicalLeafId,
+			targetManifestId: cursor.targetManifestId,
+			undoStack: cursor.undoHead === null ? [] : checkpointFrontierById(manager, identity, cursor.undoHead),
+		};
+	}
+	throw new Error("tree target 缺少精确的 checkpoint 边界");
 }
 
 function findCheckpointByEndLeaf(

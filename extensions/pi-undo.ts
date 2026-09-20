@@ -9,7 +9,7 @@ import type {
 	SessionTreeEvent as PiSessionTreeEvent,
 } from "@earendil-works/pi-coding-agent";
 
-import type { OperationResult, UndoController } from "../src/controller.ts";
+import type { OperationResult, SessionTreeEvent, UndoController } from "../src/controller.ts";
 import { browseDiff } from "../src/diff-ui.ts";
 import { computeCheckpointDiff, type DiffSource, formatDiffSummary, sanitizeDisplayText } from "../src/diff-view.ts";
 import { createPiUndoRuntime } from "../src/pi-runtime.ts";
@@ -22,6 +22,8 @@ export interface PiUndoRuntime {
 	readonly recovery?: { readonly reason?: string; readonly files?: number; readonly opId?: string };
 	setCommandContext?(context: ExtensionCommandContext | undefined): void;
 	isInternalNavigation?(): boolean;
+	normalizeTreeEvent?(event: PiSessionTreeEvent): SessionTreeEvent;
+	dispose?(): Promise<void>;
 }
 
 export type PiUndoRuntimeFactory = (
@@ -55,6 +57,7 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 		let activeAction: "undo" | "redo" | undefined;
 		let captureFailureNotified = false;
 		let recoveryHintNotified = false;
+		let clearTreeWatch: (() => void) | undefined;
 
 		const initialize = async (context: ExtensionContext): Promise<void> => {
 			const currentGeneration = ++generation;
@@ -360,23 +363,46 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 				active.controller.recoveryReason?.() ?? "session state ambiguous",
 			);
 		});
-		pi.on("session_before_tree", async (event: PiSessionBeforeTreeEvent) => {
+		pi.on("session_before_tree", async (event: PiSessionBeforeTreeEvent, context: ExtensionContext) => {
 			if (runtime === undefined) return { cancel: true };
 			if (runtime.isInternalNavigation?.()) return undefined;
 			const active = runtime;
-			const result = await active.controller.beforeTree({ targetLeafId: event.preparation.targetId });
-			if (result === undefined) {
-				event.signal?.addEventListener("abort", () => { void active.controller.cancelTree?.(); }, { once: true });
+			if (event.signal?.aborted) return { cancel: true };
+			clearTreeWatch?.();
+			let timer: ReturnType<typeof setInterval> | undefined;
+			const clear = (): void => {
+				if (timer !== undefined) clearInterval(timer);
+				event.signal?.removeEventListener("abort", cancel);
+				if (clearTreeWatch === clear) clearTreeWatch = undefined;
+			};
+			const cancel = (): void => { void active.controller.cancelTree?.().catch(() => {}); };
+			clearTreeWatch = clear;
+			event.signal?.addEventListener("abort", cancel, { once: true });
+			const result = await active.controller.beforeTree({ targetLeafId: event.preparation.targetId, signal: event.signal });
+			if (result !== undefined || event.signal?.aborted) {
+				await active.controller.cancelTree?.();
+				clear();
+				return { cancel: true };
 			}
-			return result;
+			// 摘要错误或其他扩展取消可能没有 session_tree；Pi 离开导航后才终结准备事务。
+			timer = setInterval(() => {
+				if (!context.isIdle()) return;
+				clear();
+				void active.controller.cancelTree?.().then(() => {
+					resumeDeferredPrompts(active, generation, "tree_navigation_incomplete");
+				});
+			}, 100);
+			timer.unref();
+			return undefined;
 		});
 		pi.on("session_tree", async (event: PiSessionTreeEvent) => {
 			const active = runtime;
 			if (active?.isInternalNavigation?.()) return;
 			const treeGeneration = generation;
-			await active?.controller.afterTree({
+			clearTreeWatch?.();
+			await active?.controller.afterTree(active.normalizeTreeEvent?.(event) ?? {
 				newLeafId: event.newLeafId,
-				navigationTargetLeafId: event.summaryEntry?.parentId ?? event.newLeafId,
+				navigationTargetLeafId: event.summaryEntry === undefined ? event.newLeafId : event.summaryEntry.parentId,
 			});
 			if (active !== undefined && runtime === active && generation === treeGeneration) {
 				resumeDeferredPrompts(
@@ -387,6 +413,7 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 			}
 		});
 		pi.on("session_shutdown", async () => {
+			clearTreeWatch?.();
 			generation += 1;
 			deferredPrompts = [];
 			replaying = undefined;

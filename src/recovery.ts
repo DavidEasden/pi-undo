@@ -94,9 +94,9 @@ export class JournalRecovery {
 			if (inspection.kind === "conflict") {
 				return { kind: "locked", reason: "cursor_conflict", operations: recovered };
 			}
-			const expectedLeaf = inspection.kind === "match"
-				? journal.descriptor.toLogicalLeaf
-				: journal.descriptor.fromLogicalLeaf;
+			const committedLeaf = journal.descriptor.action === "tree" && journal.state.observedLogicalLeaf !== undefined
+				? journal.state.observedLogicalLeaf : journal.descriptor.toLogicalLeaf;
+			const expectedLeaf = inspection.kind === "match" ? committedLeaf : journal.descriptor.fromLogicalLeaf;
 			if (this.dependencies.getLogicalLeafId() !== expectedLeaf) {
 				return { kind: "locked", reason: "session_leaf_mismatch", operations: recovered };
 			}

@@ -103,6 +103,99 @@ function dependencies(overrides: Partial<ControllerDependencies> = {}): Controll
 }
 
 describe("UndoController", () => {
+	it("Pi 已空闲而本轮仍在预制检查点时，undo 等待最新轮次且不提前拿锁", async () => {
+		let enter!: () => void;
+		let release!: () => void;
+		const entered = new Promise<void>((resolve) => { enter = resolve; });
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const navigate = vi.fn(dependencies().navigateSession);
+		const acquire = vi.fn(dependencies().acquireWorkspaceLock);
+		const deps = dependencies({
+			navigateSession: navigate,
+			acquireWorkspaceLock: acquire,
+			prepareDurableRestore: async () => { enter(); await gate; },
+		});
+		const controller = new UndoControllerImpl(deps, { undoStack: [restoredCheckpoint("上一轮")] });
+		await controller.prepareInput("最新一轮", { streaming: false });
+		await controller.beforeAgentStart();
+		const settled = controller.agentSettled();
+		await entered;
+		const lockCount = acquire.mock.calls.length;
+		const undo = controller.undo();
+		try {
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(navigate).not.toHaveBeenCalled();
+			expect(acquire).toHaveBeenCalledTimes(lockCount);
+			expect(await controller.prepareInput("后续输入", { streaming: false })).toEqual({ action: "defer" });
+		} finally {
+			release();
+			await settled;
+			await undo;
+		}
+		expect(navigate.mock.calls[0]?.[1].rawPrompt).toBe("最新一轮");
+		expect(controller.history()).toEqual({ undoCount: 1, redoCount: 1, locked: false });
+	});
+
+	it("完成凭据在 settled 事件触发前存在，避免空闲窗口选中旧检查点", async () => {
+		const navigate = vi.fn(dependencies().navigateSession);
+		const controller = new UndoControllerImpl(dependencies({ navigateSession: navigate }), {
+			undoStack: [restoredCheckpoint("上一轮")],
+		});
+		await controller.prepareInput("事件尚未到达的新一轮", { streaming: false });
+		await controller.beforeAgentStart();
+		const undo = controller.undo();
+		try {
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(navigate).not.toHaveBeenCalled();
+		} finally {
+			await controller.agentSettled();
+			await undo;
+		}
+		expect(navigate.mock.calls[0]?.[1].rawPrompt).toBe("事件尚未到达的新一轮");
+	});
+
+	it("settled 捕获失败后等待中的 undo 返回 history_paused", async () => {
+		let enter!: () => void;
+		let release!: () => void;
+		const entered = new Promise<void>((resolve) => { enter = resolve; });
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const navigate = vi.fn(dependencies().navigateSession);
+		const controller = new UndoControllerImpl(dependencies({
+			navigateSession: navigate,
+			captureBaseline: async () => { enter(); await gate; throw new Error("捕获失败"); },
+		}), { undoStack: [restoredCheckpoint()] });
+		await controller.prepareInput("本轮", { streaming: false });
+		await controller.beforeAgentStart();
+		const settled = controller.agentSettled();
+		await entered;
+		const undo = controller.undo();
+		release();
+		await settled;
+		expect((await undo).code).toBe("history_paused");
+		expect(navigate).not.toHaveBeenCalled();
+	});
+
+	it("settled 期间原生 tree 取消，普通输入暂存", async () => {
+		let enter!: () => void;
+		let release!: () => void;
+		const entered = new Promise<void>((resolve) => { enter = resolve; });
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const controller = new UndoControllerImpl(dependencies({
+			prepareDurableRestore: async () => { enter(); await gate; },
+		}));
+		await controller.prepareInput("本轮", { streaming: false });
+		await controller.beforeAgentStart();
+		const settled = controller.agentSettled();
+		await entered;
+		try {
+			expect(await controller.beforeTree({ targetLeafId: "target" })).toEqual({ cancel: true });
+			expect(controller.beginInput("新输入", { streaming: false })).toEqual({ action: "defer" });
+		} finally {
+			release();
+			await settled;
+			await controller.cancelTree();
+		}
+	});
 	it("session_start 可注入已验证的 undo/redo frontier", async () => {
 		const undoCheckpoint = restoredCheckpoint("undo-restored");
 		const redoCheckpoint = restoredCheckpoint("redo-restored");

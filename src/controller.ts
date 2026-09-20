@@ -116,6 +116,7 @@ export interface InputContext {
 
 export interface SessionBeforeTreeEvent {
 	readonly targetLeafId: string | null;
+	readonly signal?: AbortSignal;
 }
 
 export interface SessionBeforeTreeResult {
@@ -158,6 +159,12 @@ export interface UndoController {
 	captureFailed(): boolean;
 	/** 最近一次输入前快照失败的原因（截断后的错误消息）；成功时为 undefined。 */
 	captureFailureReason(): string | undefined;
+}
+
+interface RunCompletion {
+	started: boolean;
+	readonly promise: Promise<void>;
+	readonly resolve: () => void;
 }
 
 interface StagedRun {
@@ -214,6 +221,12 @@ export class UndoControllerImpl implements UndoController {
 	private warmUpManifest: SnapshotManifest | undefined;
 	private pendingInputCapture: { readonly token: symbol; readonly promise: Promise<void> } | undefined;
 	private deferAgentStartUntilMessageEnd = false;
+	private runCompletion: RunCompletion | undefined;
+	private settling: Promise<void> | undefined;
+	private inputCommit: Promise<void> | undefined;
+	private treePreparation: Promise<SessionBeforeTreeResult | undefined> | undefined;
+	private treeCancellationRequested = false;
+	private disposed = false;
 	private recoveryInFlight: Promise<void> | undefined;
 	private recoveryCompleted = false;
 
@@ -279,9 +292,11 @@ export class UndoControllerImpl implements UndoController {
 		if (this.locked) return { action: "continue" };
 		if (this.operationInFlight) return { action: "defer" };
 		if (context.streaming || text.length === 0) return { action: "continue" };
+		if (this.disposed || this.runCompletion?.started || this.settling !== undefined) return { action: "defer" };
+		const run = this.beginRun();
 		try {
 			const before = await this.captureInputBaseline();
-			this.stageInput(text, before);
+			if (this.runCompletion === run && !this.disposed) this.stageInput(text, before);
 			return { action: "continue" };
 		} catch (error) {
 			// 无法证明输入前状态：放弃记录本次历史，但绝不吞掉用户输入。
@@ -295,6 +310,8 @@ export class UndoControllerImpl implements UndoController {
 		if (this.locked) return { action: "continue" };
 		if (this.operationInFlight) return { action: "defer" };
 		if (context.streaming || text.length === 0) return { action: "continue" };
+		if (this.disposed || this.runCompletion?.started || this.settling !== undefined) return { action: "defer" };
+		this.beginRun();
 		this.staged = undefined;
 		this.lastCaptureFailed = false;
 		this.lastCaptureFailureMessage = undefined;
@@ -308,8 +325,16 @@ export class UndoControllerImpl implements UndoController {
 		return { action: "continue" };
 	}
 
-	async commitInput(): Promise<void> {
-		if (!this.deferAgentStartUntilMessageEnd) return;
+	commitInput(): Promise<void> {
+		if (this.inputCommit !== undefined) return this.inputCommit;
+		const commit = this.commitCapturedInput();
+		this.inputCommit = commit.finally(() => { this.inputCommit = undefined; });
+		return this.inputCommit;
+	}
+
+	private async commitCapturedInput(): Promise<void> {
+		if (!this.deferAgentStartUntilMessageEnd || this.disposed) return;
+		if (this.runCompletion !== undefined) this.runCompletion.started = true;
 		const pending = this.pendingInputCapture;
 		if (pending !== undefined) await pending.promise;
 		this.pendingInputCapture = undefined;
@@ -318,26 +343,48 @@ export class UndoControllerImpl implements UndoController {
 	}
 
 	async beforeAgentStart(): Promise<void> {
+		if (this.runCompletion !== undefined) this.runCompletion.started = true;
 		if (this.deferAgentStartUntilMessageEnd) return;
 		await this.startAgentRun();
 	}
 
+	private beginRun(): RunCompletion {
+		this.finishRun(this.runCompletion);
+		let resolve!: () => void;
+		const promise = new Promise<void>((done) => { resolve = done; });
+		const run = { started: false, promise, resolve };
+		this.runCompletion = run;
+		return run;
+	}
+
+	private finishRun(run: RunCompletion | undefined): void {
+		if (this.runCompletion === run) this.runCompletion = undefined;
+		run?.resolve();
+	}
+
 	private async startAgentRun(): Promise<void> {
-		if (this.locked || this.staged === undefined) return;
+		if (this.locked || this.disposed || this.staged === undefined) {
+			this.finishRun(this.runCompletion);
+			return;
+		}
+		const staged = this.staged;
+		if (staged.startEntryId !== undefined) return;
 		try {
-			this.staged.startEntryId = await this.dependencies.appendControl("pi-undo:start", {
+			staged.startEntryId = await this.dependencies.appendControl("pi-undo:start", {
 				schemaVersion: 1,
-				beforeManifestId: this.staged.before.manifestId,
-				sourceLogicalLeaf: this.staged.sourceLogicalLeaf,
+				beforeManifestId: staged.before.manifestId,
+				sourceLogicalLeaf: staged.sourceLogicalLeaf,
 			});
 			if (this.staged.startEntryId === null) {
 				this.lock("start_entry_missing");
+				this.finishRun(this.runCompletion);
 				this.staged = undefined;
 				await this.dependencies.appendControl("pi-undo:barrier", { reason: "start_entry_missing" }).catch(() => {});
 				return;
 			}
 		} catch {
 			this.lock("start_entry_append_failed");
+			this.finishRun(this.runCompletion);
 			this.staged = undefined;
 			return;
 		}
@@ -380,7 +427,18 @@ export class UndoControllerImpl implements UndoController {
 		this.lastCaptureFailureMessage = truncateReason(error instanceof Error ? error.message : String(error));
 	}
 
-	async agentSettled(): Promise<void> {
+	agentSettled(): Promise<void> {
+		if (this.settling !== undefined) return this.settling;
+		const run = this.runCompletion;
+		const settled = this.settleRun();
+		this.settling = settled.finally(() => {
+			this.settling = undefined;
+			this.finishRun(run);
+		});
+		return this.settling;
+	}
+
+	private async settleRun(): Promise<void> {
 		const staged = this.staged;
 		this.staged = undefined;
 		if (this.locked || staged === undefined) return;
@@ -451,14 +509,23 @@ export class UndoControllerImpl implements UndoController {
 		return this.runOperation("redo");
 	}
 
-	async beforeTree(event: SessionBeforeTreeEvent): Promise<SessionBeforeTreeResult | undefined> {
+	beforeTree(event: SessionBeforeTreeEvent): Promise<SessionBeforeTreeResult | undefined> {
+		if (this.treePreparation !== undefined) return Promise.resolve({ cancel: true });
+		this.treeCancellationRequested = event.signal?.aborted ?? false;
+		const preparation = this.prepareTree(event);
+		this.treePreparation = preparation.finally(() => { this.treePreparation = undefined; });
+		return this.treePreparation;
+	}
+
+	private async prepareTree(event: SessionBeforeTreeEvent): Promise<SessionBeforeTreeResult | undefined> {
 		// Pi 0.86+ 在树导航期间也会让 isIdle() 暂时返回 false；只有 pi-undo
 		// 已经记录了尚未 settle 的 run 时，才需要中止并取消导航。
-		if (this.staged !== undefined) {
+		if (this.staged !== undefined || this.pendingInputCapture !== undefined ||
+			this.runCompletion !== undefined || this.settling !== undefined || this.disposed) {
 			await this.dependencies.abortAgent();
 			return { cancel: true };
 		}
-		if (this.locked || this.historyPaused || this.operationInFlight) return { cancel: true };
+		if (this.locked || this.historyPaused || this.operationInFlight || this.treeCancellationRequested) return { cancel: true };
 		this.operationInFlight = true;
 		let lease: { release(): Promise<void> } | undefined;
 		try {
@@ -470,6 +537,10 @@ export class UndoControllerImpl implements UndoController {
 			const descriptor = this.createDescriptor("tree", rollback, target, plan, targetState.logicalLeafId);
 			await this.dependencies.journal.prepare(descriptor, plan);
 			this.pendingTree = { descriptor, rollback, target, plan, undoStack: targetState.undoStack, lease };
+			if (this.treeCancellationRequested || event.signal?.aborted) {
+				await this.cancelPreparedTree();
+				return { cancel: true };
+			}
 			return undefined;
 		} catch {
 			if (lease !== undefined) {
@@ -485,7 +556,8 @@ export class UndoControllerImpl implements UndoController {
 		if (pending === undefined) return;
 		this.pendingTree = undefined;
 		try {
-			if ((event.navigationTargetLeafId ?? event.newLeafId) !== pending.descriptor.toLogicalLeaf) {
+			const navigationTarget = event.navigationTargetLeafId === undefined ? event.newLeafId : event.navigationTargetLeafId;
+			if (navigationTarget !== pending.descriptor.toLogicalLeaf) {
 				this.lock("session_navigation_diverged");
 				await this.dependencies.journal.setPhase(pending.descriptor.opId, "RECOVERY_REQUIRED");
 				return;
@@ -526,10 +598,21 @@ export class UndoControllerImpl implements UndoController {
 	}
 
 	async cancelTree(): Promise<void> {
+		this.treeCancellationRequested = true;
+		await this.treePreparation;
+		await this.cancelPreparedTree();
+	}
+
+	private async cancelPreparedTree(): Promise<void> {
 		const pending = this.pendingTree;
 		if (pending === undefined) return;
 		this.pendingTree = undefined;
 		try {
+			if (this.dependencies.getLogicalLeafId() !== pending.descriptor.fromLogicalLeaf) {
+				this.lock("tree_cancel_session_moved");
+				await this.dependencies.journal.setPhase(pending.descriptor.opId, "RECOVERY_REQUIRED");
+				return;
+			}
 			await this.dependencies.journal.setPhase(pending.descriptor.opId, "ABORTING");
 			await this.dependencies.journal.setPhase(pending.descriptor.opId, "ABORTED");
 		} catch {
@@ -576,7 +659,13 @@ export class UndoControllerImpl implements UndoController {
 			if (!await profile.measure("idle", () => this.ensureIdle())) {
 				return done({ code: "idle_timeout", changedFiles: 0 });
 			}
-			// 中断中的 run 会在 waitForIdle() 内由 agentSettled() 推入栈，必须在此之后选择目标。
+			if (!await profile.measure("checkpoint", () => this.waitForCheckpoint())) {
+				return done({ code: "idle_timeout", changedFiles: 0 });
+			}
+			if (this.locked) return done(this.recoveryResult());
+			if (this.historyPaused) return done({ code: "history_paused", changedFiles: 0 });
+			if (this.disposed) return done({ code: "busy", changedFiles: 0 });
+			// Pi 空闲早于扩展 settled 完成；只有本轮完成凭据已终结才能选择目标。
 			const redo = action === "redo" ? this.redoStack.at(-1) : undefined;
 			const checkpoint = action === "undo" ? this.undoStack.at(-1) : redo?.checkpoint;
 			if (checkpoint === undefined) return done(noop());
@@ -800,6 +889,20 @@ export class UndoControllerImpl implements UndoController {
 		}
 	}
 
+	private async waitForCheckpoint(): Promise<boolean> {
+		const deadline = Date.now() + 30_000;
+		for (const task of [this.pendingInputCapture?.promise, this.inputCommit]) {
+			if (task !== undefined && !await waitForCompletion(task, deadline)) return false;
+		}
+		const run = this.runCompletion;
+		if (run?.started) return waitForCompletion(run.promise, deadline);
+		// 输入预检失败时没有 message_end/settled；候选快照不属于已启动的 run。
+		this.staged = undefined;
+		this.deferAgentStartUntilMessageEnd = false;
+		this.finishRun(run);
+		return true;
+	}
+
 	private async ensureIdle(): Promise<boolean> {
 		if (this.dependencies.isAgentIdle()) return true;
 		try {
@@ -1021,6 +1124,18 @@ class OperationProfiler {
 				durationMs: Math.round(durationMs),
 			})),
 		};
+	}
+}
+
+async function waitForCompletion(task: Promise<void>, deadline: number): Promise<boolean> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			task.then(() => true, () => false),
+			new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), Math.max(0, deadline - Date.now())); }),
+		]);
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
 	}
 }
 

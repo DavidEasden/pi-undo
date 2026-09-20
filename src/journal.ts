@@ -254,6 +254,7 @@ export class JournalStore {
 export async function inspectCursorMarkers(
 	sessionFile: string,
 	descriptor: OperationDescriptor,
+	expectedLogicalLeaf: string | null = descriptor.toLogicalLeaf,
 ): Promise<CursorMarkerInspection> {
 	assertOperationDescriptor(descriptor);
 	let content: string;
@@ -287,7 +288,8 @@ export async function inspectCursorMarkers(
 			continue;
 		}
 		if (cursor.opId !== descriptor.opId) continue;
-		if (!matchesDescriptor(cursor, descriptor)) return { kind: "conflict" };
+		if (!matchesDescriptor(cursor, descriptor) || cursor.fromLogicalLeaf !== descriptor.fromLogicalLeaf ||
+			cursor.toLogicalLeaf !== expectedLogicalLeaf) return { kind: "conflict" };
 		const encoded = canonicalJson(cursor);
 		if (matched !== undefined && matched !== encoded) return { kind: "conflict" };
 		matched = encoded;
@@ -306,13 +308,14 @@ export async function finalizeCursorMarker(
 	sessionFile: string,
 	descriptor: OperationDescriptor,
 	inspection: Extract<CursorMarkerInspection, { kind: "match" }>,
+	expectedLogicalLeaf: string | null = descriptor.toLogicalLeaf,
 ): Promise<void> {
 	if (inspection.needsTrailingNewline) {
 		await appendFile(sessionFile, "\n");
 	}
 	await fsyncFile(sessionFile);
 	await fsyncDirectory(dirname(sessionFile));
-	const verified = await inspectCursorMarkers(sessionFile, descriptor);
+	const verified = await inspectCursorMarkers(sessionFile, descriptor, expectedLogicalLeaf);
 	if (verified.kind !== "match" || verified.needsTrailingNewline) {
 		throw new Error("cursor marker 耐久化校验失败");
 	}
