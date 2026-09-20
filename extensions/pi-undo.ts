@@ -58,9 +58,23 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 		let captureFailureNotified = false;
 		let recoveryHintNotified = false;
 		let clearTreeWatch: (() => void) | undefined;
+		let initializing = false;
 
 		const initialize = async (context: ExtensionContext): Promise<void> => {
+			if (initializing) return;
+			initializing = true;
+			try {
+				clearTreeWatch?.();
+				if (runtime?.dispose !== undefined) await runtime.dispose();
+				else await runtime?.controller.dispose?.();
+			} catch (error) {
+				initializing = false;
+				runtime?.reporter.setRecoveryRequired(errorMessage(error));
+				context.ui.notify(`旧任务尚未安全结束：${errorMessage(error)}`, "error");
+				return;
+			}
 			const currentGeneration = ++generation;
+			restoreDeferredPrompts(context);
 			runtimeContext = context;
 			deferredPrompts = [];
 			replaying = undefined;
@@ -85,19 +99,21 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 				if (currentGeneration !== generation) return;
 				runtime = undefined;
 				new StatusReporter(context).setRecoveryRequired(errorMessage(error));
+			} finally {
+				initializing = false;
 			}
 		};
 
 		const dispatchDeferredPrompt = (active: PiUndoRuntime, expectedGeneration: number): void => {
 			if (
-				expectedGeneration !== generation || runtime !== active || activeCommands.size > 0 ||
+				initializing || expectedGeneration !== generation || runtime !== active || activeCommands.size > 0 ||
 				replaying !== undefined || deferredPrompts.length === 0 || active.controller.history().locked
 			) return;
 			const prompt = deferredPrompts[0]!;
 			replaying = prompt;
 			acceptedReplay = undefined;
 			queueMicrotask(() => {
-				if (expectedGeneration !== generation || runtime !== active || replaying !== prompt) return;
+				if (initializing || expectedGeneration !== generation || runtime !== active || replaying !== prompt) return;
 				try {
 					pi.sendUserMessage(prompt.images === undefined || prompt.images.length === 0
 						? prompt.text
@@ -147,7 +163,7 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 		): Promise<void> => {
 			const active = runtime;
 			const commandGeneration = generation;
-			if (active === undefined) {
+			if (active === undefined || initializing) {
 				context.ui.notify("pi-undo session unavailable", "warning");
 				return;
 			}
@@ -156,8 +172,8 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 			// 只有当前执行命令能安装/清理导航上下文；busy 的第二个命令不得覆盖或清空它。
 			const ownsCommandContext = commandSet.size === 0;
 			commandSet.add(commandToken);
-			activeAction = action;
-			active.reporter.setPhase(action === "undo" ? "undoing" : "redoing");
+			if (ownsCommandContext) activeAction = action;
+			if (ownsCommandContext) active.reporter.setPhase(action === "undo" ? "undoing" : "redoing");
 			if (ownsCommandContext) active.setCommandContext?.(context);
 			const commandStarted = performance.now();
 			let result: OperationResult;
@@ -178,6 +194,10 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 					code: "recovery_required",
 					message: active.controller.recoveryReason?.() ?? "pending journal",
 				};
+			}
+			if (!ownsCommandContext) {
+				context.ui.notify(`${result.code} files:${result.changedFiles}`, "warning");
+				return;
 			}
 			active.reporter.result(result, performance.now() - commandStarted);
 			if (result.code === "recovery_required" && !recoveryHintNotified) {
@@ -243,6 +263,13 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 			description: "Review files changed by an Agent run (latest, or /diff N)",
 			handler: async (args: string, context: ExtensionCommandContext) => runDiff(args, context),
 		});
+		pi.registerCommand("undo-cancel", {
+			description: "安全停止正在执行的撤回或重做",
+			handler: async (_args: string, context: ExtensionCommandContext) => {
+				const requested = runtime?.controller.cancelOperation?.() ?? false;
+				context.ui.notify(requested ? "已请求停止，正在等待写入结束并恢复一致状态" : "当前没有可取消的撤回操作", "info");
+			},
+		});
 		pi.registerCommand("undo-recover", {
 			description: "Re-run pi-undo recovery and refresh undo history",
 			handler: async (_args: string, context: ExtensionCommandContext) => {
@@ -269,6 +296,10 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 		pi.on("session_start", async (_event: unknown, context: ExtensionContext) => initialize(context));
 		pi.on("input", async (event: InputEvent, context: ExtensionContext) => {
 			const active = runtime;
+			if (initializing) {
+				restoreEditorText(context, event.text);
+				return { action: "handled" as const };
+			}
 			if (active === undefined) return { action: "continue" as const };
 			const inputContext = { streaming: event.streamingBehavior !== undefined };
 			const result = active.controller.beginInput !== undefined
@@ -357,14 +388,14 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 			if (active === undefined) return;
 			await active.controller.agentSettled();
 			if (runtime !== active || generation !== settledGeneration) return;
-			resumeDeferredPrompts(
+			if (activeCommands.size === 0) resumeDeferredPrompts(
 				active,
 				settledGeneration,
 				active.controller.recoveryReason?.() ?? "session state ambiguous",
 			);
 		});
 		pi.on("session_before_tree", async (event: PiSessionBeforeTreeEvent, context: ExtensionContext) => {
-			if (runtime === undefined) return { cancel: true };
+			if (runtime === undefined || initializing) return { cancel: true };
 			if (runtime.isInternalNavigation?.()) return undefined;
 			const active = runtime;
 			if (event.signal?.aborted) return { cancel: true };
@@ -421,6 +452,8 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 			activeCommands = new Set<symbol>();
 			activeAction = undefined;
 			runtimeContext = undefined;
+			if (runtime?.dispose !== undefined) await runtime.dispose();
+			else await runtime?.controller.dispose?.();
 			await runtime?.controller.cancelTree?.();
 			runtime?.reporter.clear();
 			runtime = undefined;

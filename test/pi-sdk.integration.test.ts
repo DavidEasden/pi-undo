@@ -1,6 +1,6 @@
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { RestoreEngine } from "../src/restore-engine.ts";
 import {
@@ -11,6 +11,7 @@ import {
 	readSessionEntries,
 	readValue,
 	setUpRun,
+	waitForRecoveryDrain,
 } from "./pi-sdk.fixture.ts";
 
 /**
@@ -21,6 +22,50 @@ import {
  */
 
 describe("真实 pi 0.86.1 SDK", () => {
+	it("摘要失败没有 session_tree 事件时终结 PREPARED，后续 undo 可用", async () => {
+		const { temp, harness } = await createFreshHarness();
+		try {
+			setUpRun(harness.faux, "value.txt", "after\n", "完成");
+			await harness.session.prompt("修改文件");
+			const checkpoint = harness.runtime().controller.listCheckpoints().at(-1)!;
+			const cancellation = vi.spyOn(harness.runtime().controller, "cancelTree");
+			harness.faux.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "注入摘要失败" })]);
+			await expect(harness.session.navigateTree(checkpoint.userEntryId, { summarize: true })).rejects.toThrow("注入摘要失败");
+			await vi.waitFor(() => expect(cancellation).toHaveBeenCalled());
+			await cancellation.mock.results[0]!.value;
+			await waitForRecoveryDrain(temp.sessionDir);
+			expect(await readValue(temp.workspace)).toBe("after\n");
+			await harness.session.prompt("/undo");
+			expect(await readValue(temp.workspace)).toBe("before\n");
+			expect(harness.runtime().controller.history().locked).toBe(false);
+		} finally {
+			await closeHarness(harness, temp.sessionDir);
+		}
+	});
+
+	it("后续扩展取消导航时清理准备事务，保留文件和历史", async () => {
+		let cancel = true;
+		const { temp, harness } = await createFreshHarness([
+			(pi) => pi.on("session_before_tree", async () => cancel ? { cancel: true } : undefined),
+		]);
+		try {
+			setUpRun(harness.faux, "value.txt", "after\n", "完成");
+			await harness.session.prompt("修改文件");
+			const checkpoint = harness.runtime().controller.listCheckpoints().at(-1)!;
+			const cancellation = vi.spyOn(harness.runtime().controller, "cancelTree");
+			expect((await harness.session.navigateTree(checkpoint.userEntryId, { summarize: false })).cancelled).toBe(true);
+			await vi.waitFor(() => expect(cancellation).toHaveBeenCalled());
+			await cancellation.mock.results[0]!.value;
+			await waitForRecoveryDrain(temp.sessionDir);
+			expect(await readValue(temp.workspace)).toBe("after\n");
+			expect(harness.runtime().controller.history()).toEqual({ undoCount: 1, redoCount: 0, locked: false });
+			cancel = false;
+			await harness.session.prompt("/undo");
+			expect(await readValue(temp.workspace)).toBe("before\n");
+		} finally {
+			await closeHarness(harness, temp.sessionDir);
+		}
+	});
 	it("普通 undo / redo / 重启后重建历史保持文件与会话一致", async () => {
 		const { temp, harness } = await createFreshHarness();
 		const { session } = harness;

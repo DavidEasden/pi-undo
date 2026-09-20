@@ -12,6 +12,8 @@ export type ResultCode =
 	| "noop"
 	| "busy"
 	| "idle_timeout"
+	| "operation_cancelled"
+	| "operation_timeout"
 	| "capture_failed"
 	| "restore_failed_safe"
 	| "partial_restore"

@@ -22,7 +22,7 @@ import type {
 } from "./model.ts";
 import type { NativeMetadataEntry, NativeMetadataPort } from "./native-metadata.ts";
 import { NativeMetadataInspector } from "./native-metadata.ts";
-import { operationProcessOptions } from "./operation-context.ts";
+import { allCompleted, checkOperation, configuredTimeout, OperationError, operationProcessOptions, rethrowOperationFailure } from "./operation-context.ts";
 import { assertNoSymlinkEscape, assertNoSymlinkParents, pathSetsOverlap, relativeSafePath } from "./path-safety.ts";
 import { RootDiscovery, type RootDiscoveryReason, type RootTopology } from "./root-discovery.ts";
 import { WorkspaceLock } from "./workspace-lock.ts";
@@ -541,7 +541,8 @@ export class SnapshotStore {
 				await this.assertVisibleLeavesUnchanged(absoluteRoot, leaves, transactionDirectory);
 			}
 			return true;
-		} catch {
+		} catch (error) {
+			rethrowOperationFailure(error);
 			// baseline 证据读取失败时不复用旧快照；完整 capture 会重新建立对象和缓存。
 			return false;
 		} finally {
@@ -1364,7 +1365,7 @@ export class SnapshotStore {
 		const pathspecs = inclusions.length === 0 ? ["."] : inclusions.map(literalPathspec);
 		for (const excluded of exclusions) pathspecs.push(excludeLiteralPathspec(excluded));
 		const queryEnvironment = gitBacked ? sourceGitEnvironment() : environment;
-		const [output, deletedOutput] = await Promise.all([
+		const [output, deletedOutput] = await allCompleted([
 			this.runGitBytes([
 				...(gitBacked ? ["-c", "core.fsmonitor=false"] : []),
 				"ls-files",
@@ -1676,7 +1677,7 @@ export class SnapshotStore {
 	private async runGit(args: readonly string[], options: GitRunOptions = {}): Promise<string> {
 		const result = await this.git.run(args, injectOperationBudget(options));
 		if (result.killed) {
-			throw new SnapshotStoreError("capture_failed", "Git 命令未正常结束");
+			throw new OperationError(result.timedOut ? "operation_timeout" : "operation_cancelled", "Git 命令已停止");
 		}
 		return result.stdout;
 	}
@@ -1684,7 +1685,7 @@ export class SnapshotStore {
 	private async runGitBytes(args: readonly string[], options: GitRunOptions = {}): Promise<Uint8Array> {
 		const result = await this.git.run(args, injectOperationBudget(options));
 		if (result.killed) {
-			throw new SnapshotStoreError("capture_failed", "Git 命令未正常结束");
+			throw new OperationError(result.timedOut ? "operation_timeout" : "operation_cancelled", "Git 命令已停止");
 		}
 		return result.stdoutBytes;
 	}
@@ -1979,7 +1980,7 @@ function rootStoreId(root: RootTopologyIdentity): string {
 /** 为 GitRunner 调用注入 operation 预算：调用方 budget 优先，否则取当前 context 的剩余预算。 */
 function injectOperationBudget(options: GitRunOptions): GitRunOptions {
 	if (options.timeoutMs !== undefined) return options;
-	const budget = operationProcessOptions();
+	const budget = operationProcessOptions(configuredTimeout("PI_UNDO_GIT_TIMEOUT_MS", 120_000));
 	return {
 		...options,
 		timeoutMs: budget.timeoutMs,
@@ -2263,6 +2264,7 @@ async function mapConcurrentOrdered<T, R>(
 			const index = nextIndex;
 			nextIndex += 1;
 			try {
+				checkOperation();
 				result[index] = await operation(values[index]!);
 			} catch (error) {
 				if (!failed) failure = error;

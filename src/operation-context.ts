@@ -6,10 +6,18 @@ export type OperationErrorCode = "operation_cancelled" | "operation_timeout";
  * 一次可取消操作的共享作用域。调用方（撤回/捕获/恢复入口）创建 context，
  * 低层只读取当前继承的 context：deadline 是硬上限，signal 是取消通道。
  */
+export interface ProcessDiagnostic {
+	readonly command: string;
+	readonly durationMs: number;
+	readonly outcome: string;
+	readonly exitCode: number | null;
+}
+
 export interface OperationContext {
 	readonly signal: AbortSignal;
 	readonly deadline: number;
 	readonly onProgress?: (phase: string) => void;
+	readonly onProcess?: (diagnostic: ProcessDiagnostic) => void;
 }
 
 export class OperationError extends Error {
@@ -26,6 +34,17 @@ export class OperationError extends Error {
 const OPERATION_TIMEOUT_REASON = "operation_timeout";
 
 const storage = new AsyncLocalStorage<OperationContext | undefined>();
+const unsafeContexts = new WeakSet<OperationContext>();
+
+export function markProcessExitUnconfirmed(): void {
+	const context = storage.getStore();
+	if (context !== undefined) unsafeContexts.add(context);
+}
+
+export function operationHasUnconfirmedExit(): boolean {
+	const context = storage.getStore();
+	return context !== undefined && unsafeContexts.has(context);
+}
 
 /**
  * 在 context 下运行 body；context 为 undefined 时清除继承的 context，
@@ -48,6 +67,7 @@ export function checkOperation(): void {
 	if (context === undefined) {
 		return;
 	}
+	if (unsafeContexts.has(context)) throw Object.assign(new Error("子进程未确认退出"), { code: "process_exit_unconfirmed" });
 	if (context.signal.aborted) {
 		throw operationErrorFromAbortReason(context.signal.reason);
 	}
@@ -59,6 +79,14 @@ export function checkOperation(): void {
 /** 报告可读阶段（供状态显示使用）；没有 context 或没有 onProgress 时是空操作。 */
 export function reportOperationProgress(phase: string): void {
 	storage.getStore()?.onProgress?.(phase);
+}
+
+export function reportProcessDiagnostic(diagnostic: ProcessDiagnostic): void {
+	try {
+		storage.getStore()?.onProcess?.(diagnostic);
+	} catch {
+		// 诊断失败不能改变事务结果。
+	}
 }
 
 export interface OperationProcessOptions {
@@ -92,6 +120,7 @@ export interface OperationScopeOptions {
 	/** 上层取消（例如 /undo-cancel 或父作用域）会传播到本作用域。 */
 	readonly signal?: AbortSignal;
 	readonly onProgress?: (phase: string) => void;
+	readonly onProcess?: (diagnostic: ProcessDiagnostic) => void;
 	readonly now?: () => number;
 }
 
@@ -130,6 +159,7 @@ export function createOperationScope(options: OperationScopeOptions = {}): Opera
 		signal: controller.signal,
 		deadline,
 		...(options.onProgress === undefined ? {} : { onProgress: options.onProgress }),
+		...(options.onProcess === undefined ? {} : { onProcess: options.onProcess }),
 	};
 	return {
 		context,
@@ -141,6 +171,75 @@ export function createOperationScope(options: OperationScopeOptions = {}): Opera
 			options.signal?.removeEventListener("abort", onParentAbort);
 		},
 	};
+}
+
+export async function allCompleted<T extends readonly unknown[]>(tasks: T): Promise<{ -readonly [K in keyof T]: Awaited<T[K]> }> {
+	const outcomes = await Promise.allSettled(tasks);
+	const failure = outcomes.find((outcome) => outcome.status === "rejected");
+	if (failure?.status === "rejected") throw failure.reason;
+	return outcomes.map((outcome) => (outcome as PromiseFulfilledResult<unknown>).value) as { -readonly [K in keyof T]: Awaited<T[K]> };
+}
+
+export function configuredTimeout(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (raw === undefined || raw === "") return fallback;
+	const value = Number(raw);
+	if (!Number.isSafeInteger(value) || value <= 0 || value > 2_147_483_647) throw new Error(`${name} 必须是正整数毫秒`);
+	return value;
+}
+
+export async function withRecoveryBudget<T>(body: () => Promise<T>, options: OperationScopeOptions = {}): Promise<T> {
+	if (operationHasUnconfirmedExit()) checkOperation();
+	const scope = createOperationScope({
+		timeoutMs: configuredTimeout("PI_UNDO_OPERATION_TIMEOUT_MS", 300_000),
+		onProcess: currentOperationContext()?.onProcess,
+		...options,
+	});
+	try {
+		return await runWithOperationContext(scope.context, async () => {
+			try {
+				return await body();
+			} finally {
+				if (operationHasUnconfirmedExit()) checkOperation();
+			}
+		});
+	} catch (error) {
+		if (isUnconfirmedExit(error)) markProcessExitUnconfirmed();
+		throw error;
+	} finally {
+		scope.dispose();
+	}
+}
+
+export function isUnconfirmedExit(error: unknown): boolean {
+	return errorChain(error).some((value) => value.code === "git_termination_failed" || value.code === "process_exit_unconfirmed");
+}
+
+/** 包装层保留 cause 时仍能识别取消，避免被误报为普通 capture 失败。 */
+export function operationFailure(error: unknown): OperationErrorCode | undefined {
+	for (const value of errorChain(error)) {
+		if (value.code === "operation_cancelled" || value.code === "operation_timeout") return value.code;
+		const result = value.result as { timedOut?: boolean; aborted?: boolean } | undefined;
+		if (result?.timedOut) return "operation_timeout";
+		if (result?.aborted) return "operation_cancelled";
+	}
+	return undefined;
+}
+
+export function rethrowOperationFailure(error: unknown): void {
+	if (isUnconfirmedExit(error) || operationFailure(error) !== undefined) throw error;
+}
+
+function errorChain(error: unknown): Array<Record<string, unknown>> {
+	const chain: Array<Record<string, unknown>> = [];
+	const seen = new Set<unknown>();
+	while (typeof error === "object" && error !== null && !seen.has(error)) {
+		seen.add(error);
+		const value = error as Record<string, unknown>;
+		chain.push(value);
+		error = value.cause;
+	}
+	return chain;
 }
 
 function operationErrorFromAbortReason(reason: unknown): OperationError {

@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 
 import type { DurablePack } from "./durable-pack.ts";
 import { GitRunError, runSupervisedProcess } from "./git-runner.ts";
-import { OperationError, type OperationProcessOptions, operationProcessOptions } from "./operation-context.ts";
+import { OperationError, type OperationProcessOptions, operationProcessOptions, rethrowOperationFailure } from "./operation-context.ts";
 import type { MutationJournal } from "./mutation-journal.ts";
 
 const NATIVE_TIMEOUT_MS = 120_000;
@@ -77,7 +77,8 @@ export async function createNativeFileBatch(options: {
 			try {
 				await execute(pack, join(dirname(pack.storagePath), `native-verify-${process.pid}.json`), true);
 				return true;
-			} catch {
+			} catch (error) {
+				rethrowOperationFailure(error);
 				return false;
 			}
 		},

@@ -3,6 +3,7 @@ import { performance } from "node:perf_hooks";
 import { describe, expect, it, vi } from "vitest";
 
 import { UndoControllerImpl, type ControllerDependencies } from "../src/controller.ts";
+import { checkOperation, currentOperationContext, OperationError } from "../src/operation-context.ts";
 import { canonicalJson, checksum } from "../src/encoding.ts";
 import type {
 	CheckpointRecord,
@@ -103,6 +104,165 @@ function dependencies(overrides: Partial<ControllerDependencies> = {}): Controll
 }
 
 describe("UndoController", () => {
+	it("dispose 让出事件循环期间收到迟到的 settled 不再捕获或追加检查点", async () => {
+		const capture = vi.fn(async () => manifest("a"));
+		const deps = dependencies({ capture });
+		const controller = new UndoControllerImpl(deps);
+		await controller.prepareInput("本轮", { streaming: false });
+		await controller.beforeAgentStart();
+		const disposal = controller.dispose();
+		await controller.agentSettled();
+		await disposal;
+		expect(capture).toHaveBeenCalledOnce();
+		expect(deps.calls).not.toContain("entry:pi-undo:checkpoint");
+	});
+
+	it("tree 准备事务取消时未确认退出，保留 lease 并拒绝 runtime 重建", async () => {
+		const released = vi.fn(async () => {});
+		const defaults = dependencies();
+		const controller = new UndoControllerImpl(dependencies({
+			acquireWorkspaceLock: async () => ({ release: released }),
+			journal: {
+				...defaults.journal,
+				setPhase: async (_id, phase) => {
+					if (phase === "ABORTING") throw Object.assign(new Error("未确认退出"), { code: "git_termination_failed" });
+				},
+			},
+		}));
+		expect(await controller.beforeTree({ targetLeafId: "tree-leaf" })).toBeUndefined();
+		await controller.cancelTree();
+		expect(released).not.toHaveBeenCalled();
+		expect(controller.history().locked).toBe(true);
+		await expect(controller.dispose()).rejects.toThrow("process_exit_unconfirmed");
+	});
+	it("取消等待检查点的 undo 不会取消仍可完成的本轮检查点", async () => {
+		let release!: () => void;
+		let enter!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const entered = new Promise<void>((resolve) => { enter = resolve; });
+		const controller = new UndoControllerImpl(dependencies({
+			prepareDurableRestore: async () => { enter(); await gate; checkOperation(); },
+		}), { undoStack: [restoredCheckpoint("上一轮")] });
+		await controller.prepareInput("本轮", { streaming: false });
+		await controller.beforeAgentStart();
+		const settled = controller.agentSettled();
+		await entered;
+		const undo = controller.undo();
+		expect(controller.cancelOperation()).toBe(true);
+		try {
+			expect((await undo).code).toBe("operation_cancelled");
+		} finally {
+			release();
+			await settled;
+		}
+		expect(controller.history()).toEqual({ undoCount: 2, redoCount: 0, locked: false });
+		expect((await controller.undo()).code).toBe("ok");
+	});
+
+	it("捕获预算耗尽等待前向任务停止后才释放锁", async () => {
+		const released = vi.fn(async () => {});
+		let stopped = false;
+		const controller = new UndoControllerImpl(dependencies({
+			operationTimeoutMs: 20,
+			acquireWorkspaceLock: async () => ({ release: released }),
+			capture: async () => {
+				const signal = currentOperationContext()!.signal;
+				await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+				expect(released).not.toHaveBeenCalled();
+				stopped = true;
+				checkOperation();
+				return manifest("c");
+			},
+		}), { undoStack: [restoredCheckpoint()] });
+		expect((await controller.undo()).code).toBe("operation_timeout");
+		expect(stopped).toBe(true);
+		expect(released).toHaveBeenCalledOnce();
+		expect(controller.history().locked).toBe(false);
+	});
+
+	it("会话移动后取消使用独立预算恢复会话和文件，保留原历史", async () => {
+		let controller!: UndoControllerImpl;
+		const restore = vi.fn(async () => {
+			expect(currentOperationContext()!.signal.aborted).toBe(false);
+			return { code: "ok" as const, verifiedPaths: 1, totalPaths: 1 };
+		});
+		const deps = dependencies({
+			navigateSession: async () => {
+				controller.cancelOperation();
+				return { cancelled: false, logicalLeafId: "assistant-before" };
+			},
+			applyRestore: restore,
+		});
+		controller = new UndoControllerImpl(deps, { undoStack: [restoredCheckpoint()] });
+		expect((await controller.undo()).code).toBe("operation_cancelled");
+		expect(restore).toHaveBeenCalledOnce();
+		expect(deps.calls).toContain("session-rollback");
+		expect(deps.calls).toContain("phase:ABORTED");
+		expect(controller.history()).toEqual({ undoCount: 1, redoCount: 0, locked: false });
+	});
+
+	it("cursor 已经持久提交时取消不会回滚，继续完成提交", async () => {
+		let controller!: UndoControllerImpl;
+		const deps = dependencies({
+			appendCursor: async () => {
+				controller.cancelOperation();
+				return { kind: "durable", logicalLeafId: "assistant-before" };
+			},
+		});
+		controller = new UndoControllerImpl(deps, { undoStack: [restoredCheckpoint()] });
+		expect((await controller.undo()).code).toBe("ok");
+		expect(deps.calls).toContain("committed");
+		expect(deps.calls).not.toContain("session-rollback");
+		expect(controller.history()).toEqual({ undoCount: 0, redoCount: 1, locked: false });
+	});
+
+	it("dispose 等待不可中断的捕获结束再释放锁，之后拒绝新输入", async () => {
+		let release!: () => void;
+		let enter!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const entered = new Promise<void>((resolve) => { enter = resolve; });
+		const released = vi.fn(async () => {});
+		const controller = new UndoControllerImpl(dependencies({
+			acquireWorkspaceLock: async () => ({ release: released }),
+			capture: async () => { enter(); await gate; checkOperation(); return manifest("c"); },
+		}), { undoStack: [restoredCheckpoint()] });
+		const undo = controller.undo();
+		await entered;
+		let disposed = false;
+		const disposal = controller.dispose().then(() => { disposed = true; });
+		try {
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(disposed).toBe(false);
+			expect(released).not.toHaveBeenCalled();
+		} finally {
+			release();
+			await disposal;
+		}
+		expect((await undo).code).toBe("operation_cancelled");
+		expect(released).toHaveBeenCalledOnce();
+		expect(controller.beginInput("稍后输入", { streaming: false })).toEqual({ action: "defer" });
+	});
+
+	it("子进程未确认退出时保留 workspace lease，禁止重建或新输入", async () => {
+		const released = vi.fn(async () => {});
+		const controller = new UndoControllerImpl(dependencies({
+			acquireWorkspaceLock: async () => ({ release: released }),
+			capture: async () => { throw Object.assign(new Error("未确认退出"), { code: "git_termination_failed" }); },
+		}), { undoStack: [restoredCheckpoint()] });
+		expect((await controller.undo()).code).toBe("recovery_required");
+		expect(released).not.toHaveBeenCalled();
+		expect(controller.beginInput("稍后输入", { streaming: false })).toEqual({ action: "defer" });
+		await expect(controller.dispose()).rejects.toThrow("process_exit_unconfirmed");
+	});
+
+	it("文件恢复取消后补偿失败时保留 recovery 状态", async () => {
+		const controller = new UndoControllerImpl(dependencies({
+			applyRestore: async () => { throw new OperationError("operation_cancelled", "已取消"); },
+			restoreSessionLeaf: async () => false,
+		}), { undoStack: [restoredCheckpoint()] });
+		expect((await controller.undo()).code).toBe("recovery_required");
+		expect(controller.history().locked).toBe(true);
+	});
 	it("Pi 已空闲而本轮仍在预制检查点时，undo 等待最新轮次且不提前拿锁", async () => {
 		let enter!: () => void;
 		let release!: () => void;

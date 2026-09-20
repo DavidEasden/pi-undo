@@ -4,7 +4,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { checksum, topologyFingerprint } from "./encoding.ts";
 import { GitRunError, GitRunner } from "./git-runner.ts";
 import type { DiscoveryRoot } from "./model.ts";
-import { checkOperation, OperationError, reportOperationProgress } from "./operation-context.ts";
+import { allCompleted, checkOperation, OperationError, reportOperationProgress } from "./operation-context.ts";
 
 const DIRECTORY_SCAN_CONCURRENCY = 16;
 const GIT_POINTER_MAX_BYTES = 4096;
@@ -112,16 +112,19 @@ export class RootDiscovery {
 		activeRoots: Map<string, DiscoveredRoot>,
 	): Promise<void> {
 		let level: Array<{ readonly path: string; readonly inspect: boolean }> = [{ path: directory, inspect: false }];
+		let scanned = 0;
+		reportOperationProgress("scan_directories");
 		while (level.length > 0) {
 			checkOperation();
-			reportOperationProgress("scan_directories");
 			const next: Array<{ readonly path: string; readonly inspect: true }> = [];
 			for (let index = 0; index < level.length; index += DIRECTORY_SCAN_CONCURRENCY) {
 				checkOperation();
-				const children = await Promise.all(level.slice(index, index + DIRECTORY_SCAN_CONCURRENCY).map(
+				const children = await allCompleted(level.slice(index, index + DIRECTORY_SCAN_CONCURRENCY).map(
 					(candidate) => this.scanDirectoryNode(workspaceIdentity, candidate, activeRoots),
 				));
 				for (const group of children) next.push(...group);
+				scanned += children.length;
+				reportOperationProgress(`scan_directories:${scanned}`);
 			}
 			level = next;
 		}

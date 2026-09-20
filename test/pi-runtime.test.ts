@@ -7,13 +7,21 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { canonicalJson, checksum } from "../src/encoding.ts";
 import { GitRunner } from "../src/git-runner.ts";
 import type { CheckpointRecord, CursorState, ManifestId, SessionFileIdentity } from "../src/model.ts";
-import { createPiUndoRuntime } from "../src/pi-runtime.ts";
+import { createPiUndoRuntime as createRuntime } from "../src/pi-runtime.ts";
 import { JournalRecovery } from "../src/recovery.ts";
 import { RestoreEngine } from "../src/restore-engine.ts";
 
 const temporaryRoots: string[] = [];
+const runtimes: Awaited<ReturnType<typeof createRuntime>>[] = [];
+
+async function createPiUndoRuntime(...args: Parameters<typeof createRuntime>) {
+	const runtime = await createRuntime(...args);
+	runtimes.push(runtime);
+	return runtime;
+}
 
 afterEach(async () => {
+	await Promise.all(runtimes.splice(0).map((runtime) => runtime.dispose()));
 	await Promise.all(temporaryRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 

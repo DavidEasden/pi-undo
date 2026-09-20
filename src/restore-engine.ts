@@ -17,6 +17,7 @@ import {
 } from "./durable-pack.ts";
 import { assertManifest, assertOperationId, canonicalJson, checksum } from "./encoding.ts";
 import { MutationJournal } from "./mutation-journal.ts";
+import { allCompleted, checkOperation, rethrowOperationFailure, isUnconfirmedExit, operationFailure, withRecoveryBudget } from "./operation-context.ts";
 import { createNativeFileBatch } from "./native-restore.ts";
 import { recoverPackedMutations } from "./packed-recovery.ts";
 import type { ManifestId, RestorePath, SnapshotManifest, SnapshotRoot } from "./model.ts";
@@ -61,6 +62,7 @@ export interface RestoreResult {
 	verifiedPaths: number;
 	totalPaths: number;
 	postFingerprint?: string;
+	failureCode?: "operation_cancelled" | "operation_timeout";
 }
 
 export interface RestoreEngine {
@@ -217,12 +219,12 @@ export class RestoreEngine {
 		const canonicalScopePaths = scope === undefined ? undefined : [...scope];
 		assertCompatibleManifests(current, target, scope);
 		const isScopedPath = (path: string): boolean => scope === undefined || scope.has(path);
-		await Promise.all([
+		await allCompleted([
 			this.store.assertComplete(current.manifestId, canonicalScopePaths),
 			this.store.assertComplete(target.manifestId, canonicalScopePaths),
 		]);
 
-		const [currentPaths, targetPaths] = await Promise.all([
+		const [currentPaths, targetPaths] = await allCompleted([
 			this.readOwnedPaths(current, canonicalScopePaths),
 			this.readOwnedPaths(target, canonicalScopePaths),
 		]);
@@ -323,7 +325,8 @@ export class RestoreEngine {
 				);
 			}
 			return true;
-		} catch {
+		} catch (error) {
+			rethrowOperationFailure(error);
 			return false;
 		}
 	}
@@ -527,7 +530,8 @@ export class RestoreEngine {
 	private async acquireDurableIndexLease(): Promise<{ release(): Promise<void> } | undefined> {
 		try {
 			return await this.durableIndexLock.acquire(await this.durableIndexLockIdentity());
-		} catch {
+		} catch (error) {
+			rethrowOperationFailure(error);
 			return undefined;
 		}
 	}
@@ -747,7 +751,7 @@ export class RestoreEngine {
 		compatibilityMode: boolean,
 		pinsDeferred: boolean,
 	): Promise<RestoreResult> {
-		const [current, storedTarget] = await Promise.all([
+		const [current, storedTarget] = await allCompleted([
 			this.store.loadManifest(plan.currentManifestId),
 			this.store.loadManifest(target.manifestId),
 		]);
@@ -785,11 +789,12 @@ export class RestoreEngine {
 			}
 			topologyBefore = await this.discovery.discover(this.workspaceRoot, "restore-pre");
 			this.assertCurrentTopology(current, target, topologyBefore);
-		} catch {
+		} catch (error) {
+			rethrowOperationFailure(error);
 			return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
 		}
 		const [currentPaths, targetPaths] = prepared === undefined
-			? await Promise.all([
+			? await allCompleted([
 				this.readOwnedPaths(current, plan.scopePaths),
 				this.readOwnedPaths(target, plan.scopePaths),
 			])
@@ -816,7 +821,8 @@ export class RestoreEngine {
 					ownedPaths: this.completeCoverageOwnedPaths(plan.scopePaths, [currentPaths, targetPaths]),
 				},
 			);
-		} catch {
+		} catch (error) {
+			rethrowOperationFailure(error);
 			return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
 		}
 		let durablePack: DurablePack | undefined;
@@ -846,7 +852,8 @@ export class RestoreEngine {
 						entries: await this.durablePackEntries(current, target, currentPaths, targetPaths, plan, options.opId),
 					});
 				}
-			} catch {
+			} catch (error) {
+				rethrowOperationFailure(error);
 				await removeDurablePack(options.mutationJournal).catch(() => {});
 			}
 		}
@@ -886,7 +893,8 @@ export class RestoreEngine {
 		}
 		try {
 			await this.prefetchCompleteRestoreBlobs(plan, current, target, currentPaths, targetPaths);
-		} catch {
+		} catch (error) {
+			rethrowOperationFailure(error);
 			// 预取是性能优化；失败时继续走原有逐文件校验和可恢复 mutation 路径。
 		}
 		const preflight = await this.verifyKnownState(current, target, currentPaths, targetPaths, plan.scopePaths);
@@ -951,20 +959,17 @@ export class RestoreEngine {
 			return await this.mutationsAreClean(options.mutationJournal)
 				? result
 				: { code: "recovery_required", verifiedPaths: 0, totalPaths: verification.totalPaths };
-		} catch {
-			if (!await this.restorePendingMutations(mutationContext.quarantine, options.mutationJournal)) {
-				return { code: "recovery_required", verifiedPaths: 0, totalPaths: currentPaths.size };
-			}
-			return this.rollback(
-				current,
-				target,
-				topologyBefore,
-				currentPaths,
-				targetPaths,
-				options,
-				plan.scopePaths,
-				!durablePackEnabled,
-			);
+		} catch (error) {
+			if (isUnconfirmedExit(error)) throw error;
+			return withRecoveryBudget(async () => {
+				if (!await this.restorePendingMutations(mutationContext.quarantine, options.mutationJournal)) {
+					return { code: "recovery_required", verifiedPaths: 0, totalPaths: currentPaths.size };
+				}
+				const result = await this.rollback(
+					current, target, topologyBefore, currentPaths, targetPaths, options, plan.scopePaths, !durablePackEnabled,
+				);
+				return { ...result, failureCode: operationFailure(error) };
+			});
 		}
 	}
 
@@ -1021,30 +1026,23 @@ export class RestoreEngine {
 				return { code: "recovery_required", verifiedPaths: 0, totalPaths };
 			}
 			return { code: "ok", verifiedPaths: totalPaths, totalPaths };
-		} catch {
-			const packedRecovery = await recoverPackedMutations({
-				workspaceRoot: this.workspaceRoot,
-				journal: options.mutationJournal,
-				planDigest: plan.planDigest,
-				decision: "rollback",
+		} catch (error) {
+			if (isUnconfirmedExit(error)) throw error;
+			return withRecoveryBudget(async () => {
+				const packedRecovery = await recoverPackedMutations({
+					workspaceRoot: this.workspaceRoot,
+					journal: options.mutationJournal,
+					planDigest: plan.planDigest,
+					decision: "rollback",
+				});
+				if (packedRecovery.kind !== "clean") {
+					return { code: "recovery_required", verifiedPaths: 0, totalPaths: plan.deletePaths.length + plan.writePaths.length };
+				}
+				const result = await this.rollback(
+					current, target, topologyBefore, currentPaths, targetPaths, options, plan.scopePaths, false,
+				);
+				return { ...result, failureCode: operationFailure(error) };
 			});
-			if (packedRecovery.kind !== "clean") {
-				return {
-					code: "recovery_required",
-					verifiedPaths: 0,
-					totalPaths: plan.deletePaths.length + plan.writePaths.length,
-				};
-			}
-			return this.rollback(
-				current,
-				target,
-				topologyBefore,
-				currentPaths,
-				targetPaths,
-				options,
-				plan.scopePaths,
-				false,
-			);
 		}
 	}
 
@@ -1059,7 +1057,7 @@ export class RestoreEngine {
 		const paths = [...new Set([...plan.deletePaths, ...plan.writePaths])].sort(comparePaths);
 		const useValidatedBatch = SnapshotStore.supportsValidatedBlobBatch(this.store);
 		const [currentBlobBytes, targetBlobBytes] = useValidatedBatch
-			? await Promise.all([
+			? await allCompleted([
 				this.readDurableBlobBytes(current.manifestId, paths, currentPaths),
 				this.readDurableBlobBytes(target.manifestId, paths, targetPaths),
 			])
@@ -1229,7 +1227,7 @@ export class RestoreEngine {
 			}
 			return requests;
 		};
-		await Promise.all([
+		await allCompleted([
 			this.store.prefetchBlobs(current.manifestId, requestsFor(currentPaths, plan.deletePaths)),
 			this.store.prefetchBlobs(target.manifestId, requestsFor(targetPaths)),
 		]);
@@ -1350,6 +1348,7 @@ export class RestoreEngine {
 			fileBatchRoot = undefined;
 		};
 		for (const path of deletePaths) {
+			checkOperation();
 			if (await this.pathIsShadowedByTarget(targetManifestId, path, targetPaths)) continue;
 			const source = context.sourcePaths.get(path);
 			const live = await lstat(this.absolutePath(path)).catch((error) => {
@@ -1643,7 +1642,9 @@ export class RestoreEngine {
 		context.ordinal += 1;
 		const ordinal = context.ordinal;
 		const beforeInstall = async (): Promise<void> => {
+			checkOperation();
 			await this.beforeMutation?.({ phase: context.phase, ordinal, kind, path });
+			checkOperation();
 		};
 		if (!deferHook) await beforeInstall();
 		await this.assertMutationPath(path);
@@ -1678,6 +1679,7 @@ export class RestoreEngine {
 		};
 		for (const kind of ["directory", "leaf"] as const) {
 			for (const path of writePaths) {
+				checkOperation();
 				const target = targetPaths.get(path);
 				if (target === undefined) {
 					throw new Error(`${context.phase} plan 引用了 manifest 外路径：${path}`);
@@ -1737,6 +1739,7 @@ export class RestoreEngine {
 			targetFingerprint: fingerprintBytes(target.absolutePath, bytes, target.entry.mode),
 			...(this.beforeMutation === undefined ? {} : {
 				beforeInstall: async () => {
+					checkOperation();
 					await this.beforeMutation?.({
 						phase: context.phase,
 						ordinal,
@@ -1955,7 +1958,7 @@ export class RestoreEngine {
 		if (owned.entry.blobId === null) {
 			throw new Error(`普通文件缺少 blob：${path}`);
 		}
-		const [actual, expected] = await Promise.all([
+		const [actual, expected] = await allCompleted([
 			readFile(this.absolutePath(path)),
 			this.store.readBlob(
 				manifestId,
@@ -2284,6 +2287,7 @@ async function mapConcurrentOrdered<T, R>(
 			const index = nextIndex;
 			nextIndex += 1;
 			try {
+				checkOperation();
 				results[index] = await operation(values[index]!);
 			} catch (error) {
 				if (!failed) failure = error;

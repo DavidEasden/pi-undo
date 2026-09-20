@@ -65,7 +65,11 @@ function deferredPromptHarness() {
 			}));
 		},
 	} as unknown as ExtensionAPI;
-	createPiUndoExtension(async () => ({ controller, reporter: new StatusReporter(context) }))(pi);
+	createPiUndoExtension(async () => ({
+		controller,
+		reporter: new StatusReporter(context),
+		dispose: async () => { if (operationInFlight) await result; },
+	}))(pi);
 
 	return {
 		commands,
@@ -84,6 +88,20 @@ function deferredPromptHarness() {
 }
 
 describe("pi-undo extension", () => {
+	it("runtime 重建等待旧命令结束，排队输入恢复到编辑器而不会丢失或迟到发送", async () => {
+		const fixture = deferredPromptHarness();
+		await fixture.handlers.get("session_start")!({}, fixture.context);
+		const undo = fixture.commands.get("undo")!("", fixture.context);
+		await fixture.started;
+		expect(await fixture.handlers.get("input")!({ text: "必须保留的排队输入", source: "interactive" }, fixture.context))
+			.toEqual({ action: "handled" });
+		const initialize = fixture.handlers.get("session_start")!({}, fixture.context);
+		fixture.finish({ code: "ok", changedFiles: 1 });
+		await Promise.all([undo, initialize]);
+		await fixture.flushReplay();
+		expect(fixture.editor).toContain("必须保留的排队输入");
+		expect(fixture.sent).toEqual([]);
+	});
 	it("注册 undo、redo 和 diff 命令", () => {
 		const commandDescriptions = new Map<string, string | undefined>();
 		const pi = {
@@ -95,7 +113,7 @@ describe("pi-undo extension", () => {
 
 		extension(pi);
 
-		expect([...commandDescriptions.keys()].sort()).toEqual(["diff", "redo", "undo", "undo-recover"]);
+		expect([...commandDescriptions.keys()].sort()).toEqual(["diff", "redo", "undo", "undo-cancel", "undo-recover"]);
 		expect(commandDescriptions.get("undo")).toContain("last completed Agent run");
 		expect(commandDescriptions.get("diff")).toContain("Review files changed");
 		expect(commandDescriptions.get("undo-recover")).toContain("Re-run pi-undo recovery");

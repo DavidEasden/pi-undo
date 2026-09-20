@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import {
+	allCompleted,
 	checkOperation,
+	markProcessExitUnconfirmed,
+	operationHasUnconfirmedExit,
+	withRecoveryBudget,
 	createOperationScope,
 	currentOperationContext,
 	operationProcessOptions,
@@ -20,6 +24,37 @@ function contextWith(options: { readonly timeoutMs?: number } = {}): OperationCo
 }
 
 describe("operation context", () => {
+	it("并行分支失败仍等待其他分支结束才把错误交给回滚", async () => {
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		let finished = false;
+		const error = new Error("第一分支失败");
+		const pending = allCompleted([Promise.reject(error), gate]).catch((failure) => {
+			finished = true;
+			return failure;
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(finished).toBe(false);
+		release();
+		expect(await pending).toBe(error);
+	});
+
+	it("恢复预算独立于前向取消，但未确认退出的隔离状态传播回父作用域", async () => {
+		const scope = createOperationScope();
+		scope.cancel();
+		try {
+			await runWithOperationContext(scope.context, async () => {
+				await expect(withRecoveryBudget(async () => {
+					checkOperation();
+					markProcessExitUnconfirmed();
+				})).rejects.toMatchObject({ code: "process_exit_unconfirmed" });
+				expect(operationHasUnconfirmedExit()).toBe(true);
+				await expect(withRecoveryBudget(async () => {})).rejects.toMatchObject({ code: "process_exit_unconfirmed" });
+			});
+		} finally {
+			scope.dispose();
+		}
+	});
 	it("在 context 内传播并返回 body 结果", async () => {
 		const context = contextWith();
 		const result = await runWithOperationContext(context, async () => {

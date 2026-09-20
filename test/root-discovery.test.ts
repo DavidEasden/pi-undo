@@ -309,8 +309,8 @@ describe("RootDiscovery", () => {
 			scope.dispose();
 		}
 
-		expect(phases).toContain("discover_roots");
-		expect(phases).toContain("scan_directories");
+		expect(phases).toContain("discover_roots:unspecified");
+		expect(phases.some((phase) => phase.startsWith("scan_directories:"))).toBe(true);
 		expect(phases).toContain("discover_gitlinks");
 	});
 

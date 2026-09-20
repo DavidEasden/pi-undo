@@ -2,6 +2,11 @@ import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 
 import { canonicalJson, checksum } from "./encoding.ts";
+import {
+	checkOperation, createOperationScope, currentOperationContext, runWithOperationContext, operationFailure, isUnconfirmedExit,
+	configuredTimeout, operationHasUnconfirmedExit, rethrowOperationFailure, withRecoveryBudget,
+	type OperationScope, type ProcessDiagnostic,
+} from "./operation-context.ts";
 import type {
 	CheckpointRecord,
 	CursorState,
@@ -67,6 +72,11 @@ export interface ControllerDependencies {
 	}>;
 	readonly journal: JournalPort;
 	readonly clock: () => number;
+	readonly operationTimeoutMs?: number;
+	readonly onProgress?: (phase: string) => void;
+	readonly onOperationStart?: (opId: string) => void;
+	readonly onProcess?: (diagnostic: ProcessDiagnostic) => void;
+	readonly onOperationEnd?: (opId: string, result: OperationResult) => Promise<void>;
 }
 
 export interface JournalPort {
@@ -149,6 +159,8 @@ export interface UndoController {
 	beforeTree(event: SessionBeforeTreeEvent): Promise<SessionBeforeTreeResult | undefined>;
 	afterTree(event: SessionTreeEvent): Promise<void>;
 	cancelTree?(): Promise<void>;
+	cancelOperation?(): boolean;
+	dispose?(): Promise<void>;
 	recover(): Promise<void>;
 	history(): HistoryState;
 	/** 当前 recovery lock 的原因；未锁定时返回 undefined。 */
@@ -225,8 +237,22 @@ export class UndoControllerImpl implements UndoController {
 	private settling: Promise<void> | undefined;
 	private inputCommit: Promise<void> | undefined;
 	private treePreparation: Promise<SessionBeforeTreeResult | undefined> | undefined;
+	private treeApplication: Promise<void> | undefined;
+	private treeScope: OperationScope | undefined;
 	private treeCancellationRequested = false;
 	private disposed = false;
+	private activeScope: OperationScope | undefined;
+	private activeOperation: Promise<OperationResult> | undefined;
+	private readonly backgroundTasks = new Set<Promise<unknown>>();
+	private readonly backgroundScopes = new Set<OperationScope>();
+	private unsafeExit = false;
+	private operationId: string | undefined;
+	private transaction: {
+		descriptor: OperationDescriptor;
+		rollback?: SnapshotManifest;
+		target?: SnapshotManifest;
+		cursorDurable: boolean;
+	} | undefined;
 	private recoveryInFlight: Promise<void> | undefined;
 	private recoveryCompleted = false;
 
@@ -238,6 +264,64 @@ export class UndoControllerImpl implements UndoController {
 		this.locked = initialState.locked ?? false;
 		this.lockedReason = initialState.recoveryReason;
 		this.recoveryCompleted = initialState.recoveryCompleted ?? false;
+	}
+
+	cancelOperation(): boolean {
+		if (this.activeScope === undefined || this.transaction?.cursorDurable) return false;
+		this.activeScope.cancel();
+		return true;
+	}
+
+	async dispose(): Promise<void> {
+		this.disposed = true;
+		this.cancelOperation();
+		for (const scope of this.backgroundScopes) scope.cancel();
+		await this.activeOperation;
+		await this.cancelTree();
+		await Promise.allSettled([...this.backgroundTasks, this.inputCommit, this.settling]);
+		this.staged = undefined;
+		this.finishRun(this.runCompletion);
+		if (this.unsafeExit) throw new Error("process_exit_unconfirmed：旧任务未确认停止，不能重建 runtime");
+	}
+
+	private operationTimeout(): number {
+		return this.dependencies.operationTimeoutMs ?? configuredTimeout("PI_UNDO_OPERATION_TIMEOUT_MS", 300_000);
+	}
+
+	private recordUnsafeExit(error: unknown): boolean {
+		if (!isUnconfirmedExit(error) && !operationHasUnconfirmedExit()) return false;
+		this.unsafeExit = true;
+		this.lock("process_exit_unconfirmed");
+		return true;
+	}
+
+	private runBackground<T>(body: () => Promise<T>): Promise<T> {
+		const scope = createOperationScope({ timeoutMs: this.operationTimeout() });
+		this.backgroundScopes.add(scope);
+		const task = runWithOperationContext(scope.context, async () => {
+			try {
+				return await body();
+			} finally {
+				if (operationHasUnconfirmedExit()) this.recordUnsafeExit({ code: "process_exit_unconfirmed" });
+			}
+		}).finally(() => {
+			scope.dispose();
+			this.backgroundScopes.delete(scope);
+			this.backgroundTasks.delete(task);
+		});
+		this.backgroundTasks.add(task);
+		return task;
+	}
+
+	private async withRecoveryBudget<T>(body: () => Promise<T>): Promise<T> {
+		try {
+			return await withRecoveryBudget(body, {
+				timeoutMs: this.operationTimeout(), onProgress: this.dependencies.onProgress,
+			});
+		} catch (error) {
+			this.recordUnsafeExit(error);
+			throw error;
+		}
 	}
 
 	history(): HistoryState {
@@ -269,14 +353,15 @@ export class UndoControllerImpl implements UndoController {
 	}
 
 	warmUp(): void {
-		if (this.locked || this.warmUpInFlight !== undefined) return;
-		this.warmUpInFlight = (async () => {
+		if (this.disposed || this.locked || this.warmUpInFlight !== undefined) return;
+		this.warmUpInFlight = this.runBackground(async () => {
 			try {
 				this.warmUpManifest = await this.captureWithWorkspaceLock();
-			} catch {
+			} catch (error) {
+				this.recordUnsafeExit(error);
 				// 预热是 best-effort：失败静默，正式 capture 会再次尝试并上报。
 			}
-		})();
+		});
 	}
 
 	captureFailureReason(): string | undefined {
@@ -288,14 +373,14 @@ export class UndoControllerImpl implements UndoController {
 	}
 
 	async prepareInput(text: string, context: InputContext): Promise<InputEventResult> {
-		if (this.promptDeferralInFlight) return { action: "defer" };
+		if (this.disposed || this.unsafeExit || this.promptDeferralInFlight) return { action: "defer" };
 		if (this.locked) return { action: "continue" };
 		if (this.operationInFlight) return { action: "defer" };
 		if (context.streaming || text.length === 0) return { action: "continue" };
 		if (this.disposed || this.runCompletion?.started || this.settling !== undefined) return { action: "defer" };
 		const run = this.beginRun();
 		try {
-			const before = await this.captureInputBaseline();
+			const before = await this.runBackground(() => this.captureInputBaseline());
 			if (this.runCompletion === run && !this.disposed) this.stageInput(text, before);
 			return { action: "continue" };
 		} catch (error) {
@@ -306,7 +391,7 @@ export class UndoControllerImpl implements UndoController {
 	}
 
 	beginInput(text: string, context: InputContext): InputEventResult {
-		if (this.promptDeferralInFlight) return { action: "defer" };
+		if (this.disposed || this.unsafeExit || this.promptDeferralInFlight) return { action: "defer" };
 		if (this.locked) return { action: "continue" };
 		if (this.operationInFlight) return { action: "defer" };
 		if (context.streaming || text.length === 0) return { action: "continue" };
@@ -317,7 +402,7 @@ export class UndoControllerImpl implements UndoController {
 		this.lastCaptureFailureMessage = undefined;
 		this.deferAgentStartUntilMessageEnd = true;
 		const token = Symbol("input-capture");
-		const promise = this.captureInputForToken(text, token);
+		const promise = this.runBackground(() => this.captureInputForToken(text, token));
 		this.pendingInputCapture = { token, promise };
 		void promise.then(() => {
 			if (this.pendingInputCapture?.token === token) this.pendingInputCapture = undefined;
@@ -424,13 +509,15 @@ export class UndoControllerImpl implements UndoController {
 
 	private recordCaptureFailure(error: unknown): void {
 		this.lastCaptureFailed = true;
+		this.recordUnsafeExit(error);
 		this.lastCaptureFailureMessage = truncateReason(error instanceof Error ? error.message : String(error));
 	}
 
 	agentSettled(): Promise<void> {
+		if (this.disposed) return Promise.resolve();
 		if (this.settling !== undefined) return this.settling;
 		const run = this.runCompletion;
-		const settled = this.settleRun();
+		const settled = this.runBackground(() => this.settleRun());
 		this.settling = settled.finally(() => {
 			this.settling = undefined;
 			this.finishRun(run);
@@ -441,7 +528,7 @@ export class UndoControllerImpl implements UndoController {
 	private async settleRun(): Promise<void> {
 		const staged = this.staged;
 		this.staged = undefined;
-		if (this.locked || staged === undefined) return;
+		if (this.disposed || this.locked || staged === undefined) return;
 		if (staged.startEntryId === undefined || staged.startEntryId === null) {
 			// Pi 没有提供已落盘的 start entry ID，不能把后续 assistant 输出归属到该 checkpoint。
 			this.lock("start_entry_missing");
@@ -475,7 +562,11 @@ export class UndoControllerImpl implements UndoController {
 						measure("settled.prepareUndo", () =>
 							this.dependencies.prepareDurableRestore!(after, staged.before, changedPaths)),
 					];
-				await Promise.allSettled(preparations);
+				const outcomes = await Promise.allSettled(preparations);
+				for (const outcome of outcomes) {
+					if (outcome.status === "rejected" && this.recordUnsafeExit(outcome.reason)) throw outcome.reason;
+				}
+				checkOperation();
 			}
 			const endLeafId = this.dependencies.getLogicalLeafId() ?? staged.startEntryId;
 			const checkpoint = this.createCheckpoint(staged, after, changedPaths, userEntryId, endLeafId);
@@ -487,7 +578,8 @@ export class UndoControllerImpl implements UndoController {
 				return;
 			}
 			this.undoStack.push(checkpoint);
-		} catch {
+		} catch (error) {
+			this.recordUnsafeExit(error);
 			this.historyPaused = true;
 			this.undoStack.length = 0;
 			this.redoStack.length = 0;
@@ -510,11 +602,21 @@ export class UndoControllerImpl implements UndoController {
 	}
 
 	beforeTree(event: SessionBeforeTreeEvent): Promise<SessionBeforeTreeResult | undefined> {
-		if (this.treePreparation !== undefined) return Promise.resolve({ cancel: true });
+		if (this.treeScope !== undefined) return Promise.resolve({ cancel: true });
 		this.treeCancellationRequested = event.signal?.aborted ?? false;
-		const preparation = this.prepareTree(event);
-		this.treePreparation = preparation.finally(() => { this.treePreparation = undefined; });
+		const scope = createOperationScope({ timeoutMs: this.operationTimeout(), signal: event.signal });
+		this.treeScope = scope;
+		const preparation = runWithOperationContext(scope.context, () => this.prepareTree(event));
+		this.treePreparation = preparation.finally(() => {
+			this.treePreparation = undefined;
+			if (this.pendingTree === undefined) this.finishTreeScope();
+		});
 		return this.treePreparation;
+	}
+
+	private finishTreeScope(): void {
+		this.treeScope?.dispose();
+		this.treeScope = undefined;
 	}
 
 	private async prepareTree(event: SessionBeforeTreeEvent): Promise<SessionBeforeTreeResult | undefined> {
@@ -529,21 +631,24 @@ export class UndoControllerImpl implements UndoController {
 		this.operationInFlight = true;
 		let lease: { release(): Promise<void> } | undefined;
 		try {
+			checkOperation();
 			lease = await this.dependencies.acquireWorkspaceLock();
 			const rollback = await this.dependencies.capture();
+			checkOperation();
 			const targetState = await this.dependencies.resolveTreeTarget(event.targetLeafId);
 			const target = await this.dependencies.loadManifest(targetState.targetManifestId);
 			const plan = await this.dependencies.planRestore(rollback, target);
 			const descriptor = this.createDescriptor("tree", rollback, target, plan, targetState.logicalLeafId);
 			await this.dependencies.journal.prepare(descriptor, plan);
 			this.pendingTree = { descriptor, rollback, target, plan, undoStack: targetState.undoStack, lease };
-			if (this.treeCancellationRequested || event.signal?.aborted) {
-				await this.cancelPreparedTree();
+			if (this.treeCancellationRequested || this.treeScope?.context.signal.aborted) {
+				await this.withRecoveryBudget(() => this.cancelPreparedTree());
 				return { cancel: true };
 			}
 			return undefined;
-		} catch {
-			if (lease !== undefined) {
+		} catch (error) {
+			this.recordUnsafeExit(error);
+			if (lease !== undefined && !this.unsafeExit) {
 				await lease.release().catch(() => { this.lock("workspace_lock_release_failed"); });
 			}
 			this.operationInFlight = false;
@@ -551,7 +656,17 @@ export class UndoControllerImpl implements UndoController {
 		}
 	}
 
-	async afterTree(event: SessionTreeEvent): Promise<void> {
+	afterTree(event: SessionTreeEvent): Promise<void> {
+		if (this.treeApplication !== undefined) return this.treeApplication;
+		const application = runWithOperationContext(this.treeScope?.context, () => this.applyPreparedTree(event));
+		this.treeApplication = application.finally(() => {
+			this.treeApplication = undefined;
+			this.finishTreeScope();
+		});
+		return this.treeApplication;
+	}
+
+	private async applyPreparedTree(event: SessionTreeEvent): Promise<void> {
 		const pending = this.pendingTree;
 		if (pending === undefined) return;
 		this.pendingTree = undefined;
@@ -566,6 +681,7 @@ export class UndoControllerImpl implements UndoController {
 				{ phase: "SESSION_MOVED", observedLogicalLeaf: event.newLeafId },
 				{ phase: "APPLYING" },
 			]);
+			checkOperation();
 			const applied = await this.dependencies.applyRestore(
 				pending.plan,
 				pending.target,
@@ -576,6 +692,7 @@ export class UndoControllerImpl implements UndoController {
 				await this.dependencies.journal.setPhase(pending.descriptor.opId, "RECOVERY_REQUIRED");
 				return;
 			}
+			checkOperation();
 			await this.dependencies.journal.setPhase(pending.descriptor.opId, "FILES_VERIFIED");
 			const cursorResult = await this.dependencies.appendCursor(
 				this.createTreeCursor(pending.descriptor, event.newLeafId, pending.undoStack),
@@ -589,18 +706,24 @@ export class UndoControllerImpl implements UndoController {
 			await this.dependencies.journal.markCommitted(pending.descriptor.opId);
 			this.undoStack.splice(0, this.undoStack.length, ...pending.undoStack);
 			this.redoStack.length = 0;
-		} catch {
+		} catch (error) {
+			this.recordUnsafeExit(error);
 			this.lock("tree_recovery_failed");
 		} finally {
-			await pending.lease.release().catch(() => { this.lock("workspace_lock_release_failed"); });
+			if (!this.unsafeExit && !operationHasUnconfirmedExit()) {
+				await pending.lease.release().catch(() => { this.lock("workspace_lock_release_failed"); });
+			}
 			this.operationInFlight = false;
 		}
 	}
 
 	async cancelTree(): Promise<void> {
 		this.treeCancellationRequested = true;
+		this.treeScope?.cancel();
 		await this.treePreparation;
-		await this.cancelPreparedTree();
+		await this.treeApplication;
+		if (this.pendingTree !== undefined) await this.withRecoveryBudget(() => this.cancelPreparedTree());
+		this.finishTreeScope();
 	}
 
 	private async cancelPreparedTree(): Promise<void> {
@@ -615,10 +738,13 @@ export class UndoControllerImpl implements UndoController {
 			}
 			await this.dependencies.journal.setPhase(pending.descriptor.opId, "ABORTING");
 			await this.dependencies.journal.setPhase(pending.descriptor.opId, "ABORTED");
-		} catch {
+		} catch (error) {
+			this.recordUnsafeExit(error);
 			this.lock("tree_cancel_failed");
 		} finally {
-			await pending.lease.release().catch(() => { this.lock("workspace_lock_release_failed"); });
+			if (!this.unsafeExit && !operationHasUnconfirmedExit()) {
+				await pending.lease.release().catch(() => { this.lock("workspace_lock_release_failed"); });
+			}
 			this.operationInFlight = false;
 		}
 	}
@@ -644,10 +770,33 @@ export class UndoControllerImpl implements UndoController {
 		await recovery;
 	}
 
-	private async runOperation(action: "undo" | "redo"): Promise<OperationResult> {
+	private runOperation(action: "undo" | "redo"): Promise<OperationResult> {
+		if (this.disposed || this.operationInFlight || this.activeOperation !== undefined) return Promise.resolve({ code: "busy", changedFiles: 0 });
+		this.operationId = `op-${randomUUID()}`;
+		this.dependencies.onOperationStart?.(this.operationId);
+		const scope = createOperationScope({
+			timeoutMs: this.operationTimeout(), onProgress: this.dependencies.onProgress, onProcess: this.dependencies.onProcess,
+		});
+		this.activeScope = scope;
+		const opId = this.operationId;
+		const task = runWithOperationContext(scope.context, () => this.performOperation(action)).then(async (result) => {
+			await this.dependencies.onOperationEnd?.(opId, result).catch(() => {});
+			return result;
+		});
+		this.activeOperation = task.finally(() => {
+			scope.dispose();
+			this.activeScope = undefined;
+			this.activeOperation = undefined;
+			this.transaction = undefined;
+			this.operationId = undefined;
+		});
+		return this.activeOperation;
+	}
+
+	private async performOperation(action: "undo" | "redo"): Promise<OperationResult> {
 		if (this.locked) return this.recoveryResult();
 		if (this.operationInFlight) return { code: "busy", changedFiles: 0 };
-		const profile = new OperationProfiler();
+		const profile = new OperationProfiler(this.dependencies.onProgress);
 		const done = (result: OperationResult): OperationResult => profile.attach(result);
 		this.operationInFlight = true;
 		this.operationAction = action;
@@ -657,9 +806,11 @@ export class UndoControllerImpl implements UndoController {
 		let lease: { release(): Promise<void> } | undefined;
 		try {
 			if (!await profile.measure("idle", () => this.ensureIdle())) {
+				checkOperation();
 				return done({ code: "idle_timeout", changedFiles: 0 });
 			}
 			if (!await profile.measure("checkpoint", () => this.waitForCheckpoint())) {
+				checkOperation();
 				return done({ code: "idle_timeout", changedFiles: 0 });
 			}
 			if (this.locked) return done(this.recoveryResult());
@@ -672,7 +823,8 @@ export class UndoControllerImpl implements UndoController {
 			const targetManifestId = redo?.targetManifestId;
 			try {
 				lease = await profile.measure("lock", () => this.dependencies.acquireWorkspaceLock());
-			} catch {
+			} catch (error) {
+				if (operationFailure(error) !== undefined || isUnconfirmedExit(error)) throw error;
 				return done({ code: "busy", changedFiles: 0 });
 			}
 			if (checkpoint.changedPaths.length === 0) {
@@ -695,7 +847,8 @@ export class UndoControllerImpl implements UndoController {
 							restoreTargetManifestId,
 							checkpoint.changedPaths,
 						));
-			} catch {
+			} catch (error) {
+				if (operationFailure(error) !== undefined || isUnconfirmedExit(error)) throw error;
 				return done({ code: "capture_failed", changedFiles: 0 });
 			}
 			let target: SnapshotManifest;
@@ -707,10 +860,12 @@ export class UndoControllerImpl implements UndoController {
 				plan = await profile.measure("plan", () =>
 					this.dependencies.planRestore(rollback, target, checkpoint.changedPaths));
 				targetLogicalLeaf = this.dependencies.resolveSessionTarget(action, checkpoint);
-			} catch {
+			} catch (error) {
+				if (operationFailure(error) !== undefined || isUnconfirmedExit(error)) throw error;
 				return done({ code: "restore_failed_safe", changedFiles: 0 });
 			}
 			const descriptor = this.createDescriptor(action, rollback, target, plan, targetLogicalLeaf);
+			this.transaction = { descriptor, rollback, target, cursorDurable: false };
 			await profile.measure("journal", () => this.dependencies.journal.prepare(descriptor, plan));
 			const navigation = await profile.measure("navigate", () =>
 				this.dependencies.navigateSession(action, checkpoint));
@@ -734,8 +889,9 @@ export class UndoControllerImpl implements UndoController {
 			const applied = await profile.measure("apply", () =>
 				this.dependencies.applyRestore(plan, target, { opId: descriptor.opId }));
 			if (applied.code !== "ok") {
-				return done(await profile.measure("compensate", () =>
-					this.compensate(descriptor, rollback, target, applied)));
+				const result = await this.compensate(descriptor, rollback, target, applied);
+				return done(result.code === "restore_failed_safe" && applied.failureCode !== undefined
+					? { ...result, code: applied.failureCode } : result);
 			}
 			await profile.measure("journal", () =>
 				this.dependencies.journal.setPhase(descriptor.opId, "FILES_VERIFIED"));
@@ -754,18 +910,32 @@ export class UndoControllerImpl implements UndoController {
 					totalPaths: applied.totalPaths,
 				})));
 			}
+			this.transaction.cursorDurable = true;
 			await profile.measure("commit", async () => {
 				await this.dependencies.journal.setPhase(descriptor.opId, "CURSOR_COMMITTED");
 				await this.dependencies.journal.markCommitted(descriptor.opId);
 			});
 			this.lastSafetyManifestId = rollback.manifestId;
 			return done(this.advanceHistory(action, checkpoint, { code: "ok", changedFiles: applied.verifiedPaths }));
-		} catch {
+		} catch (error) {
+			if (this.recordUnsafeExit(error)) return done(this.recoveryResult());
+			const reason = operationFailure(error);
+			const tx = this.transaction;
+			if (reason !== undefined && !tx?.cursorDurable) {
+				if (tx !== undefined) {
+					const recovered = tx.rollback !== undefined && tx.target !== undefined
+						? await this.compensate(tx.descriptor, tx.rollback, tx.target, { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 })
+						: await this.compensateSessionOnly(tx.descriptor);
+					if (recovered.code === "recovery_required") return done(recovered);
+				}
+				return done({ code: reason, changedFiles: 0 });
+			}
 			this.lock("operation_failed");
 			return done(this.recoveryResult());
 		} finally {
+			if (operationHasUnconfirmedExit()) this.recordUnsafeExit({ code: "process_exit_unconfirmed" });
 			const activeLease = lease;
-			if (activeLease !== undefined) {
+			if (activeLease !== undefined && !this.unsafeExit) {
 				await profile.measure("unlock", () =>
 					activeLease.release().catch(() => { this.lock("workspace_lock_release_failed"); }));
 			}
@@ -814,6 +984,7 @@ export class UndoControllerImpl implements UndoController {
 			plan,
 			targetLogicalLeaf,
 		);
+		this.transaction = { descriptor, cursorDurable: false };
 		await profile.measure("journal", () => this.dependencies.journal.prepare(descriptor, plan));
 		const navigation = await profile.measure("navigate", () =>
 			this.dependencies.navigateSession(action, checkpoint));
@@ -846,6 +1017,7 @@ export class UndoControllerImpl implements UndoController {
 		if (cursorResult.kind === "volatile") {
 			return profile.measure("compensate", () => this.compensateSessionOnly(descriptor));
 		}
+		this.transaction.cursorDurable = true;
 		await profile.measure("commit", async () => {
 			await this.dependencies.journal.setPhase(descriptor.opId, "CURSOR_COMMITTED");
 			await this.dependencies.journal.markCommitted(descriptor.opId);
@@ -855,6 +1027,15 @@ export class UndoControllerImpl implements UndoController {
 	}
 
 	private async compensateSessionOnly(descriptor: OperationDescriptor): Promise<OperationResult> {
+		try {
+			return await this.withRecoveryBudget(() => this.compensateSessionOnlyWithinBudget(descriptor));
+		} catch {
+			this.lock("session_only_recovery_failed");
+			return this.recoveryResult();
+		}
+	}
+
+	private async compensateSessionOnlyWithinBudget(descriptor: OperationDescriptor): Promise<OperationResult> {
 		try {
 			await this.dependencies.journal.setPhase(descriptor.opId, "ABORTING");
 			if (!await this.dependencies.restoreSessionLeaf(descriptor.fromLogicalLeaf)) {
@@ -890,7 +1071,7 @@ export class UndoControllerImpl implements UndoController {
 	}
 
 	private async waitForCheckpoint(): Promise<boolean> {
-		const deadline = Date.now() + 30_000;
+		const deadline = currentOperationContext()?.deadline ?? Date.now() + this.operationTimeout();
 		for (const task of [this.pendingInputCapture?.promise, this.inputCommit]) {
 			if (task !== undefined && !await waitForCompletion(task, deadline)) return false;
 		}
@@ -908,7 +1089,8 @@ export class UndoControllerImpl implements UndoController {
 		try {
 			await this.dependencies.abortAgent();
 			return await this.dependencies.waitForIdle(this.dependencies.clock() + 30_000);
-		} catch {
+		} catch (error) {
+			rethrowOperationFailure(error);
 			return false;
 		}
 	}
@@ -921,8 +1103,11 @@ export class UndoControllerImpl implements UndoController {
 		const lease = await this.dependencies.acquireWorkspaceLock();
 		try {
 			return await this.dependencies.capture();
+		} catch (error) {
+			this.recordUnsafeExit(error);
+			throw error;
 		} finally {
-			await lease.release();
+			if (!this.unsafeExit) await lease.release();
 		}
 	}
 
@@ -932,8 +1117,11 @@ export class UndoControllerImpl implements UndoController {
 		const lease = await this.dependencies.acquireWorkspaceLock();
 		try {
 			return await captureBaseline(baseline);
+		} catch (error) {
+			this.recordUnsafeExit(error);
+			throw error;
 		} finally {
-			await lease.release();
+			if (!this.unsafeExit) await lease.release();
 		}
 	}
 
@@ -946,6 +1134,7 @@ export class UndoControllerImpl implements UndoController {
 		try {
 			return await this.captureBaselineWithWorkspaceLock(baseline);
 		} catch (error) {
+			rethrowOperationFailure(error);
 			if (!isTransientCaptureFailure(error)) throw error;
 			await sleep(250);
 			return await this.captureBaselineWithWorkspaceLock(baseline);
@@ -953,6 +1142,21 @@ export class UndoControllerImpl implements UndoController {
 	}
 
 	private async compensate(
+		descriptor: OperationDescriptor,
+		rollback: SnapshotManifest,
+		target: SnapshotManifest,
+		failure: RestoreResult,
+	): Promise<OperationResult> {
+		try {
+			this.dependencies.onProgress?.("compensate");
+			return await this.withRecoveryBudget(() => this.compensateWithinBudget(descriptor, rollback, target, failure));
+		} catch {
+			this.lock("compensation_failed");
+			return this.recoveryResult();
+		}
+	}
+
+	private async compensateWithinBudget(
 		descriptor: OperationDescriptor,
 		rollback: SnapshotManifest,
 		target: SnapshotManifest,
@@ -973,7 +1177,8 @@ export class UndoControllerImpl implements UndoController {
 				await this.dependencies.journal.setPhase(descriptor.opId, "ABORTED");
 				return { code: "restore_failed_safe", changedFiles: failure.verifiedPaths };
 			}
-		} catch {
+		} catch (error) {
+			this.recordUnsafeExit(error);
 			// 下面统一进入 recovery lock。
 		}
 		this.lock("compensation_failed");
@@ -1030,7 +1235,7 @@ export class UndoControllerImpl implements UndoController {
 		const scopePaths = [...(plan.scopePaths ?? [...plan.deletePaths, ...plan.writePaths])].sort();
 		const payload = {
 			schemaVersion: 1 as const,
-			opId: `op-${randomUUID()}`,
+			opId: this.operationId ?? `op-${randomUUID()}`,
 			sessionIdentity: this.dependencies.sessionIdentity,
 			workspaceIdentity: this.dependencies.workspaceIdentity,
 			action,
@@ -1105,7 +1310,11 @@ function emptyRestorePlan(currentManifestId: ManifestId, targetManifestId: Manif
 class OperationProfiler {
 	private readonly durations = new Map<string, number>();
 
+	constructor(private readonly onProgress?: (phase: string) => void) {}
+
 	async measure<T>(phase: string, operation: () => Promise<T>): Promise<T> {
+		if (phase !== "unlock" && phase !== "commit" && !phase.startsWith("settled.")) checkOperation();
+		this.onProgress?.(phase);
 		const started = performance.now();
 		try {
 			return await operation();
@@ -1129,13 +1338,21 @@ class OperationProfiler {
 
 async function waitForCompletion(task: Promise<void>, deadline: number): Promise<boolean> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
+	const signal = currentOperationContext()?.signal;
+	let onAbort: (() => void) | undefined;
 	try {
+		checkOperation();
 		return await Promise.race([
 			task.then(() => true, () => false),
-			new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), Math.max(0, deadline - Date.now())); }),
+			new Promise<boolean>((resolve) => {
+				timer = setTimeout(() => resolve(false), Math.max(0, deadline - Date.now()));
+				onAbort = () => resolve(false);
+				signal?.addEventListener("abort", onAbort, { once: true });
+			}),
 		]);
 	} finally {
 		if (timer !== undefined) clearTimeout(timer);
+		if (onAbort !== undefined) signal?.removeEventListener("abort", onAbort);
 	}
 }
 

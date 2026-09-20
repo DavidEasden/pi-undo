@@ -3,6 +3,8 @@ import { mkdir, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { checkOperation, operationHasUnconfirmedExit } from "./operation-context.ts";
+
 const LEGACY_OWNER_FILE = "owner.json";
 const OWNER_PREFIX = "owner.";
 const OWNER_SUFFIX = ".json";
@@ -86,7 +88,7 @@ export class WorkspaceLock {
 			try {
 				return await fn();
 			} finally {
-				await lease.release();
+				if (!operationHasUnconfirmedExit()) await lease.release();
 			}
 		});
 	}
@@ -100,6 +102,7 @@ export class WorkspaceLock {
 		const deadline = this.clock() + this.acquireTimeoutMs;
 
 		while (true) {
+			checkOperation();
 			const owner: LockOwner = {
 				pid: process.pid,
 				processStartedAt: currentProcessStartedAt(this.clock()),

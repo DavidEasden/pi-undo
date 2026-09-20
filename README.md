@@ -104,6 +104,29 @@ Returns to the previous completed run on the current branch. Before restoring, i
 
 After a successful undo, text entered during the operation is replayed into the editor. RPC mode reports the refill request; print and JSON modes do not replay prompts.
 
+撤回会等待当前轮次的输入快照和检查点完成，再选择撤回目标；Pi 已空闲但检查点仍在生成时，不会提前撤回上一轮。检查点生成失败会明确暂停历史。
+
+### 取消与超时
+
+执行较慢时，状态栏会显示当前阶段、经过的秒数和操作 ID。可以输入：
+
+```text
+/undo-cancel
+```
+
+此命令请求安全停止正在执行的撤回或重做。已开始的文件写入会先结束，未提交的事务随后按日志恢复。已经持久提交的操作会继续完成清理。取消或超时分别报告 `operation_cancelled`、`operation_timeout`；无法确认子进程停止或恢复一致性时，保留隔离并报告 `recovery_required`。
+
+默认单次 Git 调用预算为 120 秒，每次撤回、捕获及恢复预算为 300 秒。可在启动 Pi 前用正整数毫秒调整：
+
+```bash
+export PI_UNDO_GIT_TIMEOUT_MS=180000
+export PI_UNDO_OPERATION_TIMEOUT_MS=600000
+```
+
+补偿使用独立预算，避免继承前向操作的取消信号。磁盘 I/O 若无法中断，状态会保留到在途任务结束；超时不表示可以立即释放仍在写入的工作区锁。
+
+长操作或失败会在 `<sessionDir>/.pi-undo/diagnostics/<sessionId>-latest.json` 保存最近一次诊断，包含操作 ID、阶段、耗时、Git 子命令名和退出结果，不包含提示词、文件内容、完整参数或子进程输出。重新运行 `/undo-recover`、切换会话或退出时，会先等待旧 runtime 的任务和后台持久化结束。
+
 ### Redo
 
 ```text
@@ -137,6 +160,16 @@ recovery_required
 ```
 
 ### Performance Notes
+
+本次优化将普通文件原生恢复路径的完整拓扑扫描从 7 次减到 5 次，并以有界并发枚举目录。仍会发现 Git 忽略目录中的嵌套仓库，保留路径枚举后与文件恢复后的拓扑复核。没有使用 TTL 缓存或默认跳过 `node_modules`。
+
+可通过真实 Pi 0.86.1 SDK 和离线 faux provider 运行大型工作区基准；它覆盖 3,000／10,000 个依赖包、修改 1／100 个文件，每组撤回三次并验证重做：
+
+```bash
+PI_UNDO_LARGE_WORKSPACE=1 npx vitest run test/large-workspace.test.ts
+```
+
+输出包含扫描次数、每次耗时、进程峰值 RSS 和事件循环延迟；常规测试以扫描次数作为性能门槛，避免使用易受机器负载影响的墙钟阈值。
 
 Real-world measurements from a 104-file undo operation before optimizations:
 

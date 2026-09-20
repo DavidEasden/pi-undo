@@ -8,7 +8,9 @@ import * as atomicFs from "../src/atomic-fs.ts";
 import { hasDurablePack } from "../src/durable-pack.ts";
 import { canonicalJson, checksum, topologyFingerprint } from "../src/encoding.ts";
 import { MutationJournal } from "../src/mutation-journal.ts";
+import * as nativeRestore from "../src/native-restore.ts";
 import { nativeExecutable } from "../src/native-restore.ts";
+import { checkOperation, createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
 import { RestoreEngine, type RestoreMutation } from "../src/restore-engine.ts";
 import type { ManifestId, RestorePath, SnapshotManifest } from "../src/model.ts";
 import { RootDiscovery, type RootDiscoveryReason, type RootTopology } from "../src/root-discovery.ts";
@@ -188,6 +190,78 @@ function withActiveNullTree(manifest: SnapshotManifest): SnapshotManifest {
 }
 
 describe("RestoreEngine", () => {
+	it("native 已安装文件而尚未验证时取消，从 durable pack 回滚到原内容", async (context) => {
+		if (!await nativeRestoreAvailable()) return context.skip();
+		const workspace = await temporaryRoot("pi-undo-native-cancel-");
+		const storeRoot = await temporaryRoot("pi-undo-native-cancel-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot });
+		await writeFile(workspace, "a.txt", "target\n");
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "a.txt", "current\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		const journal = new MutationJournal(join(storeRoot, "mutations.jsonl"), "op-native-cancel");
+		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+		const plan = await engine.plan(current, target);
+		const scope = createOperationScope({ timeoutMs: 10_000 });
+		const createBatch = nativeRestore.createNativeFileBatch;
+		const mock = vi.spyOn(nativeRestore, "createNativeFileBatch").mockImplementation(async (options) => {
+			const batch = await createBatch(options);
+			if (batch === undefined) return undefined;
+			return { ...batch, run: async (pack) => {
+				await batch.run(pack);
+				expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("target\n");
+				scope.cancel();
+				checkOperation();
+			} };
+		});
+		try {
+			const result = await runWithOperationContext(scope.context, () => engine.apply(plan, target, {
+				opId: journal.operationId, mutationJournal: journal, deferDurability: true,
+			}));
+			expect(mock).toHaveBeenCalled();
+			expect(result).toMatchObject({ code: "restore_failed_safe", failureCode: "operation_cancelled" });
+			expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("current\n");
+			await journal.assertCleaned();
+		} finally {
+			mock.mockRestore();
+			scope.dispose();
+		}
+	});
+	it("第二个叶子安装时取消，等待批次收敛后用独立预算回滚并清理 WAL", async () => {
+		const workspace = await temporaryRoot("pi-undo-cancel-workspace-");
+		const storeRoot = await temporaryRoot("pi-undo-cancel-store-");
+		await writeFile(workspace, "a.txt", "target-a\n");
+		await writeFile(workspace, "b.txt", "target-b\n");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "a.txt", "current-a\n");
+		await writeFile(workspace, "b.txt", "current-b\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		const journal = new MutationJournal(join(storeRoot, "mutations.jsonl"), "op-cancel-partial");
+		const scope = createOperationScope({ timeoutMs: 10_000 });
+		const engine = new RestoreEngine({
+			workspaceRoot: workspace, store, discovery,
+			beforeMutation: (mutation) => {
+				if (mutation.phase === "apply" && mutation.path === "b.txt") scope.cancel();
+				checkOperation();
+			},
+		});
+		const plan = await engine.plan(current, target);
+		try {
+			const result = await runWithOperationContext(scope.context, () => engine.apply(plan, target, {
+				opId: journal.operationId, mutationJournal: journal,
+			}));
+			expect(result).toMatchObject({ code: "restore_failed_safe", failureCode: "operation_cancelled" });
+			expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("current-a\n");
+			expect(await readFile(join(workspace, "b.txt"), "utf8")).toBe("current-b\n");
+			await journal.assertCleaned();
+			expect(await journal.activeArtifacts()).toEqual(new Set());
+		} finally {
+			scope.dispose();
+		}
+	});
 	it("source quarantine 后外部重建路径时不覆盖外部内容并保留 WAL", async () => {
 		const workspace = await temporaryRoot("pi-undo-restore-workspace-");
 		await writeFile(workspace, "a.txt", "target\n");

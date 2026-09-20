@@ -4,7 +4,7 @@ import { delimiter, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 import { DEFAULT_GIT_TIMEOUT_MS, GitRunner, runSupervisedProcess } from "../src/git-runner.ts";
-import { createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
+import { createOperationScope, runWithOperationContext, type ProcessDiagnostic } from "../src/operation-context.ts";
 
 const temporaryRoots: string[] = [];
 
@@ -43,6 +43,18 @@ function delay(milliseconds: number): Promise<void> {
 }
 
 describe("GitRunner", () => {
+	it("诊断只记录子命令、耗时和退出结果，不记录敏感参数与输出", async () => {
+		const fake = await fakeGit("printf '私密输出'; printf '私密错误' >&2");
+		const records: ProcessDiagnostic[] = [];
+		const scope = createOperationScope({ onProcess: (record) => records.push(record) });
+		try {
+			await runWithOperationContext(scope.context, () => new GitRunner().run(["cat-file", "blob", "私密参数"], { env: fake.env }));
+			expect(records).toEqual([{ command: "git:cat-file", durationMs: expect.any(Number), outcome: "exit", exitCode: 0 }]);
+			expect(JSON.stringify(records)).not.toContain("私密");
+		} finally {
+			scope.dispose();
+		}
+	});
 	it("执行成功命令并保留 stdout/stderr", async () => {
 		const runner = new GitRunner();
 		const result = await runner.run(["--version"]);
@@ -136,6 +148,15 @@ describe("GitRunner", () => {
 			code: "git_failed",
 			result: { code: null, killed: true },
 		});
+	});
+
+	it("Git 被外部信号终止后也确认后代退出，不留下迟到写入", async () => {
+		const marker = await markerPath();
+		const fake = await fakeGit('(sleep 0.2; touch "$MARKER") >/dev/null 2>&1 &\nkill -TERM $$');
+		await expect(new GitRunner().run([], { env: { ...fake.env, MARKER: marker } }))
+			.rejects.toMatchObject({ code: "git_failed", result: { killed: true } });
+		await delay(300);
+		await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
 	it("默认预算为 120 秒", () => {

@@ -7,6 +7,7 @@ import { fsyncDirectory, writeBytesExclusive } from "./atomic-fs.ts";
 import { canonicalJson, checksum } from "./encoding.ts";
 import type { MutationJournal } from "./mutation-journal.ts";
 import type { MutationRecord } from "./model.ts";
+import { checkOperation } from "./operation-context.ts";
 import { assertNoSymlinkEscape, relativeSafePath } from "./path-safety.ts";
 
 const BATCH_FILE_IO_CONCURRENCY = 32;
@@ -828,6 +829,7 @@ export class QuarantineManager {
 	}
 
 	private async assertWorkspaceIdentity(): Promise<void> {
+		checkOperation();
 		const identity = await realpath(this.requestedWorkspaceRoot);
 		if (identity !== this.workspaceRoot) {
 			throw new QuarantineError("unsafe_artifact", "workspace root identity 已变化");
@@ -925,6 +927,7 @@ async function mapConcurrentFailClosed<T>(
 			const index = nextIndex;
 			nextIndex += 1;
 			try {
+				checkOperation();
 				await operation(values[index]!);
 			} catch (error) {
 				if (!failed) failure = error;

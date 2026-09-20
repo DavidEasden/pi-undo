@@ -76,11 +76,14 @@ function createUiContext(record: { statuses: string[]; notices: SdkHarness["noti
 	} as unknown as ExtensionUIContext;
 }
 
-export async function createHarness(options: {
+export interface SdkHarnessOptions {
 	readonly workspace: string;
 	readonly agentDir: string;
 	readonly sessionManager: SessionManager;
-}): Promise<SdkHarness> {
+	readonly additionalExtensions?: Array<(pi: ExtensionAPI) => void>;
+}
+
+export async function createHarness(options: SdkHarnessOptions): Promise<SdkHarness> {
 	// pi-undo 在 pi-subagents runner 子进程（PI_SUBAGENT_CHILD=1）中保持惰性；本测试
 	// 是直接绑定扩展的主会话场景，测试期间临时清除该变量，结束后恢复。
 	const subagentChild = process.env.PI_SUBAGENT_CHILD;
@@ -92,11 +95,7 @@ export async function createHarness(options: {
 	}
 }
 
-async function bindHarness(options: {
-	readonly workspace: string;
-	readonly agentDir: string;
-	readonly sessionManager: SessionManager;
-}): Promise<SdkHarness> {
+async function bindHarness(options: SdkHarnessOptions): Promise<SdkHarness> {
 	// 固定回复的 faux provider：没有网络请求，也没有模型费用。
 	const faux = fauxProvider({ tokensPerSecond: 1_000_000 });
 	const modelRuntime = await ModelRuntime.create({
@@ -128,7 +127,7 @@ async function bindHarness(options: {
 		noThemes: true,
 		agentsFilesOverride: () => ({ agentsFiles: [] }),
 		systemPromptOverride: () => "离线回归测试：只按固定指令调用工具。",
-		extensionFactories: [extension],
+		extensionFactories: [extension, ...(options.additionalExtensions ?? [])],
 	});
 	await loader.reload();
 	const extensionErrors = loader.getExtensions().errors;
@@ -180,13 +179,14 @@ async function bindHarness(options: {
 	};
 }
 
-export async function createFreshHarness(): Promise<{ temp: TempRoot; harness: SdkHarness }> {
+export async function createFreshHarness(additionalExtensions?: SdkHarnessOptions["additionalExtensions"]): Promise<{ temp: TempRoot; harness: SdkHarness }> {
 	const temp = await createTempRoot();
 	await writeFile(join(temp.workspace, "value.txt"), "before\n");
 	const harness = await createHarness({
 		workspace: temp.workspace,
 		agentDir: temp.agentDir,
 		sessionManager: SessionManager.create(temp.workspace, temp.sessionDir),
+		additionalExtensions,
 	});
 	return { temp, harness };
 }

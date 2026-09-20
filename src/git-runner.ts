@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 
-import { type OperationContext, currentOperationContext, isOperationTimeoutReason } from "./operation-context.ts";
+import { type OperationContext, configuredTimeout, currentOperationContext, isOperationTimeoutReason, markProcessExitUnconfirmed, reportProcessDiagnostic } from "./operation-context.ts";
 
 export const DEFAULT_STDERR_LIMIT = 64 * 1024;
 /** Git 单次调用的默认预算；调用链上的 deadline 可进一步收紧它。 */
@@ -60,6 +60,29 @@ export interface GitRunner {
 
 export class GitRunner {
 	async run(args: readonly string[], options: GitRunOptions = {}): Promise<GitRunResult> {
+		const started = performance.now();
+		// 仅记录已知子命令名，不保留路径、环境、stdin 或 stderr。
+		const commands = new Set(["cat-file", "ls-files", "ls-tree", "hash-object", "read-tree", "write-tree", "update-index", "rev-parse", "check-ignore", "config", "init"]);
+		const command = `git:${args.find((argument) => commands.has(argument)) ?? "other"}`;
+		let outcome = "failed";
+		let exitCode: number | null = null;
+		try {
+			const result = await this.runCommand(args, options);
+			outcome = result.timedOut ? "timeout" : result.aborted ? "cancelled" : "exit";
+			exitCode = result.code;
+			return result;
+		} catch (error) {
+			if (error instanceof GitRunError) {
+				outcome = error.code;
+				exitCode = error.result?.code ?? null;
+			}
+			throw error;
+		} finally {
+			reportProcessDiagnostic({ command, durationMs: Math.round(performance.now() - started), outcome, exitCode });
+		}
+	}
+
+	private async runCommand(args: readonly string[], options: GitRunOptions): Promise<GitRunResult> {
 		const stderrLimit = options.stderrLimit ?? DEFAULT_STDERR_LIMIT;
 		if (!Number.isInteger(stderrLimit) || stderrLimit < 0) {
 			throw new RangeError("stderrLimit 必须是非负整数");
@@ -71,7 +94,8 @@ export class GitRunner {
 		const signal = combineAbortSignals(options.signal, context?.signal);
 		const budget = resolveTimeoutBudget(options.timeoutMs, context);
 		if (signal?.aborted === true) {
-			return killedResult({ aborted: true, timedOut: false });
+			const timedOut = isOperationTimeoutReason(signal.reason);
+			return killedResult({ aborted: !timedOut, timedOut });
 		}
 		if (budget.expired) {
 			return killedResult({ aborted: false, timedOut: true });
@@ -154,7 +178,7 @@ export class GitRunner {
 				if (forceKill) {
 					clearTimeout(forceKill);
 				}
-				untrackProcessGroup(child);
+				if (!terminationFailed) untrackProcessGroup(child);
 				signal?.removeEventListener("abort", onAbort);
 			};
 
@@ -183,6 +207,7 @@ export class GitRunner {
 					aborted,
 				};
 				if (terminationFailed) {
+					markProcessExitUnconfirmed();
 					reject(new GitRunError("git_termination_failed", "Git 进程组未能完全终止", result));
 					return;
 				}
@@ -206,6 +231,11 @@ export class GitRunner {
 					return;
 				}
 				closeResult = { code, signal: signalValue };
+				if (!killed && signalValue !== null) {
+					// 父进程被外部信号终止时也清理后代，避免其在失败返回后继续写入。
+					void forceTerminateProcessTree(child).then(finishTermination);
+					return;
+				}
 				if (!killed) {
 					terminationFinalized = true;
 				}
@@ -213,6 +243,7 @@ export class GitRunner {
 			});
 
 			signal?.addEventListener("abort", onAbort, { once: true });
+			if (signal?.aborted) onAbort();
 			timeout = setTimeout(() => terminate("timeout"), budget.timeoutMs);
 		});
 	}
@@ -237,7 +268,10 @@ async function forceTerminateProcessTree(child: ChildProcess): Promise<boolean> 
 				// 已经退出时无需处理。
 			}
 		}
-		return waitForProcessTreeExit(child, PROCESS_TREE_EXIT_TIMEOUT_MS);
+		if (taskkilled) return waitForProcessTreeExit(child, PROCESS_TREE_EXIT_TIMEOUT_MS);
+		await waitForProcessTreeExit(child, PROCESS_TREE_EXIT_TIMEOUT_MS);
+		// 只证明父进程退出不足以证明其后代退出。
+		return false;
 	}
 	signalProcessTree(child, "SIGKILL");
 	return waitForProcessTreeExit(child, PROCESS_TREE_EXIT_TIMEOUT_MS);
@@ -363,7 +397,21 @@ export interface SupervisedProcessResult {
  * native helper 等非 Git 子进程共用同一套进程组终止语义：超时/取消先终止进程组，
  * 确认退出后才返回，避免"已取消但仍在后台写入"。
  */
-export function runSupervisedProcess(request: SupervisedProcessRequest): Promise<SupervisedProcessResult> {
+export async function runSupervisedProcess(request: SupervisedProcessRequest): Promise<SupervisedProcessResult> {
+	const started = performance.now();
+	let outcome = "failed";
+	let exitCode: number | null = null;
+	try {
+		const result = await superviseProcess(request);
+		outcome = result.stopped ? result.outcome : "process_exit_unconfirmed";
+		exitCode = result.code;
+		return result;
+	} finally {
+		reportProcessDiagnostic({ command: "native-helper", durationMs: Math.round(performance.now() - started), outcome, exitCode });
+	}
+}
+
+function superviseProcess(request: SupervisedProcessRequest): Promise<SupervisedProcessResult> {
 	if (!Number.isFinite(request.timeoutMs) || request.timeoutMs < 0) {
 		return Promise.reject(new RangeError("timeoutMs 必须是非负有限数字"));
 	}
@@ -412,7 +460,7 @@ export function runSupervisedProcess(request: SupervisedProcessRequest): Promise
 			if (timeout) {
 				clearTimeout(timeout);
 			}
-			untrackProcessGroup(child);
+			if (outcome === "exit" || stopped) untrackProcessGroup(child);
 			request.signal?.removeEventListener("abort", onAbort);
 		};
 
@@ -426,7 +474,7 @@ export function runSupervisedProcess(request: SupervisedProcessRequest): Promise
 				code: closeCode,
 				stdout: Buffer.concat(stdout),
 				stderr: Buffer.concat(stderr),
-				stopped: closeArrived || stopped,
+				stopped: outcome === "exit" ? closeArrived : stopped,
 			});
 		};
 
@@ -436,6 +484,7 @@ export function runSupervisedProcess(request: SupervisedProcessRequest): Promise
 			}
 			outcome = reason;
 			termination = terminateProcessTree(child).then((value) => {
+				if (!value) markProcessExitUnconfirmed();
 				stopped = value;
 				finish();
 				return value;
@@ -486,6 +535,7 @@ export function runSupervisedProcess(request: SupervisedProcessRequest): Promise
 		});
 
 		request.signal?.addEventListener("abort", onAbort, { once: true });
+		if (request.signal?.aborted) onAbort();
 		timeout = setTimeout(() => beginTermination("timeout"), request.timeoutMs);
 	});
 }
@@ -524,15 +574,16 @@ function resolveTimeoutBudget(
 	explicitTimeoutMs: number | undefined,
 	context: OperationContext | undefined,
 ): { readonly timeoutMs: number; readonly expired: boolean } {
+	const defaultTimeoutMs = configuredTimeout("PI_UNDO_GIT_TIMEOUT_MS", DEFAULT_GIT_TIMEOUT_MS);
 	if (context === undefined) {
-		return { timeoutMs: explicitTimeoutMs ?? DEFAULT_GIT_TIMEOUT_MS, expired: false };
+		return { timeoutMs: explicitTimeoutMs ?? defaultTimeoutMs, expired: false };
 	}
 	const remaining = context.deadline - Date.now();
 	if (remaining <= 0) {
 		return { timeoutMs: 0, expired: true };
 	}
 	const timeoutMs = explicitTimeoutMs === undefined
-		? Math.min(DEFAULT_GIT_TIMEOUT_MS, remaining)
+		? Math.min(defaultTimeoutMs, remaining)
 		: Math.min(explicitTimeoutMs, remaining);
 	return { timeoutMs, expired: false };
 }

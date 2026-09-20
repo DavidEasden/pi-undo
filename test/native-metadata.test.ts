@@ -22,7 +22,7 @@ afterEach(async () => {
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-describe("NativeMetadataInspector", () => {
+describe.skipIf(process.env.PI_UNDO_DISABLE_NATIVE === "1")("NativeMetadataInspector", () => {
 	it("严格解析 bigint metadata 并清理 request", async () => {
 		if (process.platform === "win32") return;
 		const helper = await executable(`

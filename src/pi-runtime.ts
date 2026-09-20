@@ -1,4 +1,5 @@
 import { join, resolve } from "node:path";
+import { writeJsonAtomic } from "./atomic-fs.ts";
 
 import type {
 	ExtensionAPI,
@@ -28,11 +29,17 @@ import { DurableCursorWriter, SessionState, type SessionEntrySource } from "./se
 import { SnapshotStore } from "./snapshot-store.ts";
 import { StatusReporter } from "./status-reporter.ts";
 import { WorkspaceLock } from "./workspace-lock.ts";
+import { allCompleted, checkOperation, configuredTimeout, currentOperationContext, isUnconfirmedExit, operationHasUnconfirmedExit, runWithOperationContext, withRecoveryBudget, type ProcessDiagnostic } from "./operation-context.ts";
 
 type ReadonlySessionManager = ExtensionContext["sessionManager"];
 
-export async function createPiUndoRuntime(context: ExtensionContext, pi: ExtensionAPI) {
+export function createPiUndoRuntime(context: ExtensionContext, pi: ExtensionAPI) {
+	return withRecoveryBudget(() => initializePiUndoRuntime(context, pi));
+}
+
+async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionAPI) {
 	const manager = context.sessionManager;
+	const reporter = new StatusReporter(context);
 	const sessionState = sessionStateFor(manager);
 	const sessionIdentity = await sessionState.getSessionIdentity() ?? volatileSessionIdentity(manager, context.cwd);
 	const privateRoot = join(manager.getSessionDir(), ".pi-undo");
@@ -145,7 +152,7 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 		if (finalizationFailure !== undefined) throw finalizationFailure;
 	};
 	const scheduleFinalization = (opId: string): void => {
-		finalizationQueue = finalizationQueue.then(async () => {
+		finalizationQueue = runWithOperationContext(undefined, () => finalizationQueue.then(() => withRecoveryBudget(async () => {
 			const lease = await workspaceLock.acquire(initialTopology.workspaceIdentity);
 			try {
 				const mutationJournal = journal.mutationJournal(opId);
@@ -165,9 +172,9 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 				});
 				await journal.markCommitted(opId);
 			} finally {
-				await lease.release();
+				if (!operationHasUnconfirmedExit()) await lease.release();
 			}
-		}).catch((error: unknown) => {
+		}))).catch((error: unknown) => {
 			finalizationFailure = error;
 		});
 	};
@@ -187,6 +194,9 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 		loadPending: () => journal.loadPending(),
 	};
 
+	const diagnostics: ProcessDiagnostic[] = [];
+	const phases: Array<{ phase: string; elapsedMs: number }> = [];
+	let operationStarted = 0;
 	const dependencies: ControllerDependencies = {
 		workspaceIdentity: initialTopology.workspaceIdentity,
 		sessionIdentity,
@@ -231,7 +241,7 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 		capture,
 		captureBaseline,
 		captureSafety: async (referenceManifestId, targetManifestId, scopePaths) => {
-			const [reference, target] = await Promise.all([
+			const [reference, target] = await allCompleted([
 				store.loadManifest(referenceManifestId),
 				store.loadManifest(targetManifestId),
 			]);
@@ -259,6 +269,30 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 		},
 		journal: transactionJournal,
 		clock: Date.now,
+		operationTimeoutMs: configuredTimeout("PI_UNDO_OPERATION_TIMEOUT_MS", 300_000),
+		onOperationStart: (opId) => {
+			operationStarted = performance.now();
+			diagnostics.length = 0;
+			phases.length = 0;
+			reporter.startOperation(opId);
+		},
+		onProgress: (phase) => {
+			reporter.setOperationPhase(phase);
+			if (phases.at(-1)?.phase === phase) return;
+			if (phases.length === 128) phases.shift();
+			phases.push({ phase, elapsedMs: Math.round(performance.now() - operationStarted) });
+		},
+		onProcess: (diagnostic) => {
+			if (diagnostics.length === 128) diagnostics.shift();
+			diagnostics.push(diagnostic);
+		},
+		onOperationEnd: async (opId, result) => {
+			const totalMs = Math.round(performance.now() - operationStarted);
+			if (totalMs < 1_000 && (result.code === "ok" || result.code === "noop")) return;
+			await writeJsonAtomic(join(privateRoot, "diagnostics", `${manager.getSessionId()}-latest.json`), {
+				schemaVersion: 1, opId, code: result.code, totalMs, phases, processes: diagnostics,
+			});
+		},
 	};
 	const startupRecovery = await workspaceLock.withLock(
 		initialTopology.workspaceIdentity,
@@ -272,11 +306,17 @@ export async function createPiUndoRuntime(context: ExtensionContext, pi: Extensi
 	});
 	return {
 		controller,
-		reporter: new StatusReporter(context),
+		reporter,
 		diffSource: store,
 		recovery: startupRecovery.kind === "locked"
 			? { reason: startupRecovery.reason, files: startupRecovery.files, opId: startupRecovery.opId }
 			: undefined,
+		async dispose(): Promise<void> {
+			await controller.dispose();
+			await finalizationQueue;
+			if (isUnconfirmedExit(finalizationFailure)) throw finalizationFailure;
+			reporter.endOperation();
+		},
 		setCommandContext(next: ExtensionCommandContext | undefined): void {
 			commandContext = next;
 		},
@@ -466,6 +506,24 @@ async function resolveTreeTarget(
 			undoStack: cursor.undoHead === null ? [] : checkpointFrontierById(manager, identity, cursor.undoHead),
 		};
 	}
+	// 用户输入前的控制条目/根叶可由可信 before checkpoint 证明。
+	const boundaries = new Map<string, { checkpoint: CheckpointRecord; physicalLeaf: string | null }>();
+	for (const value of manager.getEntries() as unknown[]) {
+		if (!isRecord(value) || value.type !== "custom" || value.customType !== "pi-undo:checkpoint" || typeof value.id !== "string") continue;
+		for (const checkpoint of sessionStateFor(manager, value.id).getCheckpoints(identity)) {
+			const beforeLeaf = entryParent(manager, checkpoint.userEntryId);
+			if (logicalLeafAt(manager, beforeLeaf) === logicalLeafId) boundaries.set(checkpoint.checkpointId, { checkpoint, physicalLeaf: beforeLeaf });
+		}
+	}
+	const beforeStates = [...boundaries.values()];
+	if (beforeStates.length > 0 && new Set(beforeStates.map(({ checkpoint }) => checkpoint.beforeManifestId)).size === 1) {
+		const boundary = beforeStates[0]!;
+		return {
+			logicalLeafId,
+			targetManifestId: boundary.checkpoint.beforeManifestId,
+			undoStack: sessionStateFor(manager, boundary.physicalLeaf).getCheckpoints(identity),
+		};
+	}
 	throw new Error("tree target 缺少精确的 checkpoint 边界");
 }
 
@@ -578,17 +636,23 @@ function volatileSessionIdentity(manager: ReadonlySessionManager, cwd: string): 
 
 async function waitForIdle(context: ExtensionCommandContext | undefined, deadlineMs: number): Promise<boolean> {
 	if (context === undefined) return false;
-	const remaining = Math.max(0, deadlineMs - Date.now());
+	checkOperation();
+	const operation = currentOperationContext();
+	const remaining = Math.max(0, Math.min(deadlineMs, operation?.deadline ?? Infinity) - Date.now());
 	let timeout: ReturnType<typeof setTimeout> | undefined;
+	let onAbort: (() => void) | undefined;
 	try {
 		return await Promise.race([
 			context.waitForIdle().then(() => true, () => false),
 			new Promise<boolean>((resolveTimeout) => {
 				timeout = setTimeout(() => resolveTimeout(false), remaining);
+				onAbort = () => resolveTimeout(false);
+				operation?.signal.addEventListener("abort", onAbort, { once: true });
 			}),
 		]);
 	} finally {
 		if (timeout !== undefined) clearTimeout(timeout);
+		if (onAbort !== undefined) operation?.signal.removeEventListener("abort", onAbort);
 	}
 }
 
