@@ -2,8 +2,9 @@ import { lstat, readdir, readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { checksum, topologyFingerprint } from "./encoding.ts";
-import { GitRunner } from "./git-runner.ts";
+import { GitRunError, GitRunner } from "./git-runner.ts";
 import type { DiscoveryRoot } from "./model.ts";
+import { checkOperation, OperationError, reportOperationProgress } from "./operation-context.ts";
 
 const DIRECTORY_SCAN_CONCURRENCY = 16;
 const GIT_POINTER_MAX_BYTES = 4096;
@@ -62,7 +63,10 @@ export class RootDiscovery {
 	}
 
 	async discover(workspaceRoot: string): Promise<RootTopology> {
+		checkOperation();
+		reportOperationProgress("discover_roots");
 		const workspaceIdentity = await canonicalWorkspaceRoot(workspaceRoot);
+		checkOperation();
 		const activeRoots = new Map<string, DiscoveredRoot>();
 		const outerRepository = await this.inspectRepository(workspaceIdentity, workspaceIdentity);
 		if (outerRepository.kind === "active") {
@@ -77,7 +81,10 @@ export class RootDiscovery {
 		}
 
 		await this.scanDirectory(workspaceIdentity, workspaceIdentity, activeRoots);
+		checkOperation();
+		reportOperationProgress("discover_gitlinks");
 		const gitlinkRoots = await this.discoverGitlinks(workspaceIdentity, activeRoots);
+		checkOperation();
 		const roots = buildRoots([...activeRoots.values(), ...gitlinkRoots.values()]);
 		return {
 			workspaceIdentity,
@@ -93,8 +100,11 @@ export class RootDiscovery {
 	): Promise<void> {
 		let level: Array<{ readonly path: string; readonly inspect: boolean }> = [{ path: directory, inspect: false }];
 		while (level.length > 0) {
+			checkOperation();
+			reportOperationProgress("scan_directories");
 			const next: Array<{ readonly path: string; readonly inspect: true }> = [];
 			for (let index = 0; index < level.length; index += DIRECTORY_SCAN_CONCURRENCY) {
+				checkOperation();
 				const children = await Promise.all(level.slice(index, index + DIRECTORY_SCAN_CONCURRENCY).map(
 					(candidate) => this.scanDirectoryNode(workspaceIdentity, candidate, activeRoots),
 				));
@@ -109,6 +119,7 @@ export class RootDiscovery {
 		candidate: { readonly path: string; readonly inspect: boolean },
 		activeRoots: Map<string, DiscoveredRoot>,
 	): Promise<Array<{ readonly path: string; readonly inspect: true }>> {
+		checkOperation();
 		if (!await isSafeDirectory(candidate.path, workspaceIdentity)) return [];
 		if (candidate.inspect) {
 			const inspection = await this.inspectRepository(candidate.path, workspaceIdentity);
@@ -124,6 +135,7 @@ export class RootDiscovery {
 			}
 			if (!await isSafeDirectory(candidate.path, workspaceIdentity)) return [];
 		}
+		checkOperation();
 		const entries = await readdir(candidate.path, { withFileTypes: true });
 		if (!await isSafeDirectory(candidate.path, workspaceIdentity)) return [];
 		return entries
@@ -208,6 +220,7 @@ export class RootDiscovery {
 	): Promise<Map<string, DiscoveredRoot>> {
 		const result = new Map<string, DiscoveredRoot>();
 		for (const root of activeRoots.values()) {
+			checkOperation();
 			if (!root.gitBacked || root.state !== "active") {
 				continue;
 			}
@@ -248,8 +261,19 @@ export class RootDiscovery {
 			const result = await this.git.run(["-c", "core.fsmonitor=false", ...args], {
 				env: cleanGitEnvironment(),
 			});
+			if (result.aborted || result.timedOut) {
+				// 取消/超时不应被当成"仓库损坏"；有 context 时在这里重新抛出具体原因。
+				checkOperation();
+			}
 			return result.killed ? null : result.stdout;
-		} catch {
+		} catch (error) {
+			if (error instanceof GitRunError && error.code === "git_termination_failed") {
+				// 无法证明子进程已停止：上层必须保留 lease 并走恢复，不能继续扫描。
+				throw error;
+			}
+			if (error instanceof OperationError) {
+				throw error;
+			}
 			return null;
 		}
 	}
@@ -391,6 +415,7 @@ async function gitlinkState(absolutePath: string): Promise<DiscoveryRoot["state"
 const SKELETON_NOISE_FILES = new Set([".DS_Store", "desktop.ini", "Thumbs.db"]);
 
 async function directoryTreeContainsFile(directory: string): Promise<boolean> {
+	checkOperation();
 	let entries;
 	try {
 		entries = await readdir(directory, { withFileTypes: true });

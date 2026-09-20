@@ -22,6 +22,7 @@ import type {
 } from "./model.ts";
 import type { NativeMetadataEntry, NativeMetadataPort } from "./native-metadata.ts";
 import { NativeMetadataInspector } from "./native-metadata.ts";
+import { operationProcessOptions } from "./operation-context.ts";
 import { assertNoSymlinkEscape, assertNoSymlinkParents, pathSetsOverlap, relativeSafePath } from "./path-safety.ts";
 import { RootDiscovery, type RootTopology } from "./root-discovery.ts";
 import { WorkspaceLock } from "./workspace-lock.ts";
@@ -1668,7 +1669,7 @@ export class SnapshotStore {
 	}
 
 	private async runGit(args: readonly string[], options: GitRunOptions = {}): Promise<string> {
-		const result = await this.git.run(args, options);
+		const result = await this.git.run(args, injectOperationBudget(options));
 		if (result.killed) {
 			throw new SnapshotStoreError("capture_failed", "Git 命令未正常结束");
 		}
@@ -1676,7 +1677,7 @@ export class SnapshotStore {
 	}
 
 	private async runGitBytes(args: readonly string[], options: GitRunOptions = {}): Promise<Uint8Array> {
-		const result = await this.git.run(args, options);
+		const result = await this.git.run(args, injectOperationBudget(options));
 		if (result.killed) {
 			throw new SnapshotStoreError("capture_failed", "Git 命令未正常结束");
 		}
@@ -1964,6 +1965,17 @@ function rootStoreId(root: RootTopologyIdentity): string {
 		sourceIdentity: root.sourceIdentity,
 		privateRepositoryId: root.privateRepositoryId,
 	}));
+}
+
+/** 为 GitRunner 调用注入 operation 预算：调用方 budget 优先，否则取当前 context 的剩余预算。 */
+function injectOperationBudget(options: GitRunOptions): GitRunOptions {
+	if (options.timeoutMs !== undefined) return options;
+	const budget = operationProcessOptions();
+	return {
+		...options,
+		timeoutMs: budget.timeoutMs,
+		...(options.signal === undefined && budget.signal !== undefined ? { signal: budget.signal } : {}),
+	};
 }
 
 function privateGitEnvironment(

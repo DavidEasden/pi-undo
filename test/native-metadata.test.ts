@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { NativeMetadataInspector } from "../src/native-metadata.ts";
+import { createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
 
 const roots: string[] = [];
 
@@ -104,5 +105,46 @@ else { console.error("unsafe parent"); process.exit(2); }
 		const inspector = new NativeMetadataInspector(helper.path);
 		await expect(inspector.inspect(helper.root, ["a.txt"], helper.root))
 			.rejects.toThrow("native metadata inspect 失败：unsafe parent");
+	});
+
+	it("context 取消时终止挂起的 inspect 进程并清理 request", async () => {
+		if (process.platform === "win32") return;
+		const helper = await executable(`
+const action = process.argv[2];
+if (action === "--capabilities") console.log(JSON.stringify({ ok: true, capabilities: ["inspect-v1"] }));
+else { setTimeout(() => {}, 30000); }
+`);
+		const inspector = new NativeMetadataInspector(helper.path);
+		const scope = createOperationScope();
+		const pending = runWithOperationContext(
+			scope.context,
+			() => inspector.inspect(helper.root, ["a.txt"], helper.root),
+		);
+		setTimeout(() => scope.cancel(), 50);
+		try {
+			await expect(pending).rejects.toMatchObject({ code: "operation_cancelled" });
+			expect((await readdir(helper.root)).sort()).toEqual(["helper.mjs"]);
+		} finally {
+			scope.dispose();
+		}
+	});
+
+	it("已取消的 context 在写出 request 之前失败", async () => {
+		if (process.platform === "win32") return;
+		const helper = await executable(`
+const action = process.argv[2];
+if (action === "--capabilities") console.log(JSON.stringify({ ok: true, capabilities: ["inspect-v1"] }));
+else { console.log(JSON.stringify({ ok: true, processed: 1, entries: [{ path: "a.txt", kind: "absent" }] })); }
+`);
+		const inspector = new NativeMetadataInspector(helper.path);
+		const scope = createOperationScope();
+		scope.cancel();
+		try {
+			await expect(runWithOperationContext(scope.context, () => inspector.inspect(helper.root, ["a.txt"], helper.root)))
+				.rejects.toMatchObject({ code: "operation_cancelled" });
+			expect((await readdir(helper.root)).sort()).toEqual(["helper.mjs"]);
+		} finally {
+			scope.dispose();
+		}
 	});
 });

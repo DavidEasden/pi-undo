@@ -6,6 +6,8 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it } from "vitest";
+import { GitRunError, GitRunner, type GitRunResult } from "../src/git-runner.ts";
+import { createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
 import { RootDiscovery } from "../src/root-discovery.ts";
 import { WorkspaceLock, workspaceLockPath } from "../src/workspace-lock.ts";
 import {
@@ -37,6 +39,12 @@ async function waitUntil(predicate: () => boolean | Promise<boolean>): Promise<v
 			throw new Error("等待测试条件超时");
 		}
 		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+}
+
+class TerminatingGitRunner extends GitRunner {
+	override run(): Promise<GitRunResult> {
+		return Promise.reject(new GitRunError("git_termination_failed", "注入的未确认终止"));
 	}
 }
 
@@ -255,6 +263,63 @@ describe("RootDiscovery", () => {
 
 		expect(afterAdd.fingerprint).not.toBe(before.fingerprint);
 		expect(afterRemove.fingerprint).not.toBe(afterAdd.fingerprint);
+	});
+
+	it("已取消的 context 立即抛出 operation_cancelled", async () => {
+		const outer = await createGitRepo();
+		temporaryRoots.push(outer.root);
+		const scope = createOperationScope();
+		scope.cancel();
+		try {
+			await expect(runWithOperationContext(scope.context, () => new RootDiscovery().discover(outer.root)))
+				.rejects.toMatchObject({ code: "operation_cancelled" });
+		} finally {
+			scope.dispose();
+		}
+	});
+
+	it("扫描循环中的取消会中断遍历并重抛，而不是当成不可读目录继续", async () => {
+		const outer = await createGitRepo();
+		temporaryRoots.push(outer.root);
+		await mkdir(join(outer.root, "packages", "child", "deeper"), { recursive: true });
+		const parent = new AbortController();
+		const scope = createOperationScope({
+			signal: parent.signal,
+			onProgress: (phase) => {
+				if (phase === "scan_directories") parent.abort();
+			},
+		});
+		try {
+			await expect(runWithOperationContext(scope.context, () => new RootDiscovery().discover(outer.root)))
+				.rejects.toMatchObject({ code: "operation_cancelled" });
+		} finally {
+			scope.dispose();
+		}
+	});
+
+	it("在遍历中报告可读阶段", async () => {
+		const outer = await createGitRepo();
+		temporaryRoots.push(outer.root);
+		await createNestedRepo(outer.root, "packages/child");
+		const phases: string[] = [];
+		const scope = createOperationScope({ onProgress: (phase) => phases.push(phase) });
+		try {
+			await runWithOperationContext(scope.context, () => new RootDiscovery().discover(outer.root));
+		} finally {
+			scope.dispose();
+		}
+
+		expect(phases).toContain("discover_roots");
+		expect(phases).toContain("scan_directories");
+		expect(phases).toContain("discover_gitlinks");
+	});
+
+	it("无法确认 Git 子进程停止时向上传递，而不是降级为 broken root", async () => {
+		const outer = await createGitRepo();
+		temporaryRoots.push(outer.root);
+
+		await expect(new RootDiscovery(new TerminatingGitRunner()).discover(outer.root))
+			.rejects.toMatchObject({ code: "git_termination_failed" });
 	});
 });
 

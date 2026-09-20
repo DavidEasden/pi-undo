@@ -1,13 +1,16 @@
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { access, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import { GitRunError, runSupervisedProcess } from "./git-runner.ts";
+import { OperationError, type OperationProcessOptions, operationProcessOptions } from "./operation-context.ts";
 import { nativeExecutable } from "./native-restore.ts";
 
 const NATIVE_INSPECT_TIMEOUT_MS = 30_000;
 const NATIVE_INSPECT_OUTPUT_LIMIT = 32 * 1024 * 1024;
+const NATIVE_PROBE_TIMEOUT_MS = 5_000;
+const NATIVE_PROBE_OUTPUT_LIMIT = 64 * 1024;
 
 export interface NativeMetadataEntry {
 	readonly path: string;
@@ -43,6 +46,8 @@ export class NativeMetadataInspector implements NativeMetadataPort {
 		requestDirectory: string,
 	): Promise<readonly NativeMetadataEntry[] | undefined> {
 		if (paths.length === 0) return [];
+		// 已取消/超时的操作不启动新的 helper，也不写出请求文件。
+		const budget = operationProcessOptions(NATIVE_INSPECT_TIMEOUT_MS);
 		if (!await this.supportsInspect(requestDirectory)) return undefined;
 		const executable = this.executable!;
 		const requestPath = join(requestDirectory, `native-inspect-${process.pid}-${randomUUID()}.json`);
@@ -52,7 +57,7 @@ export class NativeMetadataInspector implements NativeMetadataPort {
 				workspaceRoot,
 				paths,
 			}), { mode: 0o600, flag: "wx" });
-			return await runNativeInspect(executable, requestPath, paths);
+			return await runNativeInspect(executable, requestPath, paths, budget);
 		} finally {
 			await rm(requestPath, { force: true }).catch(() => {});
 		}
@@ -73,100 +78,55 @@ export class NativeMetadataInspector implements NativeMetadataPort {
 	}
 }
 
-function probeNativeInspect(executable: string, isolatedDirectory: string): Promise<boolean> {
-	return new Promise((resolve) => {
-		const child = spawn(executable, ["--capabilities"], {
+async function probeNativeInspect(executable: string, isolatedDirectory: string): Promise<boolean> {
+	try {
+		const result = await runSupervisedProcess({
+			command: executable,
+			args: ["--capabilities"],
 			cwd: isolatedDirectory,
-			shell: false,
-			stdio: ["ignore", "pipe", "ignore"],
-			windowsHide: true,
+			timeoutMs: NATIVE_PROBE_TIMEOUT_MS,
+			outputLimitBytes: NATIVE_PROBE_OUTPUT_LIMIT,
+			outputOverflow: "terminate",
 		});
-		const stdout: Buffer[] = [];
-		let bytes = 0;
-		let settled = false;
-		const timeout = setTimeout(() => child.kill("SIGKILL"), 5_000);
-		child.stdout?.on("data", (chunk: Buffer | string) => {
-			const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-			bytes += value.length;
-			if (bytes <= 64 * 1024) stdout.push(value);
-			else child.kill("SIGKILL");
-		});
-		child.once("error", () => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			resolve(false);
-		});
-		child.once("close", (code) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			if (code !== 0 || bytes > 64 * 1024) return resolve(false);
-			try {
-				const value: unknown = JSON.parse(Buffer.concat(stdout).toString("utf8"));
-				resolve(isRecord(value) && value.ok === true && Array.isArray(value.capabilities) &&
-					value.capabilities.includes("inspect-v1"));
-			} catch {
-				resolve(false);
-			}
-		});
-	});
+		if (!result.stopped || result.outcome !== "exit" || result.code !== 0) return false;
+		const value: unknown = JSON.parse(result.stdout.toString("utf8"));
+		return isRecord(value) && value.ok === true && Array.isArray(value.capabilities) &&
+			value.capabilities.includes("inspect-v1");
+	} catch {
+		return false;
+	}
 }
 
-function runNativeInspect(
+async function runNativeInspect(
 	executable: string,
 	requestPath: string,
 	expectedPaths: readonly string[],
+	budget: OperationProcessOptions,
 ): Promise<readonly NativeMetadataEntry[]> {
-	return new Promise((resolve, reject) => {
-		const child = spawn(executable, ["--inspect", requestPath], {
-			shell: false,
-			stdio: ["ignore", "pipe", "pipe"],
-			windowsHide: true,
-		});
-		const stdout: Buffer[] = [];
-		const stderr: Buffer[] = [];
-		let outputBytes = 0;
-		let settled = false;
-		let overflow = false;
-		const timeout = setTimeout(() => child.kill("SIGKILL"), NATIVE_INSPECT_TIMEOUT_MS);
-		const capture = (target: Buffer[]) => (chunk: Buffer | string): void => {
-			const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-			if (outputBytes + bytes.length > NATIVE_INSPECT_OUTPUT_LIMIT) {
-				overflow = true;
-				child.kill("SIGKILL");
-				return;
-			}
-			target.push(bytes);
-			outputBytes += bytes.length;
-		};
-		child.stdout?.on("data", capture(stdout));
-		child.stderr?.on("data", capture(stderr));
-		child.once("error", (error) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			reject(error);
-		});
-		child.once("close", (code) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			if (overflow) {
-				reject(new Error("native metadata inspect 输出超过限制"));
-				return;
-			}
-			if (code !== 0) {
-				reject(new Error(`native metadata inspect 失败：${Buffer.concat(stderr).toString("utf8").trim()}`));
-				return;
-			}
-			try {
-				resolve(parseInspectResponse(Buffer.concat(stdout).toString("utf8"), expectedPaths));
-			} catch (error) {
-				reject(error);
-			}
-		});
+	const result = await runSupervisedProcess({
+		command: executable,
+		args: ["--inspect", requestPath],
+		signal: budget.signal,
+		timeoutMs: budget.timeoutMs,
+		outputLimitBytes: NATIVE_INSPECT_OUTPUT_LIMIT,
+		outputOverflow: "terminate",
 	});
+	if (!result.stopped) {
+		throw new GitRunError("git_termination_failed", "native metadata inspect 进程未能确认终止");
+	}
+	if (result.outcome === "cancelled") {
+		throw new OperationError("operation_cancelled", "native metadata inspect 已被取消");
+	}
+	if (result.outcome === "timeout") {
+		throw new OperationError("operation_timeout", "native metadata inspect 超时");
+	}
+	if (result.outcome === "output_overflow") {
+		throw new Error("native metadata inspect 输出超过限制");
+	}
+	if (result.code !== 0) {
+		throw new Error(`native metadata inspect 失败：${result.stderr.toString("utf8").trim()}`);
+	}
+	return parseInspectResponse(result.stdout.toString("utf8"), expectedPaths);
 }
 
 function parseInspectResponse(text: string, expectedPaths: readonly string[]): readonly NativeMetadataEntry[] {

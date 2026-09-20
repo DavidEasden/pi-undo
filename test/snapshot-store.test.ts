@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { canonicalJson, checksum, ignoredPresentClosure } from "../src/encoding.ts";
 import { GitRunner, type GitRunOptions, type GitRunResult } from "../src/git-runner.ts";
 import type { ManifestId, SnapshotManifest } from "../src/model.ts";
+import { createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
 import { RootDiscovery, type RootTopology } from "../src/root-discovery.ts";
 import { SnapshotStore } from "../src/snapshot-store.ts";
 import { WorkspaceLock } from "../src/workspace-lock.ts";
@@ -249,6 +250,35 @@ async function publishManifestWithIgnoredPath(
 }
 
 describe("SnapshotStore", () => {
+	it("capture 内的 Git 调用注入 operation 默认预算与取消信号", async () => {
+		const repository = await createGitRepo();
+		temporaryRoots.push(repository.root);
+		await writeFixtureFile(repository.root, "a.txt", "内容A\n");
+		await runGit(repository.root, ["add", "a.txt"]);
+		await runGit(repository.root, ["commit", "-m", "init"]);
+		const topology = await new RootDiscovery().discover(repository.root);
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		const git = new RecordingGitRunner();
+		const store = new SnapshotStore({ storeRoot, git, discovery: new RootDiscovery(git) });
+
+		const scope = createOperationScope({ timeoutMs: 60_000 });
+		try {
+			await runWithOperationContext(
+				scope.context,
+				() => store.capture(topology, undefined, { topologyAlreadyValidated: true }),
+			);
+		} finally {
+			scope.dispose();
+		}
+
+		const budgets = git.calls
+			.map((call) => call.options?.timeoutMs)
+			.filter((value): value is number => value !== undefined);
+		expect(budgets.length).toBeGreaterThan(0);
+		expect(budgets.every((value) => value > 0 && value <= 60_000)).toBe(true);
+		expect(git.calls.some((call) => call.options?.signal === scope.context.signal)).toBe(true);
+	});
+
 	it("storeRoot 位于 workspace 内时拒绝且不留下目录", async () => {
 		const workspace = await temporaryRoot("pi-undo-snapshot-");
 		await writeFixtureFile(workspace, "file.txt", "content\n");

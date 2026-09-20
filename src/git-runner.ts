@@ -1,9 +1,14 @@
 import { spawn, type ChildProcess } from "node:child_process";
 
+import { type OperationContext, currentOperationContext, isOperationTimeoutReason } from "./operation-context.ts";
+
 export const DEFAULT_STDERR_LIMIT = 64 * 1024;
+/** Git 单次调用的默认预算；调用链上的 deadline 可进一步收紧它。 */
+export const DEFAULT_GIT_TIMEOUT_MS = 120_000;
 const TERMINATION_GRACE_MS = 50;
 const PROCESS_TREE_EXIT_TIMEOUT_MS = 1_000;
 const PROCESS_TREE_POLL_MS = 10;
+const TASKKILL_TIMEOUT_MS = 5_000;
 const activeProcessGroups = new Set<number>();
 
 process.once("exit", () => {
@@ -62,16 +67,14 @@ export class GitRunner {
 		if (options.timeoutMs !== undefined && (!Number.isFinite(options.timeoutMs) || options.timeoutMs < 0)) {
 			throw new RangeError("timeoutMs 必须是非负有限数字");
 		}
-		if (options.signal?.aborted) {
-			return {
-				stdout: "",
-				stdoutBytes: new Uint8Array(),
-				stderr: "",
-				code: null,
-				killed: true,
-				timedOut: false,
-				aborted: true,
-			};
+		const context = currentOperationContext();
+		const signal = combineAbortSignals(options.signal, context?.signal);
+		const budget = resolveTimeoutBudget(options.timeoutMs, context);
+		if (signal?.aborted === true) {
+			return killedResult({ aborted: true, timedOut: false });
+		}
+		if (budget.expired) {
+			return killedResult({ aborted: false, timedOut: true });
 		}
 
 		return new Promise<GitRunResult>((resolve, reject) => {
@@ -121,6 +124,12 @@ export class GitRunner {
 				child.stdin?.end(typeof options.stdin === "string" ? options.stdin : Buffer.from(options.stdin));
 			}
 
+			const finishTermination = (stopped: boolean): void => {
+				terminationFailed = !stopped;
+				terminationFinalized = true;
+				finish();
+			};
+
 			const terminate = (reason: "timeout" | "abort"): void => {
 				if (settled || killed) {
 					return;
@@ -129,21 +138,14 @@ export class GitRunner {
 				timedOut = reason === "timeout";
 				aborted = reason === "abort";
 				signalProcessTree(child, "SIGTERM");
+				// 宽限期后升级为 SIGKILL，并确认进程组真的退出；只有确认后才结束 Promise，
+				// 否则上层无法安全释放 lease。
 				forceKill = setTimeout(() => {
-					void forceTerminateProcessTree(child).then((stopped) => {
-						terminationFailed = !stopped;
-						terminationFinalized = true;
-						finish();
-					});
+					void forceTerminateProcessTree(child).then(finishTermination);
 				}, TERMINATION_GRACE_MS);
 			};
 
-			const onAbort = (): void => terminate("abort");
-			options.signal?.addEventListener("abort", onAbort, { once: true });
-			if (options.timeoutMs !== undefined) {
-				timeout = setTimeout(() => terminate("timeout"), options.timeoutMs);
-			}
-
+			const onAbort = (): void => terminate(isOperationTimeoutReason(signal?.reason) ? "timeout" : "abort");
 			const cleanUp = (): void => {
 				settled = true;
 				if (timeout) {
@@ -153,21 +155,30 @@ export class GitRunner {
 					clearTimeout(forceKill);
 				}
 				untrackProcessGroup(child);
-				options.signal?.removeEventListener("abort", onAbort);
+				signal?.removeEventListener("abort", onAbort);
 			};
 
 			const finish = (): void => {
-				if (settled || closeResult === undefined || (killed && !terminationFinalized)) {
+				if (settled) {
+					return;
+				}
+				// 被终止时先等终止确认；确认进程组已退出后即便 close 一直不到达也必须结束，
+				// 避免强杀后无限等待 close。
+				if (killed && !terminationFinalized) {
+					return;
+				}
+				if (closeResult === undefined && !terminationFinalized) {
 					return;
 				}
 				cleanUp();
+				const exit = closeResult ?? { code: null, signal: null };
 				const stdoutBuffer = Buffer.concat(stdout);
 				const result: GitRunResult = {
 					stdout: stdoutBuffer.toString("utf8"),
 					stdoutBytes: new Uint8Array(stdoutBuffer),
 					stderr: Buffer.concat(stderr).toString("utf8"),
-					code: closeResult.code,
-					killed: killed || closeResult.signal !== null,
+					code: exit.code,
+					killed: killed || exit.signal !== null,
 					timedOut,
 					aborted,
 				};
@@ -175,8 +186,8 @@ export class GitRunner {
 					reject(new GitRunError("git_termination_failed", "Git 进程组未能完全终止", result));
 					return;
 				}
-				if (!killed && closeResult.code !== 0) {
-					reject(new GitRunError("git_failed", `git 退出码为 ${String(closeResult.code)}`, result));
+				if (!killed && exit.code !== 0) {
+					reject(new GitRunError("git_failed", `git 退出码为 ${String(exit.code)}`, result));
 					return;
 				}
 				resolve(result);
@@ -190,56 +201,104 @@ export class GitRunner {
 				reject(new GitRunError("git_spawn_failed", error.message));
 			});
 
-			child.once("close", (code, signal) => {
+			child.once("close", (code, signalValue) => {
 				if (settled) {
 					return;
 				}
-				closeResult = { code, signal };
+				closeResult = { code, signal: signalValue };
 				if (!killed) {
 					terminationFinalized = true;
 				}
 				finish();
 			});
+
+			signal?.addEventListener("abort", onAbort, { once: true });
+			timeout = setTimeout(() => terminate("timeout"), budget.timeoutMs);
 		});
 	}
 }
 
+/** 终止共享子进程：先 SIGTERM，宽限期后 SIGKILL，并返回进程组是否已确认退出。 */
+async function terminateProcessTree(child: ChildProcess): Promise<boolean> {
+	signalProcessTree(child, "SIGTERM");
+	if (await waitForProcessTreeExit(child, TERMINATION_GRACE_MS)) {
+		return true;
+	}
+	return forceTerminateProcessTree(child);
+}
+
 async function forceTerminateProcessTree(child: ChildProcess): Promise<boolean> {
 	if (process.platform === "win32" && child.pid !== undefined) {
-		await runTaskkill(child.pid, child);
-		return true;
+		const taskkilled = await runTaskkill(child.pid);
+		if (!taskkilled) {
+			try {
+				child.kill("SIGKILL");
+			} catch {
+				// 已经退出时无需处理。
+			}
+		}
+		return waitForProcessTreeExit(child, PROCESS_TREE_EXIT_TIMEOUT_MS);
 	}
 	signalProcessTree(child, "SIGKILL");
-	if (child.pid === undefined) {
-		return true;
-	}
-	const deadline = Date.now() + PROCESS_TREE_EXIT_TIMEOUT_MS;
-	while (processGroupExists(child.pid)) {
+	return waitForProcessTreeExit(child, PROCESS_TREE_EXIT_TIMEOUT_MS);
+}
+
+async function waitForProcessTreeExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		if (processTreeExitConfirmed(child)) {
+			return true;
+		}
 		if (Date.now() >= deadline) {
 			return false;
 		}
 		await delay(PROCESS_TREE_POLL_MS);
 	}
-	return true;
 }
 
-function runTaskkill(pid: number, child: ChildProcess): Promise<void> {
+function processTreeExitConfirmed(child: ChildProcess): boolean {
+	if (process.platform === "win32") {
+		return child.exitCode !== null || child.signalCode !== null;
+	}
+	if (child.pid === undefined) {
+		return true;
+	}
+	return !processGroupExists(child.pid);
+}
+
+function runTaskkill(pid: number): Promise<boolean> {
 	return new Promise((resolve) => {
-		const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
-			stdio: "ignore",
-			windowsHide: true,
-		});
+		let child: ChildProcess;
+		try {
+			child = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
+				stdio: "ignore",
+				windowsHide: true,
+			});
+		} catch {
+			resolve(false);
+			return;
+		}
 		let settled = false;
-		const finish = (): void => {
-			if (settled) return;
+		const finish = (killed: boolean): void => {
+			if (settled) {
+				return;
+			}
 			settled = true;
-			resolve();
+			clearTimeout(timeout);
+			resolve(killed);
 		};
-		killer.once("error", () => {
-			child.kill("SIGKILL");
-			finish();
-		});
-		killer.once("close", finish);
+		// taskkill 本身也可能挂住；超时后放弃它并回退到直接 SIGKILL。
+		const timeout = setTimeout(() => {
+			try {
+				child.kill("SIGKILL");
+			} catch {
+				// 已经退出时无需处理。
+			}
+			finish(false);
+		}, TASKKILL_TIMEOUT_MS);
+		timeout.unref();
+		child.once("error", () => finish(false));
+		child.once("close", (code) => finish(code === 0));
 	});
 }
 
@@ -279,8 +338,203 @@ function signalProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
 	child.kill(signal);
 }
 
+export interface SupervisedProcessRequest {
+	readonly command: string;
+	readonly args: readonly string[];
+	readonly cwd?: string;
+	readonly env?: Readonly<Record<string, string | undefined>>;
+	readonly signal?: AbortSignal;
+	readonly timeoutMs: number;
+	readonly outputLimitBytes: number;
+	/** 输出超过限制时：truncate 只停止捕获，terminate 先终止进程组。 */
+	readonly outputOverflow?: "truncate" | "terminate";
+}
+
+export interface SupervisedProcessResult {
+	readonly outcome: "exit" | "timeout" | "cancelled" | "output_overflow";
+	readonly code: number | null;
+	readonly stdout: Buffer;
+	readonly stderr: Buffer;
+	/** 非 exit 结果下进程组是否已确认退出；false 表示调用方必须保留 lease。 */
+	readonly stopped: boolean;
+}
+
+/**
+ * native helper 等非 Git 子进程共用同一套进程组终止语义：超时/取消先终止进程组，
+ * 确认退出后才返回，避免"已取消但仍在后台写入"。
+ */
+export function runSupervisedProcess(request: SupervisedProcessRequest): Promise<SupervisedProcessResult> {
+	if (!Number.isFinite(request.timeoutMs) || request.timeoutMs < 0) {
+		return Promise.reject(new RangeError("timeoutMs 必须是非负有限数字"));
+	}
+	if (!Number.isInteger(request.outputLimitBytes) || request.outputLimitBytes < 0) {
+		return Promise.reject(new RangeError("outputLimitBytes 必须是非负整数"));
+	}
+	if (request.signal?.aborted === true) {
+		return Promise.resolve({
+			outcome: "cancelled",
+			code: null,
+			stdout: Buffer.alloc(0),
+			stderr: Buffer.alloc(0),
+			stopped: true,
+		});
+	}
+	return new Promise<SupervisedProcessResult>((resolve, reject) => {
+		let child: ChildProcess;
+		try {
+			child = spawn(request.command, [...request.args], {
+				cwd: request.cwd,
+				env: mergeEnvironment(request.env),
+				detached: process.platform !== "win32",
+				shell: false,
+				stdio: ["ignore", "pipe", "pipe"],
+				windowsHide: true,
+			});
+		} catch (error) {
+			reject(error);
+			return;
+		}
+		trackProcessGroup(child);
+
+		const stdout: Buffer[] = [];
+		const stderr: Buffer[] = [];
+		let outputBytes = 0;
+		let outcome: SupervisedProcessResult["outcome"] = "exit";
+		let closeCode: number | null = null;
+		let closeArrived = false;
+		let stopped = false;
+		let settled = false;
+		let timeout: NodeJS.Timeout | undefined;
+		let termination: Promise<boolean> | undefined;
+
+		const cleanUp = (): void => {
+			settled = true;
+			if (timeout) {
+				clearTimeout(timeout);
+			}
+			untrackProcessGroup(child);
+			request.signal?.removeEventListener("abort", onAbort);
+		};
+
+		const finish = (): void => {
+			if (settled) {
+				return;
+			}
+			cleanUp();
+			resolve({
+				outcome,
+				code: closeCode,
+				stdout: Buffer.concat(stdout),
+				stderr: Buffer.concat(stderr),
+				stopped: closeArrived || stopped,
+			});
+		};
+
+		const beginTermination = (reason: SupervisedProcessResult["outcome"]): void => {
+			if (settled || termination !== undefined || outcome !== "exit") {
+				return;
+			}
+			outcome = reason;
+			termination = terminateProcessTree(child).then((value) => {
+				stopped = value;
+				finish();
+				return value;
+			});
+		};
+
+		function onAbort(): void {
+			beginTermination("cancelled");
+		}
+
+		const capture = (target: Buffer[]) => (chunk: Buffer | string): void => {
+			if (settled) {
+				return;
+			}
+			const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+			const remaining = request.outputLimitBytes - outputBytes;
+			if (bytes.length > remaining) {
+				if (remaining > 0) {
+					target.push(bytes.subarray(0, remaining));
+					outputBytes += remaining;
+				}
+				if (request.outputOverflow === "terminate") {
+					beginTermination("output_overflow");
+				} else {
+					outputBytes = request.outputLimitBytes;
+				}
+				return;
+			}
+			target.push(bytes);
+			outputBytes += bytes.length;
+		};
+		child.stdout?.on("data", capture(stdout));
+		child.stderr?.on("data", capture(stderr));
+
+		child.once("error", (error) => {
+			if (settled) {
+				return;
+			}
+			cleanUp();
+			reject(error);
+		});
+		child.once("close", (code) => {
+			closeCode = code;
+			closeArrived = true;
+			if (termination === undefined) {
+				finish();
+			}
+		});
+
+		request.signal?.addEventListener("abort", onAbort, { once: true });
+		timeout = setTimeout(() => beginTermination("timeout"), request.timeoutMs);
+	});
+}
+
 export function createGitRunner(): GitRunner {
 	return new GitRunner();
+}
+
+function killedResult(options: { readonly aborted: boolean; readonly timedOut: boolean }): GitRunResult {
+	return {
+		stdout: "",
+		stdoutBytes: new Uint8Array(),
+		stderr: "",
+		code: null,
+		killed: true,
+		timedOut: options.timedOut,
+		aborted: options.aborted,
+	};
+}
+
+/** context.signal 与调用方 signal 都要能终止子进程；两者取并集。 */
+function combineAbortSignals(
+	own: AbortSignal | undefined,
+	context: AbortSignal | undefined,
+): AbortSignal | undefined {
+	if (own === undefined) {
+		return context;
+	}
+	if (context === undefined || own === context) {
+		return own;
+	}
+	return AbortSignal.any([own, context]);
+}
+
+function resolveTimeoutBudget(
+	explicitTimeoutMs: number | undefined,
+	context: OperationContext | undefined,
+): { readonly timeoutMs: number; readonly expired: boolean } {
+	if (context === undefined) {
+		return { timeoutMs: explicitTimeoutMs ?? DEFAULT_GIT_TIMEOUT_MS, expired: false };
+	}
+	const remaining = context.deadline - Date.now();
+	if (remaining <= 0) {
+		return { timeoutMs: 0, expired: true };
+	}
+	const timeoutMs = explicitTimeoutMs === undefined
+		? Math.min(DEFAULT_GIT_TIMEOUT_MS, remaining)
+		: Math.min(explicitTimeoutMs, remaining);
+	return { timeoutMs, expired: false };
 }
 
 function mergeEnvironment(overrides: Readonly<Record<string, string | undefined>> | undefined): NodeJS.ProcessEnv {

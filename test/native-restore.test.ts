@@ -1,16 +1,26 @@
-import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createDurablePack } from "../src/durable-pack.ts";
 import { MutationJournal } from "../src/mutation-journal.ts";
 import { createNativeFileBatch } from "../src/native-restore.ts";
+import { createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
 import { recoverPackedMutations } from "../src/packed-recovery.ts";
 import { fingerprintAbsent, fingerprintBytes } from "../src/quarantine.ts";
 
 const roots: string[] = [];
+
+async function hangingHelper(marker: string): Promise<string> {
+	const root = await mkdtemp(join(tmpdir(), "pi-undo-native-hang-"));
+	roots.push(root);
+	const path = join(root, "helper");
+	await writeFile(path, `#!/bin/sh\n(sleep 0.3; touch "${marker}") >/dev/null 2>&1 &\nsleep 30\n`);
+	await chmod(path, 0o755);
+	return path;
+}
 
 async function fixture() {
 	const root = await realpath(await mkdtemp(join(tmpdir(), "pi-undo-native-restore-")));
@@ -130,5 +140,48 @@ describe("native restore helper", () => {
 		})).resolves.toEqual({ kind: "clean" });
 		await expect(lstat(join(root, ".pi-undo-q2-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-source")))
 			.rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it("context 取消时终止 native helper 进程组，不留下迟到写入", async () => {
+		const value = await fixture();
+		const marker = join(value.root, "late-write");
+		const native = await createNativeFileBatch({
+			workspaceRoot: value.root,
+			planDigest: value.planDigest,
+			journal: value.journal,
+			executable: await hangingHelper(marker),
+		});
+		if (native === undefined) return;
+		const scope = createOperationScope();
+		const pending = runWithOperationContext(scope.context, () => native.run(value.pack));
+		setTimeout(() => scope.cancel(), 50);
+		try {
+			await expect(pending).rejects.toMatchObject({ code: "operation_cancelled" });
+			await new Promise((resolve) => setTimeout(resolve, 500));
+			await expect(lstat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			scope.dispose();
+		}
+	});
+
+	it("已取消的 context 在写出 request 前结束", async () => {
+		const value = await fixture();
+		const native = await createNativeFileBatch({
+			workspaceRoot: value.root,
+			planDigest: value.planDigest,
+			journal: value.journal,
+			executable: await hangingHelper(join(value.root, "late-write")),
+		});
+		if (native === undefined) return;
+		const scope = createOperationScope();
+		scope.cancel();
+		try {
+			await expect(runWithOperationContext(scope.context, () => native.run(value.pack)))
+				.rejects.toMatchObject({ code: "operation_cancelled" });
+			const requestDirectory = dirname(value.journal.storagePath);
+			expect((await readdir(requestDirectory)).filter((name) => name.startsWith("native-request"))).toEqual([]);
+		} finally {
+			scope.dispose();
+		}
 	});
 });
