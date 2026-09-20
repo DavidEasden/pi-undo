@@ -19,7 +19,7 @@ Each completed agent run creates a checkpoint that captures both the Pi session 
 
 ## Requirements
 
-- Pi `0.80.10` 或更高版本（已在 0.84.4 上验证）。
+- Pi `0.86.1` 或更高版本（已在 0.86.1 上验证）。`0.84.4` 及更早版本不再受支持，也不在 CI 中测试：早期版本的会话树与扩展生命周期行为不同，不保证撤回语义正确。
 - Node.js `22.19.0` or later.
 - Git available on `PATH` (used internally for content-addressed snapshots).
 

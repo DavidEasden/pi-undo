@@ -39,22 +39,23 @@
 	"scripts": {
 		"test": "vitest run",
 		"test:watch": "vitest",
-		"test:integration": "vitest run test/extension.integration.test.ts test/pi-runtime.test.ts",
+		"test:integration": "vitest run test/extension.integration.test.ts test/pi-runtime.test.ts test/pi-sdk.integration.test.ts",
 		"test:native": "cargo test --manifest-path native/pi-undo-fs/Cargo.toml && vitest run test/native-restore.test.ts test/durable-pack.test.ts test/packed-recovery.test.ts",
 		"build:native": "cargo build --release --manifest-path native/pi-undo-fs/Cargo.toml",
 		"typecheck": "tsc --noEmit",
 		"pack:dry-run": "npm pack --dry-run"
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": ">=0.80.10",
-		"@earendil-works/pi-tui": "*"
+		"@earendil-works/pi-coding-agent": ">=0.86.1",
+		"@earendil-works/pi-tui": ">=0.86.1"
 	},
 	"dependencies": {
 		"proper-lockfile": "4.1.2"
 	},
 	"devDependencies": {
-		"@earendil-works/pi-coding-agent": "0.84.4",
-		"@earendil-works/pi-tui": "0.84.4",
+		"@earendil-works/pi-ai": "0.86.1",
+		"@earendil-works/pi-coding-agent": "0.86.1",
+		"@earendil-works/pi-tui": "0.86.1",
 		"@types/node": "24.12.4",
 		"@types/proper-lockfile": "4.1.4",
 		"typescript": "5.9.3",
