@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { createDurablePack } from "../src/durable-pack.ts";
 import { MutationJournal } from "../src/mutation-journal.ts";
-import { createNativeFileBatch } from "../src/native-restore.ts";
+import { createNativeFileBatch, nativeRestoreCapability } from "../src/native-restore.ts";
 import { createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
 import { recoverPackedMutations } from "../src/packed-recovery.ts";
 import { fingerprintAbsent, fingerprintBytes } from "../src/quarantine.ts";
@@ -51,6 +51,40 @@ async function fixture() {
 	await writeFile(join(root, "a.txt"), source);
 	const native = await createNativeFileBatch({ workspaceRoot: root, planDigest, journal });
 	return { root, journal, planDigest, pack, native, source, target };
+}
+
+async function mixedFixture() {
+	const value = await fixture();
+	await mkdir(join(value.root, "src"));
+	const paths = ["src/changed.txt", "src/removed.txt", "src/added.txt"];
+	const pack = await createDurablePack(value.journal, {
+		opId: value.journal.operationId,
+		planDigest: value.planDigest,
+		entries: paths.map((path, index) => {
+			const sourceFingerprint = index === 2 ? fingerprintAbsent(path) : fingerprintBytes(path, value.source, 0o644);
+			const targetFingerprint = index === 1 ? fingerprintAbsent(path) : fingerprintBytes(path, value.target, 0o644);
+			const nonce = (index + 2).toString().repeat(32);
+			return {
+				path,
+				sourceArtifact: `src/.pi-undo-q2-${nonce}-source`,
+				targetArtifact: index === 1 ? null : `src/.pi-undo-q2-${nonce}-target`,
+				sourceFingerprint,
+				targetFingerprint,
+				variants: [
+					index === 2 ? { kind: "absent" as const, fingerprint: sourceFingerprint }
+						: { kind: "file" as const, fingerprint: sourceFingerprint, mode: 0o644 as const, bytes: value.source },
+					index === 1 ? { kind: "absent" as const, fingerprint: targetFingerprint }
+						: { kind: "file" as const, fingerprint: targetFingerprint, mode: 0o644 as const, bytes: value.target },
+				],
+			};
+		}),
+	});
+	for (const path of paths.slice(0, 2)) await writeFile(join(value.root, path), value.source);
+	const native = await createNativeFileBatch({
+		workspaceRoot: value.root, planDigest: value.planDigest, journal: value.journal,
+		requiredCapability: nativeRestoreCapability(pack),
+	});
+	return { ...value, pack, native, paths };
 }
 
 afterEach(async () => {
@@ -140,6 +174,60 @@ describe("native restore helper", () => {
 		})).resolves.toEqual({ kind: "clean" });
 		await expect(lstat(join(root, ".pi-undo-q2-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-source")))
 			.rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	it.for(["rollback", "roll_forward"] as const)("子目录混合写入、创建和删除后支持 %s", async (decision, context) => {
+		const value = await mixedFixture();
+		if (value.native === undefined) return context.skip();
+		expect(await value.native.verifySource(value.pack)).toBe(true);
+		await value.native.run(value.pack);
+		expect(await readFile(join(value.root, value.paths[0]))).toEqual(value.target);
+		await expect(lstat(join(value.root, value.paths[1]))).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await readFile(join(value.root, value.paths[2]))).toEqual(value.target);
+		await expect(recoverPackedMutations({
+			workspaceRoot: value.root, journal: value.journal, planDigest: value.planDigest, decision,
+		})).resolves.toEqual({ kind: "clean" });
+		if (decision === "rollback") {
+			for (const path of value.paths.slice(0, 2)) expect(await readFile(join(value.root, path))).toEqual(value.source);
+			await expect(lstat(join(value.root, value.paths[2]))).rejects.toMatchObject({ code: "ENOENT" });
+		}
+		expect((await readdir(join(value.root, "src"))).some((name) => name.startsWith(".pi-undo-q2-"))).toBe(false);
+	});
+
+	it("混合计划的父目录被替换为 symlink 时拒绝所有 mutation", async (context) => {
+		const value = await mixedFixture();
+		if (value.native === undefined) return context.skip();
+		await rename(join(value.root, "src"), join(value.root, "moved"));
+		await symlink(join(value.root, "moved"), join(value.root, "src"));
+		await expect(value.native.run(value.pack)).rejects.toThrow("父目录");
+		expect((await readdir(join(value.root, "moved"))).sort()).toEqual(["changed.txt", "removed.txt"]);
+		for (const name of ["changed.txt", "removed.txt"]) expect(await readFile(join(value.root, "moved", name))).toEqual(value.source);
+	});
+
+	it("混合计划部分隔离失败时可从 pack 回滚并保留外来文件", async (context) => {
+		const value = await mixedFixture();
+		if (value.native === undefined) return context.skip();
+		await writeFile(join(value.root, "src/added.txt"), "foreign");
+		await expect(value.native.run(value.pack)).rejects.toThrow();
+		const result = await recoverPackedMutations({
+			workspaceRoot: value.root, journal: value.journal, planDigest: value.planDigest, decision: "rollback",
+		});
+		// 冲突必须保留，恢复器不能把外来内容误认成本次安装结果。
+		expect(result.kind).not.toBe("clean");
+		expect(await readFile(join(value.root, "src/added.txt"), "utf8")).toBe("foreign");
+	});
+
+	it("旧 helper 缺少扩展能力时在 restore 请求写出前回退", async (context) => {
+		if (process.platform === "win32" || process.env.PI_UNDO_DISABLE_NATIVE === "1") return context.skip();
+		const value = await fixture();
+		const executable = join(value.root, "old-helper");
+		await writeFile(executable, `#!${process.execPath}\nconsole.log(JSON.stringify({ ok: true, capabilities: ["restore-v1"] }));\n`);
+		await chmod(executable, 0o755);
+		await expect(createNativeFileBatch({
+			workspaceRoot: value.root, journal: value.journal, planDigest: value.planDigest,
+			executable, requiredCapability: "restore-files-v2",
+		})).resolves.toBeUndefined();
+		await expect(lstat(join(dirname(value.journal.storagePath), "native-request-v1.json"))).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
 	it("context 取消时终止 native helper 进程组，不留下迟到写入", async () => {

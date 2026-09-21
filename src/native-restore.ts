@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import type { DurablePack } from "./durable-pack.ts";
 import { GitRunError, runSupervisedProcess } from "./git-runner.ts";
 import { OperationError, type OperationProcessOptions, operationProcessOptions, rethrowOperationFailure } from "./operation-context.ts";
+import { probeNativeCapability } from "./native-capabilities.ts";
 import type { MutationJournal } from "./mutation-journal.ts";
 
 const NATIVE_TIMEOUT_MS = 120_000;
@@ -23,6 +24,7 @@ export async function createNativeFileBatch(options: {
 	readonly journal: MutationJournal;
 	/** 测试注入用；默认使用随包分发的平台二进制。 */
 	readonly executable?: string;
+	readonly requiredCapability?: "restore-files-v2";
 }): Promise<NativeFileBatch | undefined> {
 	if (process.env.PI_UNDO_DISABLE_NATIVE === "1") return undefined;
 	const executable = options.executable ?? nativeExecutable();
@@ -32,6 +34,9 @@ export async function createNativeFileBatch(options: {
 	} catch {
 		return undefined;
 	}
+	if (options.requiredCapability !== undefined && !await probeNativeCapability(
+		executable, options.requiredCapability, dirname(options.journal.storagePath),
+	)) return undefined;
 	const execute = async (pack: DurablePack, requestPath: string, verifyOnly: boolean): Promise<void> => {
 		const paths = pack.paths();
 		if (paths.length === 0) return;
@@ -83,6 +88,13 @@ export async function createNativeFileBatch(options: {
 			}
 		},
 	};
+}
+
+export function nativeRestoreCapability(pack: DurablePack): "restore-files-v2" | undefined {
+	const paths = pack.paths();
+	const deletes = paths.filter((path) => pack.artifacts(path)?.target === null);
+	return deletes.some((path) => path.includes("/")) || (deletes.length > 0 && deletes.length < paths.length)
+		? "restore-files-v2" : undefined;
 }
 
 export function nativeExecutable(): string | undefined {

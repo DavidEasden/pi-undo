@@ -4,9 +4,11 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { checksum, topologyFingerprint } from "./encoding.ts";
 import { GitRunError, GitRunner } from "./git-runner.ts";
 import type { DiscoveryRoot } from "./model.ts";
+import { NativeDirectoryScanner, type NativeDirectoryScanPort, type NativeRepositoryCandidate } from "./native-directory-scan.ts";
 import { allCompleted, checkOperation, OperationError, reportOperationProgress } from "./operation-context.ts";
 
 const DIRECTORY_SCAN_CONCURRENCY = 16;
+const NATIVE_SCAN_MIN_DIRECTORIES = 64;
 const GIT_POINTER_MAX_BYTES = 4096;
 
 interface RepositoryInfo {
@@ -57,8 +59,8 @@ export type RootDiscoveryErrorCode = "workspace_not_found" | "discovery_failed";
 export class RootDiscoveryError extends Error {
 	readonly code: RootDiscoveryErrorCode;
 
-	constructor(code: RootDiscoveryErrorCode, message: string) {
-		super(message);
+	constructor(code: RootDiscoveryErrorCode, message: string, options?: ErrorOptions) {
+		super(message, options);
 		this.name = "RootDiscoveryError";
 		this.code = code;
 	}
@@ -70,8 +72,9 @@ export interface RootDiscovery {
 
 export class RootDiscovery {
 	private readonly git: GitRunner;
+	private lastDirectoryCount: number | undefined;
 
-	constructor(git = new GitRunner()) {
+	constructor(git = new GitRunner(), private readonly nativeScan: NativeDirectoryScanPort = new NativeDirectoryScanner()) {
 		this.git = git;
 	}
 
@@ -114,6 +117,24 @@ export class RootDiscovery {
 		let level: Array<{ readonly path: string; readonly inspect: boolean }> = [{ path: directory, inspect: false }];
 		let scanned = 0;
 		reportOperationProgress("scan_directories");
+		// 上次规模只选择执行器；小工作区仍完整重扫，目录增长后会重新使用 native。
+		const native = this.lastDirectoryCount !== undefined && this.lastDirectoryCount < NATIVE_SCAN_MIN_DIRECTORIES
+			? undefined : await this.nativeScan.scan(workspaceIdentity);
+		if (native !== undefined) {
+			this.lastDirectoryCount = native.directories;
+			for (let index = 0; index < native.repositories.length; index += DIRECTORY_SCAN_CONCURRENCY) {
+				await allCompleted(native.repositories.slice(index, index + DIRECTORY_SCAN_CONCURRENCY).map(async (candidate) => {
+					checkOperation();
+					const path = join(workspaceIdentity, candidate.path);
+					await assertNativeCandidate(path, candidate);
+					const inspection = await this.inspectRepository(path, workspaceIdentity);
+					await assertNativeCandidate(path, candidate);
+					this.recordInspection(workspaceIdentity, inspection, activeRoots);
+				}));
+			}
+			reportOperationProgress(`scan_directories:${native.directories}`);
+			return;
+		}
 		while (level.length > 0) {
 			checkOperation();
 			const next: Array<{ readonly path: string; readonly inspect: true }> = [];
@@ -128,6 +149,7 @@ export class RootDiscovery {
 			}
 			level = next;
 		}
+		this.lastDirectoryCount = scanned;
 	}
 
 	private async scanDirectoryNode(
@@ -139,16 +161,7 @@ export class RootDiscovery {
 		if (!await isSafeDirectory(candidate.path, workspaceIdentity)) return [];
 		if (candidate.inspect) {
 			const inspection = await this.inspectRepository(candidate.path, workspaceIdentity);
-			if (inspection.kind === "active") {
-				activeRoots.set(
-					inspection.repository.absoluteRoot,
-					this.activeRoot(workspaceIdentity, inspection.repository),
-				);
-			} else if (inspection.kind === "broken") {
-				activeRoots.set(inspection.absoluteRoot, brokenRoot(workspaceIdentity, inspection.absoluteRoot));
-			} else if (inspection.kind === "stale") {
-				activeRoots.set(inspection.absoluteRoot, staleWorktreeRoot(workspaceIdentity, inspection.absoluteRoot));
-			}
+			this.recordInspection(workspaceIdentity, inspection, activeRoots);
 			if (!await isSafeDirectory(candidate.path, workspaceIdentity)) return [];
 		}
 		checkOperation();
@@ -157,6 +170,20 @@ export class RootDiscovery {
 		return entries
 			.filter((entry) => entry.name !== ".git" && !entry.isSymbolicLink() && entry.isDirectory())
 			.map((entry) => ({ path: join(candidate.path, entry.name), inspect: true as const }));
+	}
+
+	private recordInspection(
+		workspaceIdentity: string,
+		inspection: RepositoryInspection,
+		activeRoots: Map<string, DiscoveredRoot>,
+	): void {
+		if (inspection.kind === "active") {
+			activeRoots.set(inspection.repository.absoluteRoot, this.activeRoot(workspaceIdentity, inspection.repository));
+		} else if (inspection.kind === "broken") {
+			activeRoots.set(inspection.absoluteRoot, brokenRoot(workspaceIdentity, inspection.absoluteRoot));
+		} else if (inspection.kind === "stale") {
+			activeRoots.set(inspection.absoluteRoot, staleWorktreeRoot(workspaceIdentity, inspection.absoluteRoot));
+		}
 	}
 
 	private async inspectRepository(candidate: string, workspaceIdentity: string): Promise<RepositoryInspection> {
@@ -292,6 +319,19 @@ export class RootDiscovery {
 			}
 			return null;
 		}
+	}
+}
+
+async function assertNativeCandidate(path: string, candidate: NativeRepositoryCandidate): Promise<void> {
+	try {
+		const metadata = await lstat(path, { bigint: true });
+		if (!metadata.isDirectory() || metadata.dev !== candidate.dev || metadata.ino !== candidate.ino ||
+			await realpath(path) !== path) {
+			throw new RootDiscoveryError("discovery_failed", `native 扫描后仓库目录身份发生变化：${candidate.path}`);
+		}
+	} catch (error) {
+		if (error instanceof RootDiscoveryError) throw error;
+		throw new RootDiscoveryError("discovery_failed", `无法复核 native 仓库候选：${candidate.path}`, { cause: error });
 	}
 }
 

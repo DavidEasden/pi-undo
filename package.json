@@ -34,13 +34,14 @@
 		"extensions",
 		"src",
 		"native/bin",
-		"README.md"
+		"README.md",
+		"docs/native-performance.md"
 	],
 	"scripts": {
 		"test": "vitest run",
 		"test:watch": "vitest",
 		"test:integration": "vitest run test/extension.integration.test.ts test/pi-runtime.test.ts test/pi-sdk.integration.test.ts",
-		"test:native": "cargo test --manifest-path native/pi-undo-fs/Cargo.toml && vitest run test/native-restore.test.ts test/durable-pack.test.ts test/packed-recovery.test.ts",
+		"test:native": "cargo test --manifest-path native/pi-undo-fs/Cargo.toml && vitest run test/native-restore.test.ts test/native-directory-scan.test.ts test/root-discovery.test.ts test/durable-pack.test.ts test/packed-recovery.test.ts",
 		"build:native": "cargo build --release --manifest-path native/pi-undo-fs/Cargo.toml",
 		"typecheck": "tsc --noEmit",
 		"pack:dry-run": "npm pack --dry-run"

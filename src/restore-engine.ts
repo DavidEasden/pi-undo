@@ -18,7 +18,7 @@ import {
 import { assertManifest, assertOperationId, canonicalJson, checksum } from "./encoding.ts";
 import { MutationJournal } from "./mutation-journal.ts";
 import { allCompleted, checkOperation, rethrowOperationFailure, isUnconfirmedExit, operationFailure, withRecoveryBudget } from "./operation-context.ts";
-import { createNativeFileBatch } from "./native-restore.ts";
+import { createNativeFileBatch, nativeRestoreCapability } from "./native-restore.ts";
 import { recoverPackedMutations } from "./packed-recovery.ts";
 import type { ManifestId, RestorePath, SnapshotManifest, SnapshotRoot } from "./model.ts";
 import {
@@ -311,6 +311,7 @@ export class RestoreEngine {
 				workspaceRoot: this.workspaceRoot,
 				planDigest: cached.planDigest,
 				journal: cacheJournal,
+				requiredCapability: nativeRestoreCapability(cached.pack),
 			});
 			if (native === undefined || !await native.verifySource(cached.pack)) return false;
 			if (fromPersistentIndex) {
@@ -862,6 +863,7 @@ export class RestoreEngine {
 				workspaceRoot: this.workspaceRoot,
 				planDigest: plan.planDigest,
 				journal: options.mutationJournal,
+				requiredCapability: nativeRestoreCapability(durablePack),
 			})
 			: undefined;
 		if (durablePack !== undefined && nativeFileBatch === undefined) {
@@ -978,17 +980,16 @@ export class RestoreEngine {
 		currentPaths: ReadonlyMap<string, OwnedPath>,
 		targetPaths: ReadonlyMap<string, OwnedPath>,
 	): boolean {
-		const writeOnly = plan.deletePaths.length === 0 &&
-			plan.writePaths.length > 0 &&
-			plan.writePaths.every((path) => targetPaths.get(path)?.entry.kind === "file");
-		const deleteOnly = process.platform !== "win32" &&
-			plan.writePaths.length === 0 &&
-			plan.deletePaths.length > 0 &&
-			plan.deletePaths.every((path) =>
-				currentPaths.get(path)?.entry.kind === "file" &&
-				targetPaths.get(path) === undefined &&
-				!path.includes("/"));
-		return writeOnly || deleteOnly;
+		if (plan.deletePaths.length + plan.writePaths.length === 0) return false;
+		if (process.platform === "win32" && plan.deletePaths.length > 0) return false;
+		if (!plan.deletePaths.every((path) =>
+			currentPaths.get(path)?.entry.kind === "file" && targetPaths.get(path) === undefined)) return false;
+		if (!plan.writePaths.every((path) =>
+			targetPaths.get(path)?.entry.kind === "file" &&
+			(currentPaths.get(path) === undefined || currentPaths.get(path)?.entry.kind === "file"))) return false;
+		// 与 helper 的句柄上限一致；目录创建、类型替换及过多父目录继续使用 TypeScript。
+		const parents = new Set([...plan.deletePaths, ...plan.writePaths].flatMap(strictPathAncestors));
+		return process.platform === "win32" || parents.size <= 128;
 	}
 
 	private async applyNativeFilePlan(

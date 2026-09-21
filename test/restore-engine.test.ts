@@ -11,6 +11,7 @@ import { MutationJournal } from "../src/mutation-journal.ts";
 import * as nativeRestore from "../src/native-restore.ts";
 import { nativeExecutable } from "../src/native-restore.ts";
 import { checkOperation, createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
+import { recoverPackedMutations } from "../src/packed-recovery.ts";
 import { RestoreEngine, type RestoreMutation } from "../src/restore-engine.ts";
 import type { ManifestId, RestorePath, SnapshotManifest } from "../src/model.ts";
 import { RootDiscovery, type RootDiscoveryReason, type RootTopology } from "../src/root-discovery.ts";
@@ -514,6 +515,60 @@ describe("RestoreEngine", () => {
 		} finally {
 			vi.unstubAllEnvs();
 		}
+	});
+
+	it.for([true, false])("子目录混合文件计划复用和执行（native=%s）", async (useNative, context) => {
+		const workspace = await temporaryRoot("pi-undo-mixed-workspace-");
+		const storeRoot = await temporaryRoot("pi-undo-mixed-store-");
+		const transactionRoot = await temporaryRoot("pi-undo-mixed-transaction-");
+		const journal = new MutationJournal(join(transactionRoot, "mutations.jsonl"), "mixed-1");
+		if (useNative && (await nativeRestore.createNativeFileBatch({
+			workspaceRoot: workspace, journal, planDigest: "a".repeat(64), requiredCapability: "restore-files-v2",
+		})) === undefined) return context.skip();
+		await writeFile(workspace, "src/keep.txt", "keep\n");
+		await writeFile(workspace, "src/change.txt", "target\n");
+		await writeFile(workspace, "src/add.txt", "target\n");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "src/change.txt", "source\n");
+		await writeFile(workspace, "src/remove.txt", "source\n");
+		await rm(join(workspace, "src/add.txt"));
+		const scope = ["src/add.txt", "src/change.txt", "src/remove.txt"];
+		const current = await store.capture(await discovery.discover(workspace), scope);
+		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+		const mock = useNative ? undefined : vi.spyOn(nativeRestore, "createNativeFileBatch").mockResolvedValue(undefined);
+		try {
+			await engine.prepareDurableRestore(current, target, scope);
+			expect(await engine.canReuseDurableSource(current, target, scope)).toBe(useNative);
+			const plan = await engine.plan(current, target, scope);
+			const result = await engine.apply(plan, target, { opId: journal.operationId, mutationJournal: journal, deferDurability: true });
+			expect(result.code).toBe("ok");
+			expect(await hasDurablePack(journal)).toBe(useNative);
+			for (const path of ["src/add.txt", "src/change.txt"]) expect(await readFile(join(workspace, path), "utf8")).toBe("target\n");
+			await expect(lstat(join(workspace, "src/remove.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+			expect(await readFile(join(workspace, "src/keep.txt"), "utf8")).toBe("keep\n");
+			if (useNative) {
+				expect(await journal.load()).toEqual([]);
+				expect(await recoverPackedMutations({ workspaceRoot: workspace, journal, planDigest: plan.planDigest, decision: "roll_forward" })).toEqual({ kind: "clean" });
+			} else await journal.assertCleaned();
+		} finally { mock?.mockRestore(); }
+	});
+
+	it.for([128, 129])("%i 个父目录的 native 计划边界", async (count, context) => {
+		if (process.platform === "win32" || !await nativeRestoreAvailable()) return context.skip();
+		const workspace = await temporaryRoot("pi-undo-parent-limit-");
+		const storeRoot = await temporaryRoot("pi-undo-parent-limit-store-");
+		const paths = Array.from({ length: count }, (_, index) => `d${index}/a.txt`);
+		await Promise.all(paths.map((path) => writeFile(workspace, path, "target\n")));
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		const target = await store.capture(await discovery.discover(workspace));
+		await Promise.all(paths.map((path) => writeFile(workspace, path, "source\n")));
+		const current = await store.capture(await discovery.discover(workspace), paths);
+		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+		await engine.prepareDurableRestore(current, target, paths);
+		expect(await engine.canReuseDurableSource(current, target, paths)).toBe(count === 128);
 	});
 
 	it("预生成 cache pack 被改写时在 mutation 前回退 TypeScript", async () => {

@@ -1,7 +1,21 @@
+#[cfg(unix)]
+mod directory;
+#[cfg(unix)]
+mod file_batch;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod scan_directories;
+#[cfg(unix)]
+use file_batch::{
+    ParentDirectory, capture_source, create_target, install_target, verify_installed, verify_source,
+};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
+#[cfg(not(unix))]
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,13 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[cfg(unix)]
-use std::ffi::CString;
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
-#[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 
 const MAGIC: &[u8] = b"PIUNDO-PACK-V1\0";
 const CONCURRENCY: usize = 32;
@@ -91,11 +99,6 @@ struct Pack {
     entries: BTreeMap<String, PackedOperation>,
 }
 
-#[cfg(unix)]
-struct ParentDirectory {
-    file: fs::File,
-}
-
 struct OperationEntry {
     path: String,
     original: PathBuf,
@@ -105,10 +108,6 @@ struct OperationEntry {
     target_variant: PackVariant,
     #[cfg(unix)]
     parent: Option<Arc<ParentDirectory>>,
-    #[cfg(unix)]
-    original_name: Option<String>,
-    #[cfg(unix)]
-    source_name: Option<String>,
 }
 
 fn main() {
@@ -121,14 +120,24 @@ fn main() {
 fn run() -> Result<(), String> {
     let first = std::env::args().nth(1).ok_or("缺少 request path")?;
     if first == "--capabilities" {
-        #[cfg(unix)]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         println!(
             "{}",
-            r#"{"ok":true,"capabilities":["restore-v1","inspect-v1"]}"#
+            r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","scan-directories-v1","restore-files-v2"]}"#
+        );
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+        println!(
+            "{}",
+            r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","restore-files-v2"]}"#
         );
         #[cfg(not(unix))]
         println!("{}", r#"{"ok":true,"capabilities":["restore-v1"]}"#);
         return Ok(());
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if first == "--scan-directories" {
+        let path = std::env::args().nth(2).ok_or("缺少目录扫描 request path")?;
+        return scan_directories::run(Path::new(&path));
     }
     if first == "--inspect" {
         let request_path = std::env::args().nth(2).ok_or("缺少 inspect request path")?;
@@ -159,10 +168,21 @@ fn run_restore(request_path: &Path) -> Result<(), String> {
         return Err("request 与 pack 路径数量不匹配".into());
     }
     #[cfg(unix)]
-    let workspace_parent = Arc::new(open_parent_directory(&workspace)?);
+    let workspace_parent = ParentDirectory::root(&workspace)?;
+    #[cfg(unix)]
+    let mut parents = BTreeMap::new();
     let mut operations = Vec::with_capacity(request.entries.len());
     let mut requested_paths = BTreeMap::new();
+    let mut reserved_paths = BTreeSet::new();
     for entry in request.entries {
+        for path in [&entry.path, &entry.source_artifact]
+            .into_iter()
+            .chain(entry.target_artifact.iter())
+        {
+            if !reserved_paths.insert(path.clone()) {
+                return Err(format!("native 路径或 artifact 重叠：{path}"));
+            }
+        }
         if requested_paths.insert(entry.path.clone(), ()).is_some() {
             return Err(format!("request 路径重复：{}", entry.path));
         }
@@ -185,32 +205,11 @@ fn run_restore(request_path: &Path) -> Result<(), String> {
             .map(|artifact| safe_artifact(&workspace, &entry.path, artifact, "target"))
             .transpose()?;
         #[cfg(unix)]
-        let (parent, original_name, source_name) = if target.is_none() {
-            let original_parent = original
-                .parent()
-                .ok_or_else(|| format!("路径缺少 parent：{}", entry.path))?;
-            if original_parent != workspace {
-                return Err(format!(
-                    "native delete 只允许 workspace 直属普通文件：{}",
-                    entry.path
-                ));
-            }
-            let original_name = original
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| format!("文件名无效：{}", entry.path))?;
-            let source_name = source
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| format!("source 文件名无效：{}", entry.path))?;
-            (
-                Some(Arc::clone(&workspace_parent)),
-                Some(original_name.to_owned()),
-                Some(source_name.to_owned()),
-            )
-        } else {
-            (None, None, None)
-        };
+        let parent = Some(file_batch::open_parent(
+            &workspace_parent,
+            &entry.path,
+            &mut parents,
+        )?);
         #[cfg(not(unix))]
         if target.is_none() {
             return Err("当前平台 native delete 不支持，回退 TypeScript restore".into());
@@ -246,11 +245,16 @@ fn run_restore(request_path: &Path) -> Result<(), String> {
             target_variant,
             #[cfg(unix)]
             parent,
-            #[cfg(unix)]
-            original_name,
-            #[cfg(unix)]
-            source_name,
         });
+    }
+    for path in &reserved_paths {
+        if Path::new(path)
+            .ancestors()
+            .skip(1)
+            .any(|parent| reserved_paths.contains(parent.to_str().unwrap()))
+        {
+            return Err(format!("native 路径前缀重叠：{path}"));
+        }
     }
     let operations = Arc::new(operations);
     let pack = Arc::new(pack);
@@ -350,6 +354,10 @@ fn run_inspect(request_path: &Path) -> Result<(), String> {
 fn validate_relative_path(relative: &str) -> Result<(), String> {
     let path = Path::new(relative);
     if relative.is_empty()
+        || relative.contains('\0')
+        || relative
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
         || path.is_absolute()
         || path
             .components()
@@ -548,6 +556,7 @@ fn load_pack(
     })
 }
 
+#[cfg(not(unix))]
 fn verify_source(pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
     if entry.source_variant.kind == "absent" {
         return assert_absent(&entry.original, &entry.path);
@@ -555,6 +564,7 @@ fn verify_source(pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
     verify_file(pack, &entry.original, &entry.source_variant, &entry.path)
 }
 
+#[cfg(not(unix))]
 fn create_target(pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
     let Some(target) = entry.target.as_ref() else {
         return Ok(());
@@ -580,31 +590,9 @@ fn create_target(pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
     verify_file(pack, target, &entry.target_variant, &entry.path)
 }
 
+#[cfg(not(unix))]
 fn capture_source(pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
     if entry.target.is_none() {
-        #[cfg(unix)]
-        {
-            let parent = entry.parent.as_ref().ok_or("delete parent handle 缺失")?;
-            let original_name = entry
-                .original_name
-                .as_deref()
-                .ok_or("delete original name 缺失")?;
-            let source_name = entry
-                .source_name
-                .as_deref()
-                .ok_or("delete source name 缺失")?;
-            verify_file(pack, &entry.original, &entry.source_variant, &entry.path)?;
-            assert_absent(&entry.source, &entry.path)?;
-            link_no_replace_at(parent, original_name, source_name, &entry.path)?;
-            verify_file(pack, &entry.original, &entry.source_variant, &entry.path)?;
-            verify_file(pack, &entry.source, &entry.source_variant, &entry.path)?;
-            assert_same_file_identity(&entry.original, &entry.source, &entry.path)?;
-            unlink_at(parent, original_name, &entry.path)?;
-            assert_absent(&entry.original, &entry.path)?;
-            verify_file(pack, &entry.source, &entry.source_variant, &entry.path)?;
-            return Ok(());
-        }
-        #[cfg(not(unix))]
         return Err("当前平台 native delete 不支持，回退 TypeScript restore".into());
     }
     if entry.source_variant.kind == "absent" {
@@ -618,6 +606,7 @@ fn capture_source(pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
     verify_file(pack, &entry.source, &entry.source_variant, &entry.path)
 }
 
+#[cfg(not(unix))]
 fn install_target(pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
     if entry.target.is_none() {
         return Ok(());
@@ -631,6 +620,7 @@ fn install_target(pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
     ))
 }
 
+#[cfg(not(unix))]
 fn verify_installed(pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
     if entry.target.is_none() {
         assert_absent(&entry.original, &entry.path)?;
@@ -643,77 +633,6 @@ fn verify_installed(pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
         verify_file(pack, &entry.source, &entry.source_variant, &entry.path)?;
     } else {
         assert_absent(&entry.source, &entry.path)?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn open_parent_directory(path: &Path) -> Result<ParentDirectory, String> {
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
-    let file = options
-        .open(path)
-        .map_err(error("打开 native delete parent 失败"))?;
-    Ok(ParentDirectory { file })
-}
-
-#[cfg(unix)]
-fn link_no_replace_at(
-    parent: &ParentDirectory,
-    original_name: &str,
-    source_name: &str,
-    logical: &str,
-) -> Result<(), String> {
-    let original = CString::new(original_name).map_err(|_| format!("文件名包含 NUL：{logical}"))?;
-    let source =
-        CString::new(source_name).map_err(|_| format!("source 文件名包含 NUL：{logical}"))?;
-    let result = unsafe {
-        libc::linkat(
-            parent.file.as_raw_fd(),
-            original.as_ptr(),
-            parent.file.as_raw_fd(),
-            source.as_ptr(),
-            0,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(format!(
-            "建立 source hard link 失败：{logical}: {}",
-            std::io::Error::last_os_error()
-        ))
-    }
-}
-
-#[cfg(unix)]
-fn unlink_at(parent: &ParentDirectory, name: &str, logical: &str) -> Result<(), String> {
-    let name = CString::new(name).map_err(|_| format!("文件名包含 NUL：{logical}"))?;
-    let result = unsafe { libc::unlinkat(parent.file.as_raw_fd(), name.as_ptr(), 0) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(format!(
-            "删除原路径失败：{logical}: {}",
-            std::io::Error::last_os_error()
-        ))
-    }
-}
-
-#[cfg(unix)]
-fn assert_same_file_identity(left: &Path, right: &Path, logical: &str) -> Result<(), String> {
-    let left_metadata =
-        fs::symlink_metadata(left).map_err(error_path("读取 installed identity 失败", logical))?;
-    let right_metadata =
-        fs::symlink_metadata(right).map_err(error_path("读取 ownership identity 失败", logical))?;
-    if !left_metadata.file_type().is_file()
-        || !right_metadata.file_type().is_file()
-        || left_metadata.dev() != right_metadata.dev()
-        || left_metadata.ino() != right_metadata.ino()
-    {
-        return Err(format!("target ownership identity 冲突：{logical}"));
     }
     Ok(())
 }
@@ -752,6 +671,7 @@ fn read_variant(pack: &Pack, variant: &PackVariant) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+#[cfg(not(unix))]
 fn verify_file(
     pack: &Pack,
     path: &Path,
@@ -789,6 +709,7 @@ fn verify_file(
     Ok(())
 }
 
+#[cfg(not(unix))]
 fn read_file_nofollow(path: &Path) -> std::io::Result<Vec<u8>> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -800,50 +721,12 @@ fn read_file_nofollow(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-#[cfg(target_os = "macos")]
-fn rename_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
-    let source = CString::new(source.as_os_str().as_bytes())?;
-    let target = CString::new(target.as_os_str().as_bytes())?;
-    let result = unsafe { libc::renamex_np(source.as_ptr(), target.as_ptr(), libc::RENAME_EXCL) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn rename_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
-    let source = CString::new(source.as_os_str().as_bytes())?;
-    let target = CString::new(target.as_os_str().as_bytes())?;
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            source.as_ptr(),
-            libc::AT_FDCWD,
-            target.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
 #[cfg(windows)]
 fn rename_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
     fs::rename(source, target)
 }
 
-#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-fn rename_no_replace(source: &Path, target: &Path) -> std::io::Result<()> {
-    fs::hard_link(source, target)?;
-    fs::remove_file(source)
-}
-
+#[cfg(not(unix))]
 fn assert_absent(path: &Path, logical: &str) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -853,6 +736,13 @@ fn assert_absent(path: &Path, logical: &str) -> Result<(), String> {
 }
 
 fn safe_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
+    validate_relative_path(relative)?;
+    if relative
+        .split('/')
+        .any(|part| part.eq_ignore_ascii_case(".git"))
+    {
+        return Err(format!("native restore 禁止操作 Git metadata：{relative}"));
+    }
     let relative_path = Path::new(relative);
     if relative_path.is_absolute()
         || relative_path
@@ -1002,7 +892,7 @@ mod tests {
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
-    fn fixture() -> PathBuf {
+    pub(crate) fn fixture() -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "pi-undo-native-inspect-test-{}-{}",
             std::process::id(),
