@@ -1,6 +1,6 @@
 {
 	"name": "@davideasden/pi-undo",
-	"version": "0.2.25",
+	"version": "0.2.26",
 	"description": "Persistent workspace undo and redo for Pi",
 	"license": "MIT",
 	"type": "module",
