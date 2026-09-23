@@ -1,10 +1,10 @@
-import { constants } from "node:fs";
+import { constants, rmSync } from "node:fs";
 import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, isAbsolute, relative, resolve, sep } from "node:path";
 
 import { GitRunError, runSupervisedProcess } from "./git-runner.ts";
-import { probeNativeCapability } from "./native-capabilities.ts";
+import { probeNativeCapabilities } from "./native-capabilities.ts";
 import { nativeExecutable } from "./native-restore.ts";
 import { checkOperation, configuredTimeout, OperationError, operationProcessOptions } from "./operation-context.ts";
 
@@ -23,10 +23,30 @@ export interface NativeDirectoryScanPort {
 	scan(workspaceRoot: string): Promise<NativeDirectoryScan | undefined>;
 }
 
-/** 只缓存 helper 能力；每个拓扑检查点均重新完整扫描工作区，包括 ignored 目录。 */
+const nativeScanCacheDirectories = new Set<string>();
+let nativeScanCacheCleanupRegistered = false;
+
+function registerNativeScanCacheDirectory(directory: string): void {
+	nativeScanCacheDirectories.add(directory);
+	if (nativeScanCacheCleanupRegistered) return;
+	nativeScanCacheCleanupRegistered = true;
+	process.once("exit", () => {
+		for (const path of nativeScanCacheDirectories) {
+			try { rmSync(path, { recursive: true, force: true }); } catch { /* 退出阶段尽力清理 */ }
+		}
+	});
+}
+
+function isPathInside(root: string, candidate: string): boolean {
+	const child = relative(resolve(root), resolve(candidate));
+	return child === "" || (child !== ".." && !child.startsWith(`..${sep}`) && !isAbsolute(child));
+}
+
+/** 原生 helper 能力之外，目录快照只在逐目录元数据仍可证明时复用。 */
 export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 	private readonly executable: string | undefined;
-	private capability: Promise<boolean> | undefined;
+	private capability: Promise<"v2" | "v1" | undefined> | undefined;
+	private cacheDirectory: Promise<string> | undefined;
 
 	constructor(executable = nativeExecutable()) {
 		this.executable = process.env.PI_UNDO_DISABLE_NATIVE === "1" || process.platform === "win32"
@@ -35,7 +55,8 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 
 	async scan(workspaceRoot: string): Promise<NativeDirectoryScan | undefined> {
 		checkOperation();
-		if (this.executable === undefined || (this.capability !== undefined && !await this.capability)) return undefined;
+		if (this.executable === undefined || isPathInside(workspaceRoot, tmpdir()) ||
+			(this.capability !== undefined && await this.capability === undefined)) return undefined;
 		const requestDirectory = await mkdtemp(join(tmpdir(), "pi-undo-native-scan-"));
 		try {
 			this.capability ??= this.supportsScan(requestDirectory).catch((error) => {
@@ -43,10 +64,16 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 				this.capability = undefined;
 				throw error;
 			});
-			if (!await this.capability) return undefined;
+			const version = await this.capability;
+			if (version === undefined) return undefined;
 			const budget = operationProcessOptions(configuredTimeout("PI_UNDO_OPERATION_TIMEOUT_MS", 300_000));
 			const requestPath = join(requestDirectory, "request.json");
-			await writeFile(requestPath, JSON.stringify({ schemaVersion: 1, workspaceRoot }), { mode: 0o600, flag: "wx" });
+			const cachePath = version === "v2" ? await this.directoryCachePath(workspaceRoot, requestDirectory) : undefined;
+			await writeFile(requestPath, JSON.stringify({
+				schemaVersion: version === "v2" ? 2 : 1,
+				workspaceRoot,
+				...(cachePath === undefined ? {} : { cachePath }),
+			}), { mode: 0o600, flag: "wx" });
 			const result = await runSupervisedProcess({
 				command: this.executable,
 				args: ["--scan-directories", requestPath],
@@ -70,13 +97,38 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 		}
 	}
 
-	private async supportsScan(directory: string): Promise<boolean> {
+	private async supportsScan(directory: string): Promise<"v2" | "v1" | undefined> {
 		try {
 			await access(this.executable!, constants.X_OK);
 		} catch {
-			return false;
+			return undefined;
 		}
-		return probeNativeCapability(this.executable!, "scan-directories-v1", directory);
+		const capabilities = await probeNativeCapabilities(this.executable!, directory);
+		if (capabilities.has("scan-directories-v2")) return "v2";
+		return capabilities.has("scan-directories-v1") ? "v1" : undefined;
+	}
+
+	private async directoryCachePath(workspaceRoot: string, requestDirectory: string): Promise<string> {
+		if (isPathInside(workspaceRoot, tmpdir())) return join(requestDirectory, "directories.json");
+		try {
+			if (this.cacheDirectory === undefined) {
+				this.cacheDirectory = mkdtemp(join(tmpdir(), "pi-undo-native-scan-cache-")).catch((error) => {
+					this.cacheDirectory = undefined;
+					throw error;
+				});
+			}
+			const directory = await this.cacheDirectory;
+			if (isPathInside(workspaceRoot, directory)) {
+				await rm(directory, { recursive: true, force: true });
+				this.cacheDirectory = undefined;
+				return join(requestDirectory, "directories.json");
+			}
+			registerNativeScanCacheDirectory(directory);
+			return join(directory, "directories.json");
+		} catch {
+			this.cacheDirectory = undefined;
+			return join(requestDirectory, "directories.json");
+		}
 	}
 }
 

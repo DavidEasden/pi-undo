@@ -464,6 +464,53 @@ describe("RestoreEngine", () => {
 		expect(await readFile(join(workspace, "manual.txt"), "utf8")).toBe("user-edit\n");
 	});
 
+	it("scoped restore 保留 scope 外新建的可见文件", async () => {
+		const workspace = await temporaryRoot("pi-undo-restore-workspace-");
+		await writeFile(workspace, "src/agent.txt", "before\n");
+		const storeRoot = await temporaryRoot("pi-undo-restore-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot });
+		const target = await store.capture(await discovery.discover(workspace));
+
+		await writeFile(workspace, "src/agent.txt", "after\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "external.txt", "keep\n");
+		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+
+		const result = await engine.apply(await engine.plan(current, target, ["src/agent.txt"]), target);
+
+		expect(result.code).toBe("ok");
+		expect(await readFile(join(workspace, "src/agent.txt"), "utf8")).toBe("before\n");
+		expect(await readFile(join(workspace, "external.txt"), "utf8")).toBe("keep\n");
+	});
+
+	it("scoped complete restore 仍拒绝 scope 内新增的可见文件", async () => {
+		const workspace = await temporaryRoot("pi-undo-restore-workspace-");
+		await writeFile(workspace, "src/agent.txt", "before\n");
+		const storeRoot = await temporaryRoot("pi-undo-restore-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot });
+		const target = await store.capture(await discovery.discover(workspace));
+
+		await writeFile(workspace, "src/agent.txt", "after\n");
+		const current = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "src/intruder.txt", "unexpected\n");
+		let mutations = 0;
+		const engine = new RestoreEngine({
+			workspaceRoot: workspace,
+			store,
+			discovery,
+			beforeMutation: () => { mutations += 1; },
+		});
+
+		const result = await engine.apply(await engine.plan(current, target, ["src"]), target);
+
+		expect(result.code).toBe("restore_failed_safe");
+		expect(mutations).toBe(0);
+		expect(await readFile(join(workspace, "src/agent.txt"), "utf8")).toBe("after\n");
+		expect(await readFile(join(workspace, "src/intruder.txt"), "utf8")).toBe("unexpected\n");
+	});
+
 	it("删除受控叶子时保留含 ignored 文件的目录", async () => {
 		const repository = await createGitRepo();
 		temporaryRoots.push(repository.root);

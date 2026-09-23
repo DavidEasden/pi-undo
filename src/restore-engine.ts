@@ -106,6 +106,7 @@ interface VisibleSubsetCheck {
 	 */
 	readonly topologyValidated: boolean;
 	readonly extraExclusions?: readonly string[];
+	readonly scopePaths?: readonly string[];
 	readonly ownedPaths?: readonly (ReadonlyMap<string, OwnedPath> | undefined)[];
 }
 
@@ -819,7 +820,8 @@ export class RestoreEngine {
 				options.mutationJournal,
 				{
 					topologyValidated: !compatibilityMode,
-					ownedPaths: this.completeCoverageOwnedPaths(plan.scopePaths, [currentPaths, targetPaths]),
+					scopePaths: plan.scopePaths,
+					ownedPaths: [currentPaths, targetPaths],
 				},
 			);
 		} catch (error) {
@@ -942,7 +944,8 @@ export class RestoreEngine {
 				options.mutationJournal,
 				{
 					topologyValidated: true,
-					ownedPaths: this.completeCoverageOwnedPaths(plan.scopePaths, [targetPaths]),
+					scopePaths: plan.scopePaths,
+					ownedPaths: [targetPaths],
 				},
 			);
 			const verification = await this.verifyTarget(
@@ -1019,7 +1022,8 @@ export class RestoreEngine {
 							? []
 							: [artifacts.source, ...(artifacts.target === null ? [] : [artifacts.target])];
 					}),
-					ownedPaths: this.completeCoverageOwnedPaths(plan.scopePaths, [targetPaths]),
+					scopePaths: plan.scopePaths,
+					ownedPaths: [targetPaths],
 				},
 			);
 			const totalPaths = plan.deletePaths.length + plan.writePaths.length;
@@ -1197,13 +1201,6 @@ export class RestoreEngine {
 			}
 		}
 		return result;
-	}
-
-	private completeCoverageOwnedPaths(
-		scopePaths: readonly string[] | undefined,
-		ownedPaths: readonly ReadonlyMap<string, OwnedPath>[],
-	): readonly ReadonlyMap<string, OwnedPath>[] | undefined {
-		return scopePaths === undefined ? ownedPaths : undefined;
 	}
 
 	private async prefetchCompleteRestoreBlobs(
@@ -1542,7 +1539,8 @@ export class RestoreEngine {
 				options.mutationJournal,
 				{
 					topologyValidated: true,
-					ownedPaths: this.completeCoverageOwnedPaths(scopePaths, [currentPaths]),
+					scopePaths,
+					ownedPaths: [currentPaths],
 				},
 			);
 			const verification = await this.verifyTarget(
@@ -1587,7 +1585,8 @@ export class RestoreEngine {
 						options.mutationJournal,
 						{
 							topologyValidated: true,
-							ownedPaths: this.completeCoverageOwnedPaths(scopePaths, [currentPaths]),
+							scopePaths,
+							ownedPaths: [currentPaths],
 						},
 					);
 					const verification = await this.verifyTarget(
@@ -1791,10 +1790,10 @@ export class RestoreEngine {
 		}
 		const allowedPaths = new Set<string>();
 		for (const [index, manifest] of allowedManifests.entries()) {
-			for (const path of ignoredWorkspacePaths(manifest)) {
+			for (const path of ignoredWorkspacePaths(manifest, check.scopePaths)) {
 				allowedPaths.add(path);
 			}
-			const paths = check.ownedPaths?.[index] ?? await this.readOwnedPaths(manifest);
+			const paths = check.ownedPaths?.[index] ?? await this.readOwnedPaths(manifest, check.scopePaths);
 			for (const [path, owned] of paths) {
 				if (owned.entry.kind !== "directory") {
 					allowedPaths.add(path);
@@ -1808,6 +1807,7 @@ export class RestoreEngine {
 		}
 		const livePaths = await this.store.listVisibleLeafPaths(topology, {
 			excludePaths: exclusions.size === 0 ? undefined : [...exclusions],
+			includePaths: check.scopePaths,
 			topologyAlreadyValidated: check.topologyValidated,
 		});
 		for (const path of livePaths) {
@@ -2144,9 +2144,17 @@ function workspacePath(root: string, path: string): string {
 	return root === "." ? path : path === "." ? root : `${root}/${path}`;
 }
 
-function ignoredWorkspacePaths(manifest: SnapshotManifest): Set<string> {
+function ignoredWorkspacePaths(
+	manifest: SnapshotManifest,
+	scopePaths?: readonly string[],
+): Set<string> {
+	const scope = scopePaths === undefined ? undefined : new Set(scopePaths);
+	const scopeAncestors = new Set(scopePaths?.flatMap(strictPathAncestors));
 	return new Set(manifest.roots.flatMap((root) =>
-		root.ignoredPresentPaths.map((path) => workspacePath(root.relativeRoot, path))
+		root.ignoredPresentPaths
+			.map((path) => workspacePath(root.relativeRoot, path))
+			.filter((path) => scope === undefined || scope.has(".") || scope.has(path) ||
+				scopeAncestors.has(path) || strictPathAncestors(path).some((ancestor) => scope.has(ancestor)))
 	));
 }
 

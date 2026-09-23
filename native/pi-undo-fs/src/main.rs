@@ -123,7 +123,7 @@ fn run() -> Result<(), String> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         println!(
             "{}",
-            r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","scan-directories-v1","restore-files-v2"]}"#
+            r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","scan-directories-v1","scan-directories-v2","restore-files-v2"]}"#
         );
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
         println!(

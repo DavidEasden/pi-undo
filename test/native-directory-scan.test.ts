@@ -44,6 +44,28 @@ process.exit(2);
 		await expect(lstat(join(value.directory, "mutated"))).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
+	it("v2 helper 使用稳定 cachePath，并在连续检查点间复用同一协议", async () => {
+		const value = await helper(`
+import { appendFileSync, readFileSync } from "node:fs";
+if (process.argv[2] === "--capabilities") {
+ console.log(JSON.stringify({ ok: true, capabilities: ["scan-directories-v2"] }));
+} else {
+ const request = JSON.parse(readFileSync(process.argv[3], "utf8"));
+ appendFileSync(new URL("requests", import.meta.url), JSON.stringify(request) + "\\n");
+ console.log(JSON.stringify({ ok: true, directories: 1, repositories: [] }));
+}
+`);
+		const scanner = new NativeDirectoryScanner(value.path);
+		await expect(scanner.scan(value.directory)).resolves.toEqual({ directories: 1, repositories: [] });
+		await expect(scanner.scan(value.directory)).resolves.toEqual({ directories: 1, repositories: [] });
+		const requests = (await readFile(join(value.directory, "requests"), "utf8"))
+			.trim().split("\n").map((line) => JSON.parse(line));
+		expect(requests).toHaveLength(2);
+		expect(requests[0]).toMatchObject({ schemaVersion: 2, workspaceRoot: value.directory });
+		expect(requests[1]).toMatchObject({ schemaVersion: 2, workspaceRoot: value.directory });
+		expect(requests[1].cachePath).toBe(requests[0].cachePath);
+	});
+
 	it("原生与 TypeScript 对 ignored、嵌套仓库、损坏标记及 symlink 得到相同拓扑", async (context) => {
 		const repository = await createGitRepo();
 		roots.push(repository.root);
@@ -83,7 +105,7 @@ process.exit(2);
 		expect(topology.roots.map((entry) => entry.relativeRoot)).toContain(deep);
 	});
 
-	it("扫描结果不跨检查点缓存", async (context) => {
+	it("检查点间复用目录 cache 且结构变化仍能发现新增嵌套仓库", async (context) => {
 		const workspace = await root();
 		const scanner = new NativeDirectoryScanner();
 		if (await scanner.scan(workspace) === undefined) return context.skip();

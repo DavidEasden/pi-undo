@@ -734,6 +734,24 @@ describe("SnapshotStore", () => {
 		expect(visible).not.toContain("owned-artifact");
 	});
 
+	it("可见路径枚举支持只检查 scope 并保持空 scope 为空集语义", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, "src/one.txt", "one\n");
+		await writeFixtureFile(workspace, "src/nested/two.txt", "two\n");
+		await writeFixtureFile(workspace, "other.txt", "other\n");
+		const topology = await new RootDiscovery().discover(workspace);
+		const store = new SnapshotStore({ storeRoot });
+
+		expect(await store.listVisibleLeafPaths(topology, { includePaths: ["src"] }))
+			.toEqual(["src/nested/two.txt", "src/one.txt"]);
+		expect(await store.listVisibleLeafPaths(topology, { includePaths: [] })).toEqual([]);
+		expect(await store.listVisibleLeafPaths(topology, { includePaths: ["."] }))
+			.toEqual(["other.txt", "src/nested/two.txt", "src/one.txt"]);
+		await expect(store.listVisibleLeafPaths(topology, { includePaths: ["../outside"] }))
+			.rejects.toThrow();
+	});
+
 	it("Git-backed 轻量枚举排除 index 中已删除叶子并保留 untracked 叶子", async () => {
 		const repository = await createGitRepo();
 		temporaryRoots.push(repository.root);

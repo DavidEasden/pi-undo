@@ -155,6 +155,11 @@ export interface CaptureOptions {
 	readonly topologyAlreadyValidated?: boolean;
 }
 
+export interface VisibleLeafOptions extends CaptureOptions {
+	/** 未传时枚举整个工作区；空数组不枚举，目录路径包含其子树。 */
+	readonly includePaths?: readonly string[];
+}
+
 export interface SnapshotBlobRequest {
 	readonly rootPath: string;
 	readonly blobId: string;
@@ -188,7 +193,7 @@ export interface SnapshotStore {
 		scope?: readonly string[],
 		options?: CaptureOptions,
 	): Promise<SnapshotManifest>;
-	listVisibleLeafPaths(topology: RootTopology, options?: CaptureOptions): Promise<readonly string[]>;
+	listVisibleLeafPaths(topology: RootTopology, options?: VisibleLeafOptions): Promise<readonly string[]>;
 	loadManifest(id: ManifestId): Promise<SnapshotManifest>;
 	assertComplete(id: ManifestId, scopePaths?: readonly string[]): Promise<void>;
 	listTree(id: ManifestId, root: string, rootScopePaths?: readonly string[]): Promise<readonly RestorePath[]>;
@@ -552,7 +557,7 @@ export class SnapshotStore {
 
 	async listVisibleLeafPaths(
 		topology: RootTopology,
-		options: CaptureOptions = {},
+		options: VisibleLeafOptions = {},
 	): Promise<readonly string[]> {
 		await this.assertPrivateStore(topology.workspaceIdentity);
 		const lockIdentity = `snapshot-store:${await prospectiveCanonicalPath(this.storesRoot)}`;
@@ -561,7 +566,7 @@ export class SnapshotStore {
 
 	private async listVisibleLeafPathsLocked(
 		topology: RootTopology,
-		options: CaptureOptions,
+		options: VisibleLeafOptions,
 	): Promise<readonly string[]> {
 		let transactionDirectory: string | undefined;
 		try {
@@ -581,9 +586,23 @@ export class SnapshotStore {
 			const transactionsRoot = join(storeDirectory, "transactions");
 			await mkdir(transactionsRoot, { recursive: true });
 			transactionDirectory = await mkdtemp(join(transactionsRoot, "visible-"));
+			const includePaths = options.includePaths === undefined ? undefined : [...new Set(
+				options.includePaths.map((path) => {
+					const safe = relativeSafePath(topology.workspaceIdentity, path);
+					if (safe.split("/").some((part) => part.toLowerCase() === ".git")) {
+						throw new SnapshotStoreError("capture_failed", `可见路径 scope 不能包含 Git metadata：${path}`);
+					}
+					return safe;
+				}),
+			)].sort(comparePaths);
 			const result = new Set<string>();
 			for (const root of topology.roots) {
 				if (root.state !== "active") continue;
+				const exclusions = topology.roots
+					.filter((candidate) => isStrictRootAncestor(root.relativeRoot, candidate.relativeRoot))
+					.map((candidate) => rootRelativePath(root.relativeRoot, candidate.relativeRoot));
+				const inclusions = ownedRootInclusions(rootScopePathspecs(root.relativeRoot, includePaths), exclusions);
+				if (inclusions === null) continue;
 				const gitDirectory = this.rootGitDirectory(storeDirectory, root);
 				await this.ensurePrivateRepository(gitDirectory);
 				await this.assertNoAlternates(gitDirectory);
@@ -592,15 +611,12 @@ export class SnapshotStore {
 				const environment = privateGitEnvironment(gitDirectory, absoluteRoot, indexPath);
 				await this.runGit(["read-tree", "--empty"], { cwd: absoluteRoot, env: environment });
 				await this.validateIgnoreQuery(absoluteRoot, environment, root.gitBacked);
-				const exclusions = topology.roots
-					.filter((candidate) => isStrictRootAncestor(root.relativeRoot, candidate.relativeRoot))
-					.map((candidate) => rootRelativePath(root.relativeRoot, candidate.relativeRoot));
 				const exactExclusions = ownedArtifactExclusions(topology.roots, root.relativeRoot, artifactExclusions);
 				for (const relativePath of await this.queryVisibleLeafPaths(
 					absoluteRoot,
 					environment,
 					root.gitBacked,
-					[],
+					inclusions,
 					exclusions,
 					exactExclusions,
 					true,
