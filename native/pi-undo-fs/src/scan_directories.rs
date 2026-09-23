@@ -144,6 +144,7 @@ fn scan(
             "目录扫描深度超过限制",
         ));
     }
+    let observed_at = SystemTime::now();
     let before = directory.file.metadata()?;
     if let Some(cached) = state
         .previous
@@ -230,9 +231,10 @@ fn scan(
     }
     let after = directory.file.metadata()?;
     assert_unchanged(path, &before, &after)?;
-    state
-        .next
-        .insert(path.into(), cached_directory(&after, has_git, children));
+    state.next.insert(
+        path.into(),
+        cached_directory(&after, has_git, children, observed_at),
+    );
     Ok(())
 }
 
@@ -259,6 +261,7 @@ fn cached_directory(
     metadata: &std::fs::Metadata,
     has_git: bool,
     children: Vec<String>,
+    observed_at: SystemTime,
 ) -> CachedDirectory {
     CachedDirectory {
         dev: metadata.dev(),
@@ -268,7 +271,8 @@ fn cached_directory(
         ctime: metadata.ctime(),
         ctime_nsec: metadata.ctime_nsec(),
         has_git,
-        racy: directory_is_racy(metadata),
+        // 以枚举开始时刻判定；长子树扫描不能把同一时间戳窗口内的变化变成可信缓存。
+        racy: directory_is_racy(metadata, observed_at),
         children,
     }
 }
@@ -282,26 +286,27 @@ fn metadata_matches(cached: &CachedDirectory, metadata: &std::fs::Metadata) -> b
         && cached.ctime_nsec == metadata.ctime_nsec()
 }
 
-fn directory_is_racy(metadata: &std::fs::Metadata) -> bool {
-    metadata.mtime_nsec() == 0 || metadata.ctime_nsec() == 0 || directory_is_recent(metadata)
-}
-
-fn directory_is_recent(metadata: &std::fs::Metadata) -> bool {
-    let Some(now) = SystemTime::now().duration_since(UNIX_EPOCH).ok() else {
+fn directory_is_racy(metadata: &std::fs::Metadata, observed_at: SystemTime) -> bool {
+    if metadata.mtime_nsec() == 0 || metadata.ctime_nsec() == 0 {
+        return true;
+    }
+    let Some(observed_at) = observed_at.duration_since(UNIX_EPOCH).ok() else {
         return true;
     };
-    let now = now.as_nanos();
+    let observed_at = observed_at.as_nanos();
     [
         timestamp_nanos(metadata.mtime(), metadata.mtime_nsec()),
         timestamp_nanos(metadata.ctime(), metadata.ctime_nsec()),
     ]
     .into_iter()
-    .flatten()
-    .any(|stamp| stamp > now || now.saturating_sub(stamp) < RACY_DIRECTORY_WINDOW_NS)
+    .any(|stamp| match stamp {
+        Some(stamp) => stamp > observed_at || observed_at - stamp < RACY_DIRECTORY_WINDOW_NS,
+        None => true,
+    })
 }
 
 fn timestamp_nanos(seconds: i64, nanos: i64) -> Option<u128> {
-    if seconds < 0 || nanos < 0 {
+    if seconds < 0 || !(0..1_000_000_000).contains(&nanos) {
         return None;
     }
     Some(seconds as u128 * 1_000_000_000 + nanos as u128)
@@ -556,6 +561,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state.reused_directories, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_racy_window_uses_observation_time_not_completion_time() {
+        let root = crate::tests::fixture();
+        let observed_at = SystemTime::now();
+        let metadata = fs::metadata(&root).unwrap();
+        let cached = cached_directory(&metadata, false, Vec::new(), observed_at);
+        assert!(cached.racy);
+        // 模拟完成扫描已越过窗口，原记录仍不能随时间推移自动取得复用资格。
+        let after_window = observed_at + std::time::Duration::from_secs(3);
+        let later = cached_directory(&metadata, false, Vec::new(), after_window);
+        if metadata.mtime_nsec() != 0 && metadata.ctime_nsec() != 0 {
+            assert!(!later.racy);
+        }
+        assert!(cached.racy);
         fs::remove_dir_all(root).unwrap();
     }
 

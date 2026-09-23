@@ -65,9 +65,12 @@ describe.skipIf(process.env.PI_UNDO_LARGE_WORKSPACE !== "1")("大型工作区真
 				clearInterval(sampler);
 				loopDelay.disable();
 			}
-			expect(scans).toEqual([5, 5, 5]);
+			// 禁用原生时无法复用 durable source，重新捕获 safety snapshot 会多一次拓扑发现。
+			const expectedScans = process.env.PI_UNDO_DISABLE_NATIVE === "1" ? 6 : 5;
+			expect(scans).toEqual([expectedScans, expectedScans, expectedScans]);
 			const report = JSON.stringify({
 				packages, changedFiles, timingsMs: timings, scans,
+				nativeDisabled: process.env.PI_UNDO_DISABLE_NATIVE === "1",
 				medianMs: [...timings].sort((a, b) => a - b)[1],
 				peakRssMiB: Math.round(peakRss / 1024 / 1024),
 				loopDelayP99Ms: Math.round(loopDelay.percentile(99) / 1e6),

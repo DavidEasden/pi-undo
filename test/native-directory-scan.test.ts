@@ -1,8 +1,8 @@
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { NativeDirectoryScanner } from "../src/native-directory-scan.ts";
 import { createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
@@ -64,6 +64,23 @@ if (process.argv[2] === "--capabilities") {
 		expect(requests[0]).toMatchObject({ schemaVersion: 2, workspaceRoot: value.directory });
 		expect(requests[1]).toMatchObject({ schemaVersion: 2, workspaceRoot: value.directory });
 		expect(requests[1].cachePath).toBe(requests[0].cachePath);
+	});
+
+	it.for([false, true])("临时目录位于工作区内时安全回退（符号链接=%s）", async (useSymlink) => {
+		const workspace = await root();
+		const temporaryRoot = join(workspace, "temporary");
+		await mkdir(temporaryRoot);
+		const outside = await root();
+		const temporaryLink = join(outside, "temporary-link");
+		await symlink(temporaryRoot, temporaryLink);
+		const value = await helper(`${capabilities} else console.log(JSON.stringify({ ok: true, directories: 1, repositories: [] }));`);
+		vi.stubEnv("TMPDIR", useSymlink ? temporaryLink : temporaryRoot);
+		try {
+			await expect(new NativeDirectoryScanner(value.path).scan(workspace)).resolves.toBeUndefined();
+			expect(await readdir(temporaryRoot)).toEqual([]);
+		} finally {
+			vi.unstubAllEnvs();
+		}
 	});
 
 	it("原生与 TypeScript 对 ignored、嵌套仓库、损坏标记及 symlink 得到相同拓扑", async (context) => {

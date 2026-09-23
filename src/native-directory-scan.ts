@@ -1,7 +1,7 @@
 import { constants, rmSync } from "node:fs";
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, isAbsolute, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { GitRunError, runSupervisedProcess } from "./git-runner.ts";
 import { probeNativeCapabilities } from "./native-capabilities.ts";
@@ -55,9 +55,12 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 
 	async scan(workspaceRoot: string): Promise<NativeDirectoryScan | undefined> {
 		checkOperation();
-		if (this.executable === undefined || isPathInside(workspaceRoot, tmpdir()) ||
+		if (this.executable === undefined ||
 			(this.capability !== undefined && await this.capability === undefined)) return undefined;
-		const requestDirectory = await mkdtemp(join(tmpdir(), "pi-undo-native-scan-"));
+		// TMPDIR 可能通过符号链接指向工作区；先核验真实路径，再创建任何请求或缓存。
+		const temporaryRoot = await realpath(tmpdir()).catch(() => undefined);
+		if (temporaryRoot === undefined || isPathInside(workspaceRoot, temporaryRoot)) return undefined;
+		const requestDirectory = await mkdtemp(join(temporaryRoot, "pi-undo-native-scan-"));
 		try {
 			this.capability ??= this.supportsScan(requestDirectory).catch((error) => {
 				// 取消或未确认终止不能污染后续操作的能力缓存。
@@ -68,7 +71,8 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 			if (version === undefined) return undefined;
 			const budget = operationProcessOptions(configuredTimeout("PI_UNDO_OPERATION_TIMEOUT_MS", 300_000));
 			const requestPath = join(requestDirectory, "request.json");
-			const cachePath = version === "v2" ? await this.directoryCachePath(workspaceRoot, requestDirectory) : undefined;
+			const cachePath = version === "v2"
+				? await this.directoryCachePath(workspaceRoot, temporaryRoot, requestDirectory) : undefined;
 			await writeFile(requestPath, JSON.stringify({
 				schemaVersion: version === "v2" ? 2 : 1,
 				workspaceRoot,
@@ -108,18 +112,22 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 		return capabilities.has("scan-directories-v1") ? "v1" : undefined;
 	}
 
-	private async directoryCachePath(workspaceRoot: string, requestDirectory: string): Promise<string> {
-		if (isPathInside(workspaceRoot, tmpdir())) return join(requestDirectory, "directories.json");
+	private async directoryCachePath(
+		workspaceRoot: string,
+		temporaryRoot: string,
+		requestDirectory: string,
+	): Promise<string> {
 		try {
 			if (this.cacheDirectory === undefined) {
-				this.cacheDirectory = mkdtemp(join(tmpdir(), "pi-undo-native-scan-cache-")).catch((error) => {
+				this.cacheDirectory = mkdtemp(join(temporaryRoot, "pi-undo-native-scan-cache-")).catch((error) => {
 					this.cacheDirectory = undefined;
 					throw error;
 				});
 			}
 			const directory = await this.cacheDirectory;
 			if (isPathInside(workspaceRoot, directory)) {
-				await rm(directory, { recursive: true, force: true });
+				// 工作区切换后不再把该目录当成本实例可以删除的私有缓存。
+				nativeScanCacheDirectories.delete(directory);
 				this.cacheDirectory = undefined;
 				return join(requestDirectory, "directories.json");
 			}
