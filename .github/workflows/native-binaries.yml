@@ -179,6 +179,6 @@ jobs:
           }
           echo "package_file=$package_file" >> "$GITHUB_OUTPUT"
       - name: 发布已验证的 npm 包
-        run: npm publish "${{ steps.package.outputs.package_file }}" --provenance --access public
+        run: npm publish "./${{ steps.package.outputs.package_file }}" --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
