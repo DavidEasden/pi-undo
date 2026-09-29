@@ -5,13 +5,6 @@ on:
   push:
     tags:
       - "v*"
-    paths:
-      - "native/pi-undo-fs/**"
-      - "src/durable-pack.ts"
-      - "src/native-restore.ts"
-      - "package.json"
-      - "package-lock.json"
-      - ".github/workflows/native-binaries.yml"
   pull_request:
     paths:
       - "native/pi-undo-fs/**"
@@ -23,7 +16,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   build-macos:
@@ -155,3 +147,38 @@ jobs:
         with:
           name: npm-package
           path: "*.tgz"
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: native-package
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: 校验 npm 包版本
+        id: package
+        shell: bash
+        run: |
+          package_file="$(find native-package -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          test -n "$package_file" || { echo "npm 包 artifact 缺失"; exit 1; }
+          package_version="$(tar -xOf "$package_file" package/package.json | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")"
+          expected_version="${GITHUB_REF_NAME#v}"
+          test "$package_version" = "$expected_version" || {
+            echo "Tag $GITHUB_REF_NAME 与 npm 包版本 $package_version 不匹配"
+            exit 1
+          }
+          echo "package_file=$package_file" >> "$GITHUB_OUTPUT"
+      - name: 发布已验证的 npm 包
+        run: npm publish "${{ steps.package.outputs.package_file }}" --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

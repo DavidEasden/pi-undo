@@ -351,7 +351,7 @@ Install the [Rust toolchain](https://rustup.rs/) before building or updating a n
 npm run build:native
 ```
 
-`npm run build:native` creates `pi-undo-fs` for the current build platform under `native/pi-undo-fs/target/release/`. The `Native binaries` workflow builds arm64 and x64 versions on macOS, Linux, and Windows runners, verifies the full six-binary matrix, and uploads them as workflow artifacts. The `Publish to npm` workflow publishes the package when a `v*` tag is pushed, using the binaries committed under `native/bin/`.
+`npm run build:native` 会在当前构建平台的 `native/pi-undo-fs/target/release/` 下生成 `pi-undo-fs`。`Native binaries` 工作流会在 macOS、Linux 和 Windows runner 上构建 arm64 与 x64 版本，校验完整的六平台二进制矩阵，打包测试通过的结果，并在推送 `v*` 标签时发布该完全相同的 npm 包。
 
 For local development on the current platform, copy the generated file into `native/bin/` and rename it for the platform. For example, a Windows build must use the corresponding `.exe` filename.
 
@@ -360,7 +360,7 @@ cp native/pi-undo-fs/target/release/pi-undo-fs native/bin/pi-undo-fs-darwin-arm6
 chmod +x native/bin/pi-undo-fs-darwin-arm64
 ```
 
-Every precompiled binary listed under Requirements must be committed under `native/bin/` to be part of a release. The `Native binaries` workflow verifies the complete six-binary matrix before uploading artifacts, and the `Publish to npm` workflow publishes the package on a `v*` tag push. The npm package must configure Trusted Publishing (OIDC) for the `Publish to npm` workflow. If no binary is available for the current platform, the extension automatically uses the TypeScript fallback.
+Requirements 中列出的每个预编译二进制文件都会从已验证的构建 artifact 下载到发布包中，不再依赖提交到 `native/bin/` 的二进制文件。`Native binaries` 工作流会校验完整的六平台二进制矩阵，运行测试和类型检查，创建 npm 包，并在推送 `v*` 标签时发布该包。发布 job 使用 GitHub Actions Secret `NPM_TOKEN` 认证，并保留 `id-token: write` 以生成 provenance。后续可以迁移到 npm Trusted Publishing（OIDC）以移除长期 token。如果当前平台没有可用的二进制文件，扩展会自动使用 TypeScript fallback。
 
 ### Project Layout
 
