@@ -11,6 +11,14 @@ const NATIVE_INSPECT_TIMEOUT_MS = 30_000;
 const NATIVE_INSPECT_OUTPUT_LIMIT = 32 * 1024 * 1024;
 const NATIVE_PROBE_TIMEOUT_MS = 5_000;
 const NATIVE_PROBE_OUTPUT_LIMIT = 64 * 1024;
+const NATIVE_INSPECT_BATCHES_MAX_BATCHES = 32;
+const NATIVE_INSPECT_BATCHES_MAX_PATHS = 16_384;
+const NATIVE_INSPECT_BATCHES_MAX_REQUEST_BYTES = 4 * 1024 * 1024;
+
+interface NativeCapabilities {
+	readonly inspect: boolean;
+	readonly inspectBatches: boolean;
+}
 
 export interface NativeMetadataEntry {
 	readonly path: string;
@@ -29,12 +37,17 @@ export interface NativeMetadataPort {
 		paths: readonly string[],
 		requestDirectory: string,
 	): Promise<readonly NativeMetadataEntry[] | undefined>;
+	inspectBatches?(
+		workspaceRoot: string,
+		batches: readonly (readonly string[])[],
+		requestDirectory: string,
+	): Promise<readonly (readonly NativeMetadataEntry[])[] | undefined>;
 }
 
 /** 能力探测不支持时回退 TypeScript；已确认支持后的 inspect 错误保持 fail-closed。 */
 export class NativeMetadataInspector implements NativeMetadataPort {
 	private readonly executable: string | undefined;
-	private capability: Promise<boolean> | undefined;
+	private capability: Promise<NativeCapabilities> | undefined;
 
 	constructor(executable = nativeExecutable()) {
 		this.executable = process.env.PI_UNDO_DISABLE_NATIVE === "1" ? undefined : executable;
@@ -48,7 +61,8 @@ export class NativeMetadataInspector implements NativeMetadataPort {
 		if (paths.length === 0) return [];
 		// 已取消/超时的操作不启动新的 helper，也不写出请求文件。
 		const budget = operationProcessOptions(NATIVE_INSPECT_TIMEOUT_MS);
-		if (!await this.supportsInspect(requestDirectory)) return undefined;
+		const capabilities = await this.nativeCapabilities(requestDirectory);
+		if (!capabilities.inspect) return undefined;
 		const executable = this.executable!;
 		const requestPath = join(requestDirectory, `native-inspect-${process.pid}-${randomUUID()}.json`);
 		try {
@@ -63,22 +77,55 @@ export class NativeMetadataInspector implements NativeMetadataPort {
 		}
 	}
 
-	private supportsInspect(requestDirectory: string): Promise<boolean> {
+
+	async inspectBatches(
+		workspaceRoot: string,
+		batches: readonly (readonly string[])[],
+		requestDirectory: string,
+	): Promise<readonly (readonly NativeMetadataEntry[])[] | undefined> {
+		if (batches.length === 0) return [];
+		const totalPaths = batches.reduce((total, batch) => total + batch.length, 0);
+		if (
+			batches.length > NATIVE_INSPECT_BATCHES_MAX_BATCHES ||
+			totalPaths > NATIVE_INSPECT_BATCHES_MAX_PATHS
+		) {
+			throw new Error("native metadata inspect batches 请求超出限制");
+		}
+		const requestBytes = Buffer.byteLength(JSON.stringify({ schemaVersion: 1, workspaceRoot, batches }), "utf8");
+		if (requestBytes > NATIVE_INSPECT_BATCHES_MAX_REQUEST_BYTES) {
+			throw new Error("native metadata inspect batches 请求字节数超出限制");
+		}
+		const budget = operationProcessOptions(NATIVE_INSPECT_TIMEOUT_MS);
+		const capabilities = await this.nativeCapabilities(requestDirectory);
+		if (!capabilities.inspectBatches) return undefined;
+		const executable = this.executable!;
+		const requestPath = join(requestDirectory, `native-inspect-batches-${process.pid}-${randomUUID()}.json`);
+		try {
+			await writeFile(requestPath, JSON.stringify({ schemaVersion: 1, workspaceRoot, batches }), {
+				mode: 0o600,
+				flag: "wx",
+			});
+			return await runNativeInspectBatches(executable, requestPath, batches, budget);
+		} finally {
+			await rm(requestPath, { force: true }).catch(() => {});
+		}
+	}
+	private nativeCapabilities(requestDirectory: string): Promise<NativeCapabilities> {
 		if (this.capability !== undefined) return this.capability;
 		this.capability = (async () => {
-			if (this.executable === undefined) return false;
+			if (this.executable === undefined) return { inspect: false, inspectBatches: false };
 			try {
 				await access(this.executable, constants.X_OK);
-				return await probeNativeInspect(this.executable, requestDirectory);
+				return await probeNativeCapabilities(this.executable, requestDirectory);
 			} catch {
-				return false;
+				return { inspect: false, inspectBatches: false };
 			}
 		})();
 		return this.capability;
 	}
 }
 
-async function probeNativeInspect(executable: string, isolatedDirectory: string): Promise<boolean> {
+async function probeNativeCapabilities(executable: string, isolatedDirectory: string): Promise<NativeCapabilities> {
 	try {
 		const result = await runSupervisedProcess({
 			command: executable,
@@ -89,12 +136,19 @@ async function probeNativeInspect(executable: string, isolatedDirectory: string)
 			outputOverflow: "terminate",
 			diagnosticCommand: "native:metadata-capabilities",
 		});
-		if (!result.stopped || result.outcome !== "exit" || result.code !== 0) return false;
+		if (!result.stopped || result.outcome !== "exit" || result.code !== 0) {
+			return { inspect: false, inspectBatches: false };
+		}
 		const value: unknown = JSON.parse(result.stdout.toString("utf8"));
-		return isRecord(value) && value.ok === true && Array.isArray(value.capabilities) &&
-			value.capabilities.includes("inspect-v1");
+		if (!isRecord(value) || value.ok !== true || !Array.isArray(value.capabilities)) {
+			return { inspect: false, inspectBatches: false };
+		}
+		return {
+			inspect: value.capabilities.includes("inspect-v1"),
+			inspectBatches: value.capabilities.includes("inspect-batches-v1"),
+		};
 	} catch {
-		return false;
+		return { inspect: false, inspectBatches: false };
 	}
 }
 
@@ -131,13 +185,74 @@ async function runNativeInspect(
 	return parseInspectResponse(result.stdout.toString("utf8"), expectedPaths);
 }
 
+async function runNativeInspectBatches(
+	executable: string,
+	requestPath: string,
+	expectedBatches: readonly (readonly string[])[],
+	budget: OperationProcessOptions,
+): Promise<readonly (readonly NativeMetadataEntry[])[]> {
+	const result = await runSupervisedProcess({
+		command: executable,
+		args: ["--inspect-batches", requestPath],
+		signal: budget.signal,
+		timeoutMs: budget.timeoutMs,
+		outputLimitBytes: NATIVE_INSPECT_OUTPUT_LIMIT,
+		outputOverflow: "terminate",
+		diagnosticCommand: "native:metadata-inspect-batches",
+	});
+	if (!result.stopped) {
+		throw new GitRunError("git_termination_failed", "native metadata inspect batches 进程未能确认终止");
+	}
+	if (result.outcome === "cancelled") {
+		throw new OperationError("operation_cancelled", "native metadata inspect batches 已被取消");
+	}
+	if (result.outcome === "timeout") {
+		throw new OperationError("operation_timeout", "native metadata inspect batches 超时");
+	}
+	if (result.outcome === "output_overflow") {
+		throw new Error("native metadata inspect batches 输出超过限制");
+	}
+	if (result.code !== 0) {
+		throw new Error(`native metadata inspect batches 失败：${result.stderr.toString("utf8").trim()}`);
+	}
+	return parseInspectBatchesResponse(result.stdout.toString("utf8"), expectedBatches);
+}
+
 function parseInspectResponse(text: string, expectedPaths: readonly string[]): readonly NativeMetadataEntry[] {
 	const value: unknown = JSON.parse(text);
 	if (!isRecord(value) || value.ok !== true || value.processed !== expectedPaths.length || !Array.isArray(value.entries)) {
 		throw new Error("native metadata inspect 响应无效");
 	}
-	if (value.entries.length !== expectedPaths.length) throw new Error("native metadata inspect 条目数量不匹配");
-	return value.entries.map((candidate, index) => {
+	return parseInspectEntries(value.entries, expectedPaths);
+}
+
+function parseInspectBatchesResponse(
+	text: string,
+	expectedBatches: readonly (readonly string[])[],
+): readonly (readonly NativeMetadataEntry[])[] {
+	const value: unknown = JSON.parse(text);
+	const expectedTotal = expectedBatches.reduce((total, batch) => total + batch.length, 0);
+	if (!isRecord(value) || value.ok !== true || value.processed !== expectedTotal || !Array.isArray(value.batches)) {
+		throw new Error("native metadata inspect batches 响应无效");
+	}
+	if (value.batches.length !== expectedBatches.length) {
+		throw new Error("native metadata inspect batches 数量不匹配");
+	}
+	return value.batches.map((candidate, index) => {
+		const expectedPaths = expectedBatches[index]!;
+		if (!isRecord(candidate) || candidate.processed !== expectedPaths.length || !Array.isArray(candidate.entries)) {
+			throw new Error("native metadata inspect batch 响应无效");
+		}
+		return parseInspectEntries(candidate.entries, expectedPaths);
+	});
+}
+
+function parseInspectEntries(
+	entries: readonly unknown[],
+	expectedPaths: readonly string[],
+): readonly NativeMetadataEntry[] {
+	if (entries.length !== expectedPaths.length) throw new Error("native metadata inspect 条目数量不匹配");
+	return entries.map((candidate, index) => {
 		if (!isRecord(candidate) || candidate.path !== expectedPaths[index] ||
 			!isMetadataKind(candidate.kind)) {
 			throw new Error("native metadata inspect 条目无效");

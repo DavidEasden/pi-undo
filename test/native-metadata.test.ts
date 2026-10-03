@@ -23,6 +23,46 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.env.PI_UNDO_DISABLE_NATIVE === "1")("NativeMetadataInspector", () => {
+	it("inspect-batches-v1 协议把多批路径合并到单次 helper 进程", async () => {
+		if (process.platform === "win32") return;
+		const helper = await executable(`
+import { readFileSync } from "node:fs";
+const [, , action, requestPath] = process.argv;
+if (action === "--capabilities") {
+  console.log(JSON.stringify({ ok: true, capabilities: ["inspect-v1", "inspect-batches-v1"] }));
+} else if (action === "--inspect-batches") {
+  const request = JSON.parse(readFileSync(requestPath, "utf8"));
+  const batches = request.batches.map((paths) => ({
+    processed: paths.length,
+    entries: paths.map((p) => ({ path: p, kind: "absent", dev: null, ino: null, mode: null, size: null, mtimeNs: null, ctimeNs: null })),
+  }));
+  const processed = batches.reduce((t, b) => t + b.processed, 0);
+  console.log(JSON.stringify({ ok: true, processed, batches }));
+} else {
+  process.exit(2);
+}
+`);
+		const inspector = new NativeMetadataInspector(helper.path);
+		const batches = [["a.txt", "b.txt"], ["c.txt"]];
+		const result = await inspector.inspectBatches(helper.root, batches, helper.root);
+		expect(result).toBeDefined();
+		expect(result).toHaveLength(2);
+		expect(result![0]).toHaveLength(2);
+		expect(result![1]).toHaveLength(1);
+		expect((await readdir(helper.root)).sort()).toEqual(["helper.mjs"]);
+	});
+
+	it("旧 helper 缺少 inspect-batches-v1 时 inspectBatches 返回 undefined", async () => {
+		if (process.platform === "win32") return;
+		const helper = await executable(`
+const action = process.argv[2];
+if (action === "--capabilities") console.log(JSON.stringify({ ok: true, capabilities: ["inspect-v1"] }));
+else process.exit(2);
+`);
+		const inspector = new NativeMetadataInspector(helper.path);
+		const result = await inspector.inspectBatches(helper.root, [["a.txt"]], helper.root);
+		expect(result).toBeUndefined();
+	});
 	it("严格解析 bigint metadata 并清理 request", async () => {
 		if (process.platform === "win32") return;
 		const helper = await executable(`

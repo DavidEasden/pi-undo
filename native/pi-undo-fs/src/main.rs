@@ -27,6 +27,10 @@ use std::os::unix::fs::MetadataExt;
 
 const MAGIC: &[u8] = b"PIUNDO-PACK-V1\0";
 const CONCURRENCY: usize = 32;
+const MAX_INSPECT_BATCHES: usize = 32;
+const MAX_INSPECT_BATCH_PATHS: usize = 8_192;
+const MAX_INSPECT_PATHS: usize = 16_384;
+const MAX_INSPECT_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -123,12 +127,12 @@ fn run() -> Result<(), String> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         println!(
             "{}",
-            r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","scan-directories-v1","scan-directories-v2","restore-files-v2"]}"#
+            r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","inspect-batches-v1","scan-directories-v1","scan-directories-v2","restore-files-v2"]}"#
         );
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
         println!(
             "{}",
-            r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","restore-files-v2"]}"#
+            r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","inspect-batches-v1","restore-files-v2"]}"#
         );
         #[cfg(not(unix))]
         println!("{}", r#"{"ok":true,"capabilities":["restore-v1"]}"#);
@@ -138,6 +142,12 @@ fn run() -> Result<(), String> {
     if first == "--scan-directories" {
         let path = std::env::args().nth(2).ok_or("缺少目录扫描 request path")?;
         return scan_directories::run(Path::new(&path));
+    }
+    if first == "--inspect-batches" {
+        let request_path = std::env::args()
+            .nth(2)
+            .ok_or("缺少 inspect batches request path")?;
+        return run_inspect_batches(Path::new(&request_path));
     }
     if first == "--inspect" {
         let request_path = std::env::args().nth(2).ok_or("缺少 inspect request path")?;
@@ -274,11 +284,19 @@ fn run_restore(request_path: &Path) -> Result<(), String> {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct InspectRequest {
     schema_version: u32,
     workspace_root: String,
     paths: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InspectBatchesRequest {
+    schema_version: u32,
+    workspace_root: String,
+    batches: Vec<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -287,6 +305,21 @@ struct InspectResponse {
     ok: bool,
     processed: usize,
     entries: Vec<InspectEntry>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InspectBatchResponse {
+    processed: usize,
+    entries: Vec<InspectEntry>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InspectBatchesResponse {
+    ok: bool,
+    processed: usize,
+    batches: Vec<InspectBatchResponse>,
 }
 
 #[derive(Serialize)]
@@ -304,39 +337,19 @@ struct InspectEntry {
 
 fn run_inspect(request_path: &Path) -> Result<(), String> {
     let request_bytes = fs::read(request_path).map_err(error("读取 inspect request 失败"))?;
+    ensure_inspect_request_size(&request_bytes)?;
     let request: InspectRequest = serde_json::from_slice(&request_bytes)
         .map_err(|error| format!("解析 inspect request 失败: {error}"))?;
     if request.schema_version != 1 {
         return Err("inspect schemaVersion 不受支持".into());
     }
-    let workspace =
-        fs::canonicalize(&request.workspace_root).map_err(error("workspace canonicalize 失败"))?;
-    if workspace.as_path() != Path::new(&request.workspace_root) {
-        return Err("workspaceRoot 必须是 canonical path".into());
-    }
+    let workspace = canonical_workspace(&request.workspace_root)?;
     #[cfg(not(unix))]
     return Err("当前平台 native metadata inspect 不受支持".into());
     #[cfg(unix)]
     {
         let mut seen = BTreeSet::new();
-        let mut parents = BTreeSet::new();
-        for path in &request.paths {
-            validate_relative_path(path)?;
-            if !seen.insert(path.clone()) {
-                return Err(format!("inspect 路径重复：{path}"));
-            }
-            let parts = Path::new(path).components().collect::<Vec<_>>();
-            let mut parent = PathBuf::new();
-            for component in parts.iter().take(parts.len().saturating_sub(1)) {
-                if let Component::Normal(value) = component {
-                    parent.push(value);
-                    parents.insert(parent.clone());
-                }
-            }
-        }
-        assert_inspect_parents(&workspace, &parents)?;
-        let entries = parallel_inspect(&workspace, request.paths)?;
-        assert_inspect_parents(&workspace, &parents)?;
+        let entries = inspect_paths(&workspace, request.paths, &mut seen)?;
         let response = InspectResponse {
             ok: true,
             processed: entries.len(),
@@ -349,6 +362,70 @@ fn run_inspect(request_path: &Path) -> Result<(), String> {
         );
         Ok(())
     }
+}
+
+fn run_inspect_batches(request_path: &Path) -> Result<(), String> {
+    let request_bytes = fs::read(request_path).map_err(error("读取 inspect batches request 失败"))?;
+    ensure_inspect_request_size(&request_bytes)?;
+    let request: InspectBatchesRequest = serde_json::from_slice(&request_bytes)
+        .map_err(|error| format!("解析 inspect batches request 失败: {error}"))?;
+    if request.schema_version != 1 {
+        return Err("inspect batches schemaVersion 不受支持".into());
+    }
+    if request.batches.is_empty() || request.batches.len() > MAX_INSPECT_BATCHES {
+        return Err("inspect batches 数量超出限制".into());
+    }
+    let total = request
+        .batches
+        .iter()
+        .try_fold(0usize, |total, batch| total.checked_add(batch.len()))
+        .ok_or("inspect batches 路径数量溢出")?;
+    if total > MAX_INSPECT_PATHS {
+        return Err("inspect batches 路径数量超出限制".into());
+    }
+    let workspace = canonical_workspace(&request.workspace_root)?;
+    #[cfg(not(unix))]
+    return Err("当前平台 native metadata inspect 不受支持".into());
+    #[cfg(unix)]
+    {
+        let mut seen = BTreeSet::new();
+        let mut processed = 0usize;
+        let mut batches = Vec::with_capacity(request.batches.len());
+        for paths in request.batches {
+            let entries = inspect_paths(&workspace, paths, &mut seen)?;
+            processed += entries.len();
+            batches.push(InspectBatchResponse {
+                processed: entries.len(),
+                entries,
+            });
+        }
+        let response = InspectBatchesResponse {
+            ok: true,
+            processed,
+            batches,
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&response)
+                .map_err(|error| format!("编码 inspect batches response 失败: {error}"))?
+        );
+        Ok(())
+    }
+}
+
+fn ensure_inspect_request_size(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > MAX_INSPECT_REQUEST_BYTES {
+        return Err("inspect request 字节数超出限制".into());
+    }
+    Ok(())
+}
+
+fn canonical_workspace(path: &str) -> Result<PathBuf, String> {
+    let workspace = fs::canonicalize(path).map_err(error("workspace canonicalize 失败"))?;
+    if workspace.as_path() != Path::new(path) {
+        return Err("workspaceRoot 必须是 canonical path".into());
+    }
+    Ok(workspace)
 }
 
 fn validate_relative_path(relative: &str) -> Result<(), String> {
@@ -366,6 +443,36 @@ fn validate_relative_path(relative: &str) -> Result<(), String> {
         return Err(format!("不安全 inspect 路径：{relative}"));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn inspect_paths(
+    workspace: &Path,
+    paths: Vec<String>,
+    seen: &mut BTreeSet<String>,
+) -> Result<Vec<InspectEntry>, String> {
+    if paths.len() > MAX_INSPECT_BATCH_PATHS {
+        return Err("inspect batch 路径数量超出限制".into());
+    }
+    let mut parents = BTreeSet::new();
+    for path in &paths {
+        validate_relative_path(path)?;
+        if !seen.insert(path.clone()) {
+            return Err(format!("inspect 路径重复：{path}"));
+        }
+        let parts = Path::new(path).components().collect::<Vec<_>>();
+        let mut parent = PathBuf::new();
+        for component in parts.iter().take(parts.len().saturating_sub(1)) {
+            if let Component::Normal(value) = component {
+                parent.push(value);
+                parents.insert(parent.clone());
+            }
+        }
+    }
+    assert_inspect_parents(workspace, &parents)?;
+    let entries = parallel_inspect(workspace, paths)?;
+    assert_inspect_parents(workspace, &parents)?;
+    Ok(entries)
 }
 
 #[cfg(unix)]
@@ -915,6 +1022,35 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    fn batches_request(root: &Path, batches: &[&[&str]]) -> PathBuf {
+        let path = root.join("batches-request.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1,
+                "workspaceRoot": root,
+                "batches": batches,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn inspect_batches_preserve_order_and_reject_cross_batch_duplicates() {
+        let root = fixture();
+        fs::write(root.join("a.txt"), b"a").unwrap();
+        fs::write(root.join("b.txt"), b"b").unwrap();
+        let request_path = batches_request(&root, &[&["a.txt"], &["b.txt"]]);
+        run_inspect_batches(&request_path).unwrap();
+        let duplicate_request = batches_request(&root, &[&["a.txt"], &["a.txt"]]);
+        assert!(run_inspect_batches(&duplicate_request)
+            .unwrap_err()
+            .contains("inspect 路径重复"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

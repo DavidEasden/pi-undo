@@ -638,6 +638,35 @@ describe("SnapshotStore", () => {
 		await store.assertComplete(manifest.manifestId);
 	});
 
+	it("listTree 复用目录前缀并批量读取 symlink blob", async () => {
+		const workspace = await temporaryRoot("pi-undo-list-tree-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await mkdir(join(workspace, "nested", "deeper"), { recursive: true });
+		await writeFixtureFile(workspace, "nested/deeper/file.txt", "content\n");
+		await symlink("../deeper/file.txt", join(workspace, "nested", "link-one"));
+		await symlink("nested/deeper/file.txt", join(workspace, "link-two"));
+
+		const git = new RecordingGitRunner();
+		const topology = await new RootDiscovery(git).discover(workspace);
+		const store = new SnapshotStore({ storeRoot, git });
+		const manifest = await store.capture(topology);
+		git.calls.length = 0;
+
+		const entries = await store.listTree(manifest.manifestId, ".");
+
+		expect(entries.filter((entry) => entry.kind === "directory").map((entry) => entry.relativePath))
+			.toEqual(["nested", "nested/deeper"]);
+		expect(entries.find((entry) => entry.relativePath === "nested/link-one")).toEqual(
+			expect.objectContaining({ kind: "symlink", linkText: "../deeper/file.txt" }),
+		);
+		expect(entries.find((entry) => entry.relativePath === "link-two")).toEqual(
+			expect.objectContaining({ kind: "symlink", linkText: "nested/deeper/file.txt" }),
+		);
+		const blobBatchCalls = git.calls.filter((call) => call.args[0] === "cat-file" && call.args[1] === "--batch");
+		expect(blobBatchCalls).toHaveLength(1);
+		expect(git.calls.some((call) => call.args[0] === "cat-file" && call.args[1] === "blob")).toBe(false);
+	});
+
 	it("可见叶子为空时不调用 native metadata inspect", async () => {
 		const workspace = await temporaryRoot("pi-undo-snapshot-");
 		const storeRoot = await temporaryRoot("pi-undo-store-");
