@@ -87,6 +87,7 @@ async function probeNativeInspect(executable: string, isolatedDirectory: string)
 			timeoutMs: NATIVE_PROBE_TIMEOUT_MS,
 			outputLimitBytes: NATIVE_PROBE_OUTPUT_LIMIT,
 			outputOverflow: "terminate",
+			diagnosticCommand: "native:metadata-capabilities",
 		});
 		if (!result.stopped || result.outcome !== "exit" || result.code !== 0) return false;
 		const value: unknown = JSON.parse(result.stdout.toString("utf8"));
@@ -110,6 +111,7 @@ async function runNativeInspect(
 		timeoutMs: budget.timeoutMs,
 		outputLimitBytes: NATIVE_INSPECT_OUTPUT_LIMIT,
 		outputOverflow: "terminate",
+		diagnosticCommand: "native:metadata-inspect",
 	});
 	if (!result.stopped) {
 		throw new GitRunError("git_termination_failed", "native metadata inspect 进程未能确认终止");

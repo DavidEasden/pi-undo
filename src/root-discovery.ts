@@ -215,9 +215,31 @@ export class RootDiscovery {
 			"--show-toplevel",
 			"--git-dir",
 			"--git-common-dir",
+			"HEAD",
 		]);
 		if (details === null) {
-			return { kind: "broken", absoluteRoot };
+			// unborn repository 没有 HEAD；保留旧行为：root 仍可作为 active，但 treeId 为空。
+			const metadata = await this.gitOutput([
+				"-C",
+				absoluteRoot,
+				"rev-parse",
+				"--show-toplevel",
+				"--git-dir",
+				"--git-common-dir",
+			]);
+			if (metadata === null) return { kind: "broken", absoluteRoot };
+			const metadataLines = metadata.trimEnd().split("\n");
+			if (metadataLines.length < 3) return { kind: "broken", absoluteRoot };
+			const remote = await this.gitOutput(["-C", absoluteRoot, "config", "--get", "remote.origin.url"]);
+			return {
+				kind: "active",
+				repository: {
+					absoluteRoot,
+					commonGitDir: resolve(absoluteRoot, metadataLines[2]),
+					sourceIdentity: remote?.trim() || `git:${resolve(absoluteRoot, metadataLines[2])}`,
+					treeId: null,
+				},
+			};
 		}
 		const lines = details.trimEnd().split("\n");
 		if (lines.length < 3) {
@@ -233,7 +255,7 @@ export class RootDiscovery {
 
 		const commonGitDir = resolve(absoluteRoot, lines[2]);
 		const remote = await this.gitOutput(["-C", absoluteRoot, "config", "--get", "remote.origin.url"]);
-		const head = await this.gitOutput(["-C", absoluteRoot, "rev-parse", "HEAD"]);
+		const head = lines[3] !== undefined && /^[0-9a-f]{40,64}$/.test(lines[3]) ? lines[3] : null;
 		return {
 			kind: "active",
 			repository: {

@@ -15,6 +15,7 @@ export async function probeNativeCapabilities(
 			...budget,
 			outputLimitBytes: 64 * 1024,
 			outputOverflow: "terminate",
+			diagnosticCommand: "native:capabilities",
 		});
 		if (!result.stopped) throw new GitRunError("git_termination_failed", "native 能力探测进程未能确认终止");
 		if (result.outcome === "cancelled") {

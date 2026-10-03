@@ -41,7 +41,9 @@ const HASH_BATCH_MAX_ARGUMENT_BYTES = process.platform === "win32" ? 24 * 1024 :
 const HASH_BATCH_CONCURRENCY = 4;
 const ROOT_CAPTURE_CONCURRENCY = 4;
 const FILE_SYSTEM_INSPECTION_CONCURRENCY = 32;
-const METADATA_BATCH_SIZE = 1_024;
+const METADATA_BATCH_MAX_PATHS = 2_048;
+const METADATA_BATCH_HARD_MAX_PATHS = 8_192;
+const METADATA_BATCH_MAX_PATH_BYTES = 1 * 1024 * 1024;
 const INDEX_BATCH_MAX_ENTRIES = 4_096;
 const INDEX_BATCH_MAX_BYTES = 8 * 1024 * 1024;
 const BLOB_CACHE_MAX_BYTES = 128 * 1024 * 1024;
@@ -1115,8 +1117,7 @@ export class SnapshotStore {
 		// 空路径不得触发 native inspect；首批 unsupported 才整体回退，中途变化必须 fail closed。
 		if (paths.length === 0) return [];
 		const result: NativeMetadataEntry[] = [];
-		for (let offset = 0; offset < paths.length; offset += METADATA_BATCH_SIZE) {
-			const batch = paths.slice(offset, offset + METADATA_BATCH_SIZE);
+		for (const batch of metadataPathBatches(paths, configuredMetadataBatchMaxPaths())) {
 			const inspected = await this.nativeMetadata.inspect(cwd, batch, requestDirectory);
 			if (inspected === undefined) {
 				if (result.length > 0) {
@@ -1134,8 +1135,7 @@ export class SnapshotStore {
 		paths: readonly string[],
 	): Promise<readonly NativeMetadataEntry["kind"][]> {
 		const result: NativeMetadataEntry["kind"][] = [];
-		for (let offset = 0; offset < paths.length; offset += METADATA_BATCH_SIZE) {
-			const batch = paths.slice(offset, offset + METADATA_BATCH_SIZE);
+		for (const batch of metadataPathBatches(paths, configuredMetadataBatchMaxPaths())) {
 			await assertNoSymlinkParents(cwd, batch);
 			const kinds = await mapConcurrentOrdered(batch, FILE_SYSTEM_INSPECTION_CONCURRENCY, async (relativePath) => {
 				const metadata = await lstat(join(cwd, ...relativePath.split("/"))).catch((error) => {
@@ -2291,6 +2291,37 @@ async function mapConcurrentOrdered<T, R>(
 	await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, () => worker()));
 	if (failed) throw failure;
 	return result;
+}
+
+function metadataPathBatches(paths: readonly string[], maxPaths: number): string[][] {
+	const result: string[][] = [];
+	let batch: string[] = [];
+	let pathBytes = 0;
+	for (const path of paths) {
+		const nextPathBytes = Buffer.byteLength(path, "utf8") + 1;
+		if (
+			batch.length > 0 &&
+			(batch.length >= maxPaths || pathBytes + nextPathBytes > METADATA_BATCH_MAX_PATH_BYTES)
+		) {
+			result.push(batch);
+			batch = [];
+			pathBytes = 0;
+		}
+		batch.push(path);
+		pathBytes += nextPathBytes;
+	}
+	if (batch.length > 0) result.push(batch);
+	return result;
+}
+
+function configuredMetadataBatchMaxPaths(): number {
+	const raw = process.env.PI_UNDO_METADATA_BATCH_MAX_PATHS;
+	if (raw === undefined || raw === "") return METADATA_BATCH_MAX_PATHS;
+	const value = Number(raw);
+	if (!Number.isSafeInteger(value) || value <= 0 || value > METADATA_BATCH_HARD_MAX_PATHS) {
+		throw new Error(`PI_UNDO_METADATA_BATCH_MAX_PATHS 必须是 1-${METADATA_BATCH_HARD_MAX_PATHS} 的整数`);
+	}
+	return value;
 }
 
 function hashPathBatches(leaves: readonly VisibleLeaf[]): VisibleLeaf[][] {

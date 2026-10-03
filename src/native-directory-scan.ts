@@ -84,6 +84,7 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 				...budget,
 				outputLimitBytes: 32 * 1024 * 1024,
 				outputOverflow: "terminate",
+				diagnosticCommand: "native:scan-directories",
 			});
 			if (!result.stopped) throw new GitRunError("git_termination_failed", "native 目录扫描进程未能确认终止");
 			if (result.outcome === "cancelled") {

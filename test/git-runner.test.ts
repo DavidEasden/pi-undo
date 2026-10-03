@@ -302,7 +302,29 @@ child.unref();
 	});
 });
 
-describe("runSupervisedProcess", () => {
+	describe("runSupervisedProcess", () => {
+	it("原生 helper 诊断记录稳定标签和捕获输出字节数", async () => {
+		const executable = await scriptExecutable("helper", "printf 'abc'; printf 'de' >&2");
+		const records: ProcessDiagnostic[] = [];
+		const scope = createOperationScope({ onProcess: (record) => records.push(record) });
+		try {
+			await runWithOperationContext(scope.context, () => runSupervisedProcess({
+				command: executable,
+				args: [],
+				timeoutMs: 5_000,
+				outputLimitBytes: 1_024,
+				diagnosticCommand: "native:test",
+			}));
+			expect(records).toEqual([expect.objectContaining({
+				command: "native:test",
+				outcome: "exit",
+				outputBytes: 5,
+			})]);
+		} finally {
+			scope.dispose();
+		}
+	});
+
 	it("超时终止进程组并确认退出", async () => {
 		const marker = await markerPath();
 		const executable = await scriptExecutable(

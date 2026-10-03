@@ -120,6 +120,8 @@ async function runNative(
 		signal: budget.signal,
 		timeoutMs: budget.timeoutMs,
 		outputLimitBytes: NATIVE_OUTPUT_LIMIT,
+		outputOverflow: "terminate",
+		diagnosticCommand: "native:restore",
 	});
 	if (!result.stopped) {
 		// 无法证明 helper 已停止：保留 lease，让上层走恢复流程。

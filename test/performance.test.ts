@@ -224,7 +224,7 @@ describe("undo/redo restore performance", () => {
 			expect(manifest.roots[0]?.ignoredPresentPaths).toHaveLength(2_100);
 			const ignoredBatches = nativeMetadata.calls.filter((paths) =>
 				paths.length > 0 && paths.every((path) => path.startsWith("ignored/")));
-			expect(ignoredBatches.map((paths) => paths.length)).toEqual([1_024, 1_024, 52]);
+			expect(ignoredBatches.map((paths) => paths.length)).toEqual([2_048, 52]);
 
 			nativeMetadata.failOnIgnoredBatch = 2;
 			nativeMetadata.resetIgnoredBatches();
@@ -235,7 +235,7 @@ describe("undo/redo restore performance", () => {
 		}
 	}, 30_000);
 
-	it("大量可见叶子初检与最终复核都按 1024 分批并保持路径顺序", async () => {
+	it("大量可见叶子初检与最终复核都按 2048 分批并保持路径顺序", async () => {
 		const { workspace, storeRoot } = await createVisibleLeafWorkspace(2_100);
 		try {
 			const nativeMetadata = new RecordingMetadataPort();
@@ -247,15 +247,37 @@ describe("undo/redo restore performance", () => {
 			const captured = (await store.listTree(manifest.manifestId, "."))
 				.filter((entry) => entry.kind !== "directory");
 			expect(captured).toHaveLength(2_100);
-			expect(nativeMetadata.calls.map((paths) => paths.length)).toEqual([1_024, 1_024, 52, 1_024, 1_024, 52]);
-			const initial = nativeMetadata.calls.slice(0, 3).flat();
-			const finalReview = nativeMetadata.calls.slice(3, 6).flat();
+			expect(nativeMetadata.calls.map((paths) => paths.length)).toEqual([2_048, 52, 2_048, 52]);
+			const initial = nativeMetadata.calls.slice(0, 2).flat();
+			const finalReview = nativeMetadata.calls.slice(2, 4).flat();
 			expect(initial).toHaveLength(2_100);
 			expect(finalReview).toEqual(initial);
-			expect(nativeMetadata.calls[0]).toEqual(initial.slice(0, 1_024));
-			expect(nativeMetadata.calls[1]).toEqual(initial.slice(1_024, 2_048));
-			expect(nativeMetadata.calls[2]).toEqual(initial.slice(2_048));
+			expect(nativeMetadata.calls[0]).toEqual(initial.slice(0, 2_048));
+			expect(nativeMetadata.calls[1]).toEqual(initial.slice(2_048));
+			expect(nativeMetadata.calls[2]).toEqual(initial.slice(0, 2_048));
+			expect(nativeMetadata.calls[3]).toEqual(initial.slice(2_048));
 		} finally {
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	it("metadata inspect 批次可通过环境变量调优且保持双阶段复核", async () => {
+		const { workspace, storeRoot } = await createVisibleLeafWorkspace(2_100);
+		const previous = process.env.PI_UNDO_METADATA_BATCH_MAX_PATHS;
+		process.env.PI_UNDO_METADATA_BATCH_MAX_PATHS = "4096";
+		try {
+			const nativeMetadata = new RecordingMetadataPort();
+			const discovery = new RootDiscovery();
+			const store = new SnapshotStore({ storeRoot, discovery, nativeMetadata });
+			const topology = await discovery.discover(workspace);
+
+			await store.capture(topology);
+
+			expect(nativeMetadata.calls.map((paths) => paths.length)).toEqual([2_100, 2_100]);
+		} finally {
+			if (previous === undefined) delete process.env.PI_UNDO_METADATA_BATCH_MAX_PATHS;
+			else process.env.PI_UNDO_METADATA_BATCH_MAX_PATHS = previous;
 			await rm(workspace, { recursive: true, force: true });
 			await rm(storeRoot, { recursive: true, force: true });
 		}
@@ -274,7 +296,7 @@ describe("undo/redo restore performance", () => {
 			const captured = (await store.listTree(manifest.manifestId, "."))
 				.filter((entry) => entry.kind !== "directory");
 			expect(captured).toHaveLength(2_100);
-			expect(nativeMetadata.calls.map((paths) => paths.length)).toEqual([1_024, 1_024]);
+			expect(nativeMetadata.calls.map((paths) => paths.length)).toEqual([2_048, 2_048]);
 		} finally {
 			await rm(workspace, { recursive: true, force: true });
 			await rm(storeRoot, { recursive: true, force: true });
@@ -291,7 +313,7 @@ describe("undo/redo restore performance", () => {
 			const topology = await discovery.discover(workspace);
 
 			await expect(store.capture(topology)).rejects.toMatchObject({ code: "capture_failed" });
-			expect(nativeMetadata.calls.map((paths) => paths.length)).toEqual([1_024, 1_024]);
+			expect(nativeMetadata.calls.map((paths) => paths.length)).toEqual([2_048, 52]);
 		} finally {
 			await rm(workspace, { recursive: true, force: true });
 			await rm(storeRoot, { recursive: true, force: true });
@@ -319,14 +341,14 @@ describe("undo/redo restore performance", () => {
 		const { workspace, storeRoot } = await createVisibleLeafWorkspace(2_100);
 		try {
 			const nativeMetadata = new RecordingMetadataPort();
-			nativeMetadata.mutateOnCall = 4;
+			nativeMetadata.mutateOnCall = 3;
 			const discovery = new RootDiscovery();
 			const store = new SnapshotStore({ storeRoot, discovery, nativeMetadata });
 			const topology = await discovery.discover(workspace);
 
 			await expect(store.capture(topology)).rejects.toMatchObject({ code: "capture_failed" });
-			// 最终复核先分批 inspect 再比对 fingerprint，因此跨批变化仍会跑完 1024/1024/52。
-			expect(nativeMetadata.calls.map((paths) => paths.length)).toEqual([1_024, 1_024, 52, 1_024, 1_024, 52]);
+			// 最终复核先分批 inspect 再比对 fingerprint，因此跨批变化仍会跑完 2048/52。
+			expect(nativeMetadata.calls.map((paths) => paths.length)).toEqual([2_048, 52, 2_048, 52]);
 		} finally {
 			await rm(workspace, { recursive: true, force: true });
 			await rm(storeRoot, { recursive: true, force: true });

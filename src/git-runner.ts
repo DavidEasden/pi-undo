@@ -380,6 +380,8 @@ export interface SupervisedProcessRequest {
 	readonly signal?: AbortSignal;
 	readonly timeoutMs: number;
 	readonly outputLimitBytes: number;
+	/** 仅用于诊断的稳定命令标签，不包含路径或其他敏感参数。 */
+	readonly diagnosticCommand?: string;
 	/** 输出超过限制时：truncate 只停止捕获，terminate 先终止进程组。 */
 	readonly outputOverflow?: "truncate" | "terminate";
 }
@@ -401,13 +403,21 @@ export async function runSupervisedProcess(request: SupervisedProcessRequest): P
 	const started = performance.now();
 	let outcome = "failed";
 	let exitCode: number | null = null;
+	let outputBytes: number | undefined;
 	try {
 		const result = await superviseProcess(request);
+		outputBytes = result.stdout.byteLength + result.stderr.byteLength;
 		outcome = result.stopped ? result.outcome : "process_exit_unconfirmed";
 		exitCode = result.code;
 		return result;
 	} finally {
-		reportProcessDiagnostic({ command: "native-helper", durationMs: Math.round(performance.now() - started), outcome, exitCode });
+		reportProcessDiagnostic({
+			command: request.diagnosticCommand ?? "native-helper",
+			durationMs: Math.round(performance.now() - started),
+			outcome,
+			exitCode,
+			...(outputBytes === undefined ? {} : { outputBytes }),
+		});
 	}
 }
 
