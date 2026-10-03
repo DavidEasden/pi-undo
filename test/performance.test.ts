@@ -691,6 +691,50 @@ describe("undo/redo restore performance", () => {
 		}
 	}, 120_000);
 
+	it("restore post verification 复用未受影响路径的 metadata attestation", async () => {
+		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-attestation-"));
+		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-attestation-store-"));
+		const journalRoot = await mkdtemp(join(tmpdir(), "pi-undo-attestation-journal-"));
+		class RecordingReadBlobStore extends SnapshotStore {
+			readonly reads: Array<{ manifestId: ManifestId; relativePath: string | undefined }> = [];
+
+			override async readBlob(
+				manifestId: ManifestId,
+				rootPath: string,
+				blobId: string,
+				relativePath?: string,
+			): Promise<Uint8Array> {
+				this.reads.push({ manifestId, relativePath });
+				return super.readBlob(manifestId, rootPath, blobId, relativePath);
+			}
+		}
+		try {
+			await writeFile(join(workspace, "changed.txt"), "target\n");
+			await writeFile(join(workspace, "stable.txt"), "stable\n");
+			const discovery = new RootDiscovery();
+			const store = new RecordingReadBlobStore({ storeRoot, discovery });
+			const restore = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+			const target = await store.capture(await discovery.discover(workspace));
+			await writeFile(join(workspace, "changed.txt"), "current\n");
+			const current = await store.capture(await discovery.discover(workspace));
+			const plan = await restore.plan(current, target);
+			store.reads.length = 0;
+
+			const result = await restore.apply(plan, target, {
+				opId: "op-attestation-reuse",
+				mutationJournal: new MutationJournal(join(journalRoot, "mutations.jsonl"), "op-attestation-reuse"),
+			});
+
+			expect(result.code).toBe("ok");
+			expect(store.reads.filter((read) => read.relativePath === "stable.txt")).toHaveLength(1);
+			expect(store.reads.filter((read) => read.relativePath === "changed.txt").length).toBeGreaterThanOrEqual(2);
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+			await rm(journalRoot, { recursive: true, force: true });
+		}
+	}, 120_000);
+
 	it("scoped restore 的 Git 调用数不随未改动文件线性增长", async () => {
 		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-perf-"));
 		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-perf-store-"));

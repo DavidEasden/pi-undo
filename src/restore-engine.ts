@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { BigIntStats } from "node:fs";
 import { realpathSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, rmdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -97,6 +98,22 @@ interface OwnedPath {
 	readonly absolutePath: string;
 	readonly entry: RestorePath;
 	readonly root: SnapshotRoot;
+}
+
+interface PathAttestation {
+	readonly fingerprint: string;
+	readonly dev: bigint;
+	readonly ino: bigint;
+	readonly mode: bigint;
+	readonly size: bigint;
+	readonly mtimeNs: bigint;
+	readonly ctimeNs: bigint;
+	readonly linkText?: string;
+}
+
+interface EntryVerification {
+	readonly fingerprint: string;
+	readonly attestation: PathAttestation;
 }
 
 interface VisibleSubsetCheck {
@@ -901,7 +918,17 @@ export class RestoreEngine {
 			rethrowOperationFailure(error);
 			// 预取是性能优化；失败时继续走原有逐文件校验和可恢复 mutation 路径。
 		}
-		const preflight = await this.verifyKnownState(current, target, currentPaths, targetPaths, plan.scopePaths);
+		const reusableTargetPaths = new Set(
+			[...targetPaths.keys()].filter((path) => !isPathAffectedByMutations(path, plan.deletePaths, plan.writePaths)),
+		);
+		const preflight = await this.verifyKnownState(
+			current,
+			target,
+			currentPaths,
+			targetPaths,
+			plan.scopePaths,
+			reusableTargetPaths,
+		);
 		if (!preflight.ok) {
 			return {
 				code: "restore_failed_safe",
@@ -954,6 +981,7 @@ export class RestoreEngine {
 				targetPaths,
 				plan.deletePaths,
 				plan.scopePaths,
+				preflight.targetAttestations,
 			);
 			const result: RestoreResult = {
 				code: "ok",
@@ -1253,8 +1281,14 @@ export class RestoreEngine {
 		target: SnapshotManifest,
 		currentPaths: ReadonlyMap<string, OwnedPath>,
 		targetPaths: ReadonlyMap<string, OwnedPath>,
-		scopePaths?: readonly string[],
-	): Promise<{ ok: boolean; verifiedPaths: number; totalPaths: number }> {
+		scopePaths: readonly string[] | undefined,
+		reusableTargetPaths: ReadonlySet<string>,
+	): Promise<{
+		ok: boolean;
+		verifiedPaths: number;
+		totalPaths: number;
+		targetAttestations: ReadonlyMap<string, PathAttestation>;
+	}> {
 		const scope = scopePaths === undefined ? undefined : new Set(scopePaths);
 		const paths = [...new Set([...currentPaths.keys(), ...targetPaths.keys()])]
 			.filter((path) => scope === undefined || scope.has(path))
@@ -1264,18 +1298,43 @@ export class RestoreEngine {
 		let stop = false;
 		let failure: unknown;
 		let failureIndex: number | undefined;
+		const targetAttestations = new Map<string, PathAttestation>();
 		const verifyPath = async (path: string): Promise<boolean> => {
 			if (await this.pathIsShadowedByTarget(target.manifestId, path, targetPaths)) return true;
 			const currentPath = currentPaths.get(path);
 			const targetPath = targetPaths.get(path);
-			const matchesCurrent = currentPath !== undefined &&
-				await this.entryMatches(current.manifestId, currentPath);
-			const matchesTarget = !matchesCurrent && targetPath !== undefined &&
-				await this.entryMatches(target.manifestId, targetPath);
-			const matchesAbsentSide = !matchesCurrent && !matchesTarget &&
+			let currentVerification: EntryVerification | undefined;
+			if (currentPath !== undefined) {
+				try {
+					currentVerification = await this.verifyEntryWithAttestation(current.manifestId, currentPath);
+				} catch {
+					// current 不匹配时继续验证 target；保持 apply 前拒绝未知状态的语义。
+				}
+			}
+			if (currentVerification !== undefined) {
+				if (
+					targetPath !== undefined && reusableTargetPaths.has(path) &&
+					entriesEquivalent(currentPath!, targetPath)
+				) {
+					targetAttestations.set(path, currentVerification.attestation);
+				}
+				return true;
+			}
+			if (targetPath !== undefined) {
+				try {
+					const targetVerification = await this.verifyEntryWithAttestation(target.manifestId, targetPath);
+					if (reusableTargetPaths.has(path)) {
+						targetAttestations.set(path, targetVerification.attestation);
+					}
+					return true;
+				} catch {
+					// 继续检查 absent side；若路径仍存在但内容未知，最终返回 false。
+				}
+			}
+			const matchesAbsentSide =
 				(currentPath === undefined || targetPath === undefined) &&
 				await this.pathIsAbsent(path);
-			return matchesCurrent || matchesTarget || matchesAbsentSide;
+			return matchesAbsentSide;
 		};
 		const worker = async (): Promise<void> => {
 			while (!stop && nextIndex < paths.length) {
@@ -1303,14 +1362,24 @@ export class RestoreEngine {
 		let verifiedPaths = 0;
 		for (let index = 0; index < results.length; index += 1) {
 			const ok = results[index];
-			if (ok === false) return { ok: false, verifiedPaths, totalPaths: paths.length };
+			if (ok === false) return {
+				ok: false,
+				verifiedPaths,
+				totalPaths: paths.length,
+				targetAttestations,
+			};
 			if (ok === undefined) {
 				if (failureIndex === index && failure !== undefined) throw failure;
-				return { ok: false, verifiedPaths, totalPaths: paths.length };
+				return {
+					ok: false,
+					verifiedPaths,
+					totalPaths: paths.length,
+					targetAttestations,
+				};
 			}
 			verifiedPaths += 1;
 		}
-		return { ok: true, verifiedPaths, totalPaths: paths.length };
+		return { ok: true, verifiedPaths, totalPaths: paths.length, targetAttestations };
 	}
 
 	private async deletePlannedPaths(
@@ -1823,13 +1892,14 @@ export class RestoreEngine {
 		targetPaths: ReadonlyMap<string, OwnedPath>,
 		deletePaths: readonly string[],
 		scopePaths?: readonly string[],
+		reusableAttestations: ReadonlyMap<string, PathAttestation> = new Map(),
 	): Promise<{ verifiedPaths: number; totalPaths: number; pathFingerprints: string[] }> {
 		const scope = scopePaths === undefined ? undefined : new Set(scopePaths);
 		const scopedTargets = [...targetPaths].filter(([path]) => scope === undefined || scope.has(path));
 		const pathFingerprints = await mapConcurrentOrdered(
 			scopedTargets,
 			RESTORE_FILE_VERIFY_CONCURRENCY,
-			([, owned]) => this.verifyEntry(target.manifestId, owned),
+			([path, owned]) => this.verifyTargetEntry(target.manifestId, owned, reusableAttestations.get(path)),
 		);
 		const remainingDeletes = deletePaths.filter((path) =>
 			!targetPaths.has(path) &&
@@ -1934,26 +2004,46 @@ export class RestoreEngine {
 		return false;
 	}
 
+	private async verifyTargetEntry(
+		manifestId: ManifestId,
+		owned: OwnedPath,
+		attestation: PathAttestation | undefined,
+	): Promise<string> {
+		if (attestation !== undefined && await this.matchesAttestation(owned, attestation)) {
+			return attestation.fingerprint;
+		}
+		return (await this.verifyEntryWithAttestation(manifestId, owned)).fingerprint;
+	}
+
 	private async verifyEntry(manifestId: ManifestId, owned: OwnedPath): Promise<string> {
+		return (await this.verifyEntryWithAttestation(manifestId, owned)).fingerprint;
+	}
+
+	private async verifyEntryWithAttestation(manifestId: ManifestId, owned: OwnedPath): Promise<EntryVerification> {
 		const path = owned.absolutePath;
 		await assertNoSymlinkEscape(this.workspaceRoot, path);
-		const metadata = await lstat(this.absolutePath(path));
+		const metadata = await lstat(this.absolutePath(path), { bigint: true });
 		if (owned.entry.kind === "directory") {
 			if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
 				throw new Error(`目录类型校验失败：${path}`);
 			}
-			return checksum(canonicalJson({ path, kind: "directory" }));
+			return verifiedEntry(metadata, checksum(canonicalJson({ path, kind: "directory" })));
 		}
 		if (owned.entry.kind === "symlink") {
-			if (!metadata.isSymbolicLink() || await readlink(this.absolutePath(path)) !== owned.entry.linkText) {
+			const linkText = await readlink(this.absolutePath(path));
+			if (!metadata.isSymbolicLink() || linkText !== owned.entry.linkText) {
 				throw new Error(`symlink 校验失败：${path}`);
 			}
-			return checksum(canonicalJson({ path, kind: "symlink", linkText: owned.entry.linkText }));
+			return verifiedEntry(
+				metadata,
+				checksum(canonicalJson({ path, kind: "symlink", linkText: owned.entry.linkText })),
+				linkText,
+			);
 		}
 		if (!metadata.isFile() || metadata.isSymbolicLink()) {
 			throw new Error(`普通文件类型校验失败：${path}`);
 		}
-		if ((metadata.mode & 0o111) !== (owned.entry.mode & 0o111)) {
+		if ((metadata.mode & 0o111n) !== BigInt(owned.entry.mode & 0o111)) {
 			throw new Error(`普通文件 mode 校验失败：${path}`);
 		}
 		if (owned.entry.blobId === null) {
@@ -1971,12 +2061,33 @@ export class RestoreEngine {
 		if (!actual.equals(Buffer.from(expected))) {
 			throw new Error(`普通文件内容校验失败：${path}`);
 		}
-		return checksum(canonicalJson({
+		return verifiedEntry(metadata, checksum(canonicalJson({
 			path,
 			kind: "file",
 			mode: owned.entry.mode,
 			blobId: owned.entry.blobId,
-		}));
+		})));
+	}
+
+	private async matchesAttestation(owned: OwnedPath, attestation: PathAttestation): Promise<boolean> {
+		try {
+			if (attestation.fingerprint !== entryFingerprint(owned)) return false;
+			const path = owned.absolutePath;
+			await assertNoSymlinkEscape(this.workspaceRoot, path);
+			const metadata = await lstat(this.absolutePath(path), { bigint: true });
+			if (
+				metadata.dev !== attestation.dev || metadata.ino !== attestation.ino ||
+				metadata.mode !== attestation.mode || metadata.size !== attestation.size ||
+				metadata.mtimeNs !== attestation.mtimeNs || metadata.ctimeNs !== attestation.ctimeNs
+			) return false;
+			if (owned.entry.kind === "directory") return metadata.isDirectory() && !metadata.isSymbolicLink();
+			if (owned.entry.kind === "symlink") {
+				return metadata.isSymbolicLink() && await readlink(this.absolutePath(path)) === attestation.linkText;
+			}
+			return metadata.isFile() && !metadata.isSymbolicLink();
+		} catch {
+			return false;
+		}
 	}
 
 	private async assertMutationPath(path: string): Promise<void> {
@@ -2033,6 +2144,54 @@ function sameEntry(left: RestorePath, right: RestorePath): boolean {
 		left.blobId === right.blobId &&
 		left.size === right.size &&
 		left.linkText === right.linkText;
+}
+
+function entriesEquivalent(left: OwnedPath | undefined, right: OwnedPath): boolean {
+	return left !== undefined && sameEntry(left.entry, right.entry);
+}
+
+function isPathAffectedByMutations(
+	path: string,
+	deletePaths: readonly string[],
+	writePaths: readonly string[],
+): boolean {
+	return [...deletePaths, ...writePaths].some((mutationPath) =>
+		mutationPath === path || mutationPath.startsWith(`${path}/`) || path.startsWith(`${mutationPath}/`),
+	);
+}
+
+function entryFingerprint(owned: OwnedPath): string {
+	const path = owned.absolutePath;
+	if (owned.entry.kind === "directory") {
+		return checksum(canonicalJson({ path, kind: "directory" }));
+	}
+	if (owned.entry.kind === "symlink") {
+		if (owned.entry.linkText === undefined) throw new Error(`symlink 缺少 linkText：${path}`);
+		return checksum(canonicalJson({ path, kind: "symlink", linkText: owned.entry.linkText }));
+	}
+	if (owned.entry.blobId === null) throw new Error(`普通文件缺少 blob：${path}`);
+	return checksum(canonicalJson({
+		path,
+		kind: "file",
+		mode: owned.entry.mode,
+		blobId: owned.entry.blobId,
+	}));
+}
+
+function verifiedEntry(metadata: BigIntStats, fingerprint: string, linkText?: string): EntryVerification {
+	return {
+		fingerprint,
+		attestation: {
+			fingerprint,
+			dev: metadata.dev,
+			ino: metadata.ino,
+			mode: metadata.mode,
+			size: metadata.size,
+			mtimeNs: metadata.mtimeNs,
+			ctimeNs: metadata.ctimeNs,
+			...(linkText === undefined ? {} : { linkText }),
+		},
+	};
 }
 
 // sourceIdentity/privateRepositoryId 会随 git remote 配置漂移（例如后来补充 remote origin），

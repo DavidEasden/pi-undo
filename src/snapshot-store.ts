@@ -44,6 +44,9 @@ const FILE_SYSTEM_INSPECTION_CONCURRENCY = 32;
 const METADATA_BATCH_MAX_PATHS = 2_048;
 const METADATA_BATCH_HARD_MAX_PATHS = 8_192;
 const METADATA_BATCH_MAX_PATH_BYTES = 1 * 1024 * 1024;
+const METADATA_BATCHES_MAX_BATCHES = 32;
+const METADATA_BATCHES_MAX_PATHS = 16_384;
+const METADATA_BATCHES_MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 const INDEX_BATCH_MAX_ENTRIES = 4_096;
 const INDEX_BATCH_MAX_BYTES = 8 * 1024 * 1024;
 const BLOB_CACHE_MAX_BYTES = 128 * 1024 * 1024;
@@ -722,15 +725,11 @@ export class SnapshotStore {
 		const gitDirectory = this.rootGitDirectory(storeDirectory, root);
 		try {
 			const treeEntries = await this.readTreeEntries(gitDirectory, root.treeId, rootScopePaths);
-			const directories = new Set<string>();
-			for (const entry of treeEntries) {
-				const parts = entry.relativePath.split("/");
-				for (let index = 1; index < parts.length; index += 1) {
-					directories.add(parts.slice(0, index).join("/"));
-				}
-			}
+			const directories = treeDirectoryPaths(treeEntries);
+			const symlinkEntries = treeEntries.filter((entry) => entry.mode === 0o120000);
+			if (symlinkEntries.length > 0) await this.preloadBlobBytes(gitDirectory, symlinkEntries);
 
-			const result: RestorePath[] = [...directories].map((relativePath) => ({
+			const result: RestorePath[] = directories.map((relativePath) => ({
 				relativePath,
 				kind: "directory",
 				mode: 0o755,
@@ -1116,8 +1115,30 @@ export class SnapshotStore {
 	): Promise<readonly NativeMetadataEntry[] | undefined> {
 		// 空路径不得触发 native inspect；首批 unsupported 才整体回退，中途变化必须 fail closed。
 		if (paths.length === 0) return [];
+		const batches = metadataPathBatches(paths, configuredMetadataBatchMaxPaths());
+		const inspectBatches = this.nativeMetadata.inspectBatches;
+		if (inspectBatches !== undefined) {
+			const groupedBatches = metadataInspectRequestGroups(batches, cwd);
+			const groupedResult: NativeMetadataEntry[] = [];
+			let usedGroupedProtocol = false;
+			for (const group of groupedBatches) {
+				const inspected = await inspectBatches.call(this.nativeMetadata, cwd, group, requestDirectory);
+				if (inspected === undefined) {
+					if (usedGroupedProtocol) {
+						throw new SnapshotStoreError("capture_failed", "native metadata 批次协议在请求间变化");
+					}
+					break;
+				}
+				usedGroupedProtocol = true;
+				if (inspected.length !== group.length || inspected.some((entries, index) => entries.length !== group[index]!.length)) {
+					throw new SnapshotStoreError("capture_failed", "native metadata 批次响应数量不匹配");
+				}
+				for (const entries of inspected) groupedResult.push(...entries);
+			}
+			if (usedGroupedProtocol) return groupedResult;
+		}
 		const result: NativeMetadataEntry[] = [];
-		for (const batch of metadataPathBatches(paths, configuredMetadataBatchMaxPaths())) {
+		for (const batch of batches) {
 			const inspected = await this.nativeMetadata.inspect(cwd, batch, requestDirectory);
 			if (inspected === undefined) {
 				if (result.length > 0) {
@@ -2324,6 +2345,36 @@ function configuredMetadataBatchMaxPaths(): number {
 	return value;
 }
 
+function metadataInspectRequestGroups(
+	batches: readonly string[][],
+	workspaceRoot: string,
+): string[][][] {
+	const result: string[][][] = [];
+	let group: string[][] = [];
+	for (const batch of batches) {
+		const candidate = [...group, batch];
+		const pathCount = candidate.reduce((total, paths) => total + paths.length, 0);
+		const requestBytes = Buffer.byteLength(JSON.stringify({
+			schemaVersion: 1,
+			workspaceRoot,
+			batches: candidate,
+		}), "utf8");
+		if (
+			group.length > 0 &&
+			(candidate.length > METADATA_BATCHES_MAX_BATCHES ||
+				pathCount > METADATA_BATCHES_MAX_PATHS ||
+				requestBytes > METADATA_BATCHES_MAX_REQUEST_BYTES)
+		) {
+			result.push(group);
+			group = [batch];
+			continue;
+		}
+		group = candidate;
+	}
+	if (group.length > 0) result.push(group);
+	return result;
+}
+
 function hashPathBatches(leaves: readonly VisibleLeaf[]): VisibleLeaf[][] {
 	const result: VisibleLeaf[][] = [];
 	let current: VisibleLeaf[] = [];
@@ -2351,6 +2402,27 @@ function parseObjectIdLines(output: string, expectedCount: number): string[] {
 		throw new SnapshotStoreError("capture_failed", "git hash-object 批量输出无效");
 	}
 	return lines;
+}
+
+function treeDirectoryPaths(entries: readonly CapturedTreeEntry[]): string[] {
+	const directories: string[] = [];
+	let previousParts: readonly string[] = [];
+	let previousPrefixes: string[] = [];
+	for (const entry of entries) {
+		const parts = entry.relativePath.split("/");
+		let common = 0;
+		while (common < previousParts.length && common < parts.length && previousParts[common] === parts[common]) {
+			common += 1;
+		}
+		for (let index = common; index < parts.length - 1; index += 1) {
+			const prefix = index === 0 ? parts[0]! : `${previousPrefixes[index - 1]!}/${parts[index]!}`;
+			directories.push(prefix);
+			previousPrefixes[index] = prefix;
+		}
+		previousParts = parts;
+		previousPrefixes.length = Math.max(0, parts.length - 1);
+	}
+	return directories;
 }
 
 function parseTreeEntries(output: Uint8Array): CapturedTreeEntry[] {
