@@ -11,6 +11,7 @@ export interface ProcessDiagnostic {
 	readonly durationMs: number;
 	readonly outcome: string;
 	readonly exitCode: number | null;
+	readonly outputBytes?: number;
 }
 
 export interface OperationContext {

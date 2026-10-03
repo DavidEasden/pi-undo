@@ -262,6 +262,27 @@ describe("undo/redo restore performance", () => {
 		}
 	}, 30_000);
 
+	it("metadata inspect 批次可通过环境变量调优且保持双阶段复核", async () => {
+		const { workspace, storeRoot } = await createVisibleLeafWorkspace(2_100);
+		const previous = process.env.PI_UNDO_METADATA_BATCH_MAX_PATHS;
+		process.env.PI_UNDO_METADATA_BATCH_MAX_PATHS = "4096";
+		try {
+			const nativeMetadata = new RecordingMetadataPort();
+			const discovery = new RootDiscovery();
+			const store = new SnapshotStore({ storeRoot, discovery, nativeMetadata });
+			const topology = await discovery.discover(workspace);
+
+			await store.capture(topology);
+
+			expect(nativeMetadata.calls.map((paths) => paths.length)).toEqual([2_100, 2_100]);
+		} finally {
+			if (previous === undefined) delete process.env.PI_UNDO_METADATA_BATCH_MAX_PATHS;
+			else process.env.PI_UNDO_METADATA_BATCH_MAX_PATHS = previous;
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+		}
+	}, 30_000);
+
 	it("可见叶子 native 首批 unsupported 时整体回退 TypeScript 且不再继续分批", async () => {
 		const { workspace, storeRoot } = await createVisibleLeafWorkspace(2_100);
 		try {

@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it } from "vitest";
-import { GitRunError, GitRunner, type GitRunResult } from "../src/git-runner.ts";
+import { GitRunError, GitRunner, type GitRunOptions, type GitRunResult } from "../src/git-runner.ts";
 import { createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
 import { RootDiscovery } from "../src/root-discovery.ts";
 import { WorkspaceLock, workspaceLockPath } from "../src/workspace-lock.ts";
@@ -48,6 +48,16 @@ class TerminatingGitRunner extends GitRunner {
 	}
 }
 
+class RecordingGitRunner extends GitRunner {
+	readonly calls: string[][] = [];
+
+	override async run(args: readonly string[], options: GitRunOptions = {}): Promise<GitRunResult> {
+		this.calls.push([...args]);
+		return super.run(args, options);
+	}
+}
+
+
 describe("RootDiscovery", () => {
 	it("为非 Git 工作区创建 synthetic outer root", async () => {
 		const root = await temporaryRoot();
@@ -72,6 +82,20 @@ describe("RootDiscovery", () => {
 			expect.objectContaining({ relativeRoot: ".", parentRoot: null, state: "active" }),
 		);
 		expect(topology.roots[0].treeId).toMatch(/^[0-9a-f]{40}$/);
+	});
+
+	it("active repository discovery 在一次 rev-parse 中读取 HEAD", async () => {
+		const repository = await createGitRepo();
+		temporaryRoots.push(repository.root);
+		const git = new RecordingGitRunner();
+
+		await new RootDiscovery(git).discover(repository.root);
+
+		const revParseCalls = git.calls.filter((args) => args.includes("rev-parse"));
+		expect(revParseCalls).toHaveLength(1);
+		expect(revParseCalls[0]).toEqual(expect.arrayContaining([
+			"--show-toplevel", "--git-dir", "--git-common-dir", "HEAD",
+		]));
 	});
 
 	it("发现两层 nested repository 并建立最近父级", async () => {
