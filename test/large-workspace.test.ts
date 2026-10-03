@@ -76,6 +76,13 @@ describe.skipIf(process.env.PI_UNDO_LARGE_WORKSPACE !== "1")("大型工作区真
 				loopDelayP99Ms: Math.round(loopDelay.percentile(99) / 1e6),
 			});
 			console.log(report);
+			if (process.env.PI_UNDO_BENCH_DIAG === "1") {
+				const { readdir: listDir } = await import("node:fs/promises");
+				const diagDir = join(temp.sessionDir, ".pi-undo", "diagnostics");
+				for (const name of await listDir(diagDir).catch(() => [] as string[])) {
+					console.log(await readFile(join(diagDir, name), "utf8"));
+				}
+			}
 			if (process.env.PI_UNDO_BENCH_REPORT !== undefined) {
 				await appendFile(process.env.PI_UNDO_BENCH_REPORT, `${report}\n`);
 			}

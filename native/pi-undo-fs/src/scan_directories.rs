@@ -116,7 +116,12 @@ pub(crate) fn run(request_path: &Path) -> Result<(), String> {
         return Err("目录扫描期间 workspace 身份发生变化".into());
     }
     if request.schema_version == 2 {
-        if let Some(cache_path) = request.cache_path.as_deref() {
+        // 全部目录都由非 racy 缓存复用时，新 cache 与旧 cache 完全相同，跳过重写。
+        let unchanged = previous_cache.as_ref().is_some_and(|previous| {
+            scan_state.reused_directories == response.directories
+                && previous.directories.len() == scan_state.next.len()
+        });
+        if let Some(cache_path) = request.cache_path.as_deref().filter(|_| !unchanged) {
             if let Err(error) =
                 write_cache(Path::new(cache_path), workspace, &root, scan_state.next)
             {
@@ -152,10 +157,12 @@ fn scan(
         .cloned()
     {
         let mut reusable = metadata_matches(&cached, &before) && !cached.racy;
+        // 复用路径只打开每个子目录一次：校验存在性时得到的句柄直接用于递归。
+        let mut opened = Vec::with_capacity(if reusable { cached.children.len() } else { 0 });
         if reusable {
             for name in &cached.children {
                 match directory.open_child(OsStr::new(name)) {
-                    Ok(_child) => {}
+                    Ok(child) => opened.push(child),
                     Err(error)
                         if error.kind() == std::io::ErrorKind::NotFound
                             || error.kind() == std::io::ErrorKind::NotADirectory =>
@@ -178,8 +185,7 @@ fn scan(
                 });
             }
             state.next.insert(path.into(), cached.clone());
-            for name in cached.children {
-                let child = directory.open_child(OsStr::new(&name))?;
+            for (name, child) in cached.children.into_iter().zip(opened) {
                 let child_path = if path.is_empty() {
                     name.clone()
                 } else {
