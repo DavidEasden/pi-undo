@@ -67,7 +67,7 @@ export class GitRunner {
 		let outcome = "failed";
 		let exitCode: number | null = null;
 		try {
-			const result = await this.runCommand(args, options);
+			const result = await this.runCommand(args, options, command);
 			outcome = result.timedOut ? "timeout" : result.aborted ? "cancelled" : "exit";
 			exitCode = result.code;
 			return result;
@@ -82,7 +82,7 @@ export class GitRunner {
 		}
 	}
 
-	private async runCommand(args: readonly string[], options: GitRunOptions): Promise<GitRunResult> {
+	private async runCommand(args: readonly string[], options: GitRunOptions, command: string): Promise<GitRunResult> {
 		const stderrLimit = options.stderrLimit ?? DEFAULT_STDERR_LIMIT;
 		if (!Number.isInteger(stderrLimit) || stderrLimit < 0) {
 			throw new RangeError("stderrLimit 必须是非负整数");
@@ -212,7 +212,11 @@ export class GitRunner {
 					return;
 				}
 				if (!killed && exit.code !== 0) {
-					reject(new GitRunError("git_failed", `git 退出码为 ${String(exit.code)}`, result));
+					reject(new GitRunError(
+						"git_failed",
+						formatGitFailure(command, exit.code, result.stderr),
+						result,
+					));
 					return;
 				}
 				resolve(result);
@@ -608,6 +612,15 @@ function mergeEnvironment(overrides: Readonly<Record<string, string | undefined>
 		}
 	}
 	return environment;
+}
+
+function formatGitFailure(command: string, code: number | null, stderr: string): string {
+	const detail = stderr
+		.replace(/[\u0000-\u001F\u007F]+/g, " ")
+		.replace(/\s+/g, " ")
+		.trim()
+		.slice(0, 512);
+	return `${command} 退出码为 ${String(code)}${detail.length === 0 ? "" : `: ${detail}`}`;
 }
 
 function errorMessage(error: unknown): string {

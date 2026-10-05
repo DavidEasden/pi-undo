@@ -18,6 +18,8 @@ import type {
 } from "./model.ts";
 import type { RestorePlan, RestoreResult } from "./restore-engine.ts";
 
+const INPUT_CAPTURE_RETRY_DELAY_MS = 250;
+
 /** 控制器所需的最小运行时适配层；Pi 绑定在 extension 中完成。 */
 export interface ControllerDependencies {
 	readonly workspaceIdentity: string;
@@ -483,9 +485,18 @@ export class UndoControllerImpl implements UndoController {
 		if (warmUp !== undefined) await warmUp;
 		const warmUpManifest = this.warmUpManifest;
 		this.warmUpManifest = undefined;
-		return warmUpManifest !== undefined && this.dependencies.captureBaseline !== undefined
+		const capture = (): Promise<SnapshotManifest> => warmUpManifest !== undefined && this.dependencies.captureBaseline !== undefined
 			? this.captureBaselineWithWorkspaceLock(warmUpManifest)
 			: this.captureWithWorkspaceLock();
+		try {
+			return await capture();
+		} catch (error) {
+			// 输入前捕获也可能撞上短暂的工作区竞态；重试一次后仍失败才放弃本轮历史。
+			if (!isTransientCaptureFailure(error)) throw error;
+			await sleep(INPUT_CAPTURE_RETRY_DELAY_MS);
+			checkOperation();
+			return capture();
+		}
 	}
 
 	private async captureInputForToken(text: string, token: symbol): Promise<void> {

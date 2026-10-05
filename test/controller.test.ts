@@ -793,6 +793,27 @@ describe("UndoController", () => {
 		expect(deps.calls).toContain("entry:pi-undo:start");
 	});
 
+	it("输入前快照遇到暂态捕获失败时重试一次", async () => {
+		let captures = 0;
+		const deps = dependencies({
+			capture: async () => {
+				captures += 1;
+				if (captures === 1) {
+					throw Object.assign(
+						new Error("git:hash-object 退出码为 128: index.lock 暂时存在"),
+						{ name: "SnapshotStoreError", code: "capture_failed" },
+					);
+				}
+				return manifest("a");
+			},
+		});
+		const controller = new UndoControllerImpl(deps);
+
+		expect(await controller.prepareInput("重试输入前快照", { streaming: false })).toEqual({ action: "continue" });
+		expect(captures).toBe(2);
+		expect(controller.captureFailed()).toBe(false);
+	});
+
 	it("before capture 失败时放行输入且不记录历史", async () => {
 		const deps = dependencies({ capture: async () => { throw new Error("snapshot failed"); } });
 		const controller = new UndoControllerImpl(deps);
