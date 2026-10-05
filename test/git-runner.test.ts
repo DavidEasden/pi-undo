@@ -89,6 +89,14 @@ describe("GitRunner", () => {
 		await expect(runner.run(["--definitely-invalid"])).rejects.toMatchObject({ code: "git_failed" });
 	});
 
+	it("非零退出错误保留稳定命令名和截断后的 stderr", async () => {
+		const fake = await fakeGit("printf 'fatal: private index is invalid\\n' >&2; exit 128");
+
+		await expect(new GitRunner().run(["hash-object", "file.txt"], { env: fake.env })).rejects.toMatchObject({
+			code: "git_failed",
+			message: "git:hash-object 退出码为 128: fatal: private index is invalid",
+		});
+	});
 	it("不经过 shell 拼接参数，并截断过长 stderr", async () => {
 		const markerRoot = await mkdtemp(join(tmpdir(), "pi-undo-marker-"));
 		temporaryRoots.push(markerRoot);
