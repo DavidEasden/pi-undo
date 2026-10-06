@@ -3,6 +3,8 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { type OperationContext, configuredTimeout, currentOperationContext, isOperationTimeoutReason, markProcessExitUnconfirmed, reportProcessDiagnostic } from "./operation-context.ts";
 
 export const DEFAULT_STDERR_LIMIT = 64 * 1024;
+/** 防止 Git 单次 stdout 触发 Node 字符串/Buffer 上限；正常 blob 读取按批次拆分。 */
+export const DEFAULT_STDOUT_LIMIT = 256 * 1024 * 1024;
 /** Git 单次调用的默认预算；调用链上的 deadline 可进一步收紧它。 */
 export const DEFAULT_GIT_TIMEOUT_MS = 120_000;
 const TERMINATION_GRACE_MS = 50;
@@ -28,6 +30,7 @@ export interface GitRunOptions {
 	readonly signal?: AbortSignal;
 	readonly timeoutMs?: number;
 	readonly stderrLimit?: number;
+	readonly stdoutLimit?: number;
 }
 
 export interface GitRunResult {
@@ -40,7 +43,7 @@ export interface GitRunResult {
 	readonly aborted: boolean;
 }
 
-export type GitRunErrorCode = "git_failed" | "git_spawn_failed" | "git_termination_failed";
+export type GitRunErrorCode = "git_failed" | "git_spawn_failed" | "git_termination_failed" | "git_output_limit";
 
 export class GitRunError extends Error {
 	readonly code: GitRunErrorCode;
@@ -84,8 +87,12 @@ export class GitRunner {
 
 	private async runCommand(args: readonly string[], options: GitRunOptions, command: string): Promise<GitRunResult> {
 		const stderrLimit = options.stderrLimit ?? DEFAULT_STDERR_LIMIT;
+		const stdoutLimit = options.stdoutLimit ?? DEFAULT_STDOUT_LIMIT;
 		if (!Number.isInteger(stderrLimit) || stderrLimit < 0) {
 			throw new RangeError("stderrLimit 必须是非负整数");
+		}
+		if (!Number.isInteger(stdoutLimit) || stdoutLimit < 0) {
+			throw new RangeError("stdoutLimit 必须是非负整数");
 		}
 		if (options.timeoutMs !== undefined && (!Number.isFinite(options.timeoutMs) || options.timeoutMs < 0)) {
 			throw new RangeError("timeoutMs 必须是非负有限数字");
@@ -121,6 +128,8 @@ export class GitRunner {
 			const stdout: Buffer[] = [];
 			const stderr: Buffer[] = [];
 			let stderrBytes = 0;
+			let stdoutBytes = 0;
+			let outputLimitExceeded = false;
 			let killed = false;
 			let timedOut = false;
 			let aborted = false;
@@ -132,7 +141,17 @@ export class GitRunner {
 			let terminationFailed = false;
 
 			child.stdout?.on("data", (chunk: Buffer | string) => {
-				stdout.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+				const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+				const remaining = stdoutLimit - stdoutBytes;
+				if (bytes.length > remaining) {
+					if (remaining > 0) stdout.push(bytes.subarray(0, remaining));
+					stdoutBytes = stdoutLimit;
+					outputLimitExceeded = true;
+					terminate("output_limit");
+					return;
+				}
+				stdout.push(bytes);
+				stdoutBytes += bytes.length;
 			});
 			child.stderr?.on("data", (chunk: Buffer | string) => {
 				if (stderrBytes >= stderrLimit) {
@@ -154,7 +173,7 @@ export class GitRunner {
 				finish();
 			};
 
-			const terminate = (reason: "timeout" | "abort"): void => {
+			const terminate = (reason: "timeout" | "abort" | "output_limit"): void => {
 				if (settled || killed) {
 					return;
 				}
@@ -209,6 +228,10 @@ export class GitRunner {
 				if (terminationFailed) {
 					markProcessExitUnconfirmed();
 					reject(new GitRunError("git_termination_failed", "Git 进程组未能完全终止", result));
+					return;
+				}
+				if (outputLimitExceeded) {
+					reject(new GitRunError("git_output_limit", `Git stdout 超过 ${stdoutLimit} 字节上限`, result));
 					return;
 				}
 				if (!killed && exit.code !== 0) {

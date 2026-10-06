@@ -114,6 +114,13 @@ describe("GitRunner", () => {
 		expect(await readFile(marker, "utf8")).toBe("$(touch " + marker + ")");
 	});
 
+	it("stdout 超过上限时终止进程并抛出稳定错误，不转换完整输出", async () => {
+		const fake = await fakeGit("printf '%010000d' 0; sleep 5");
+		await expect(new GitRunner().run([], { env: fake.env, stdoutLimit: 100 })).rejects.toMatchObject({
+			code: "git_output_limit",
+			result: { killed: true, stdoutBytes: expect.any(Uint8Array) },
+		});
+	});
 	it("超时终止进程并返回 killed", async () => {
 		const fake = await fakeGit("exec sleep 5");
 		const result = await new GitRunner().run([], { env: fake.env, timeoutMs: 20 });
