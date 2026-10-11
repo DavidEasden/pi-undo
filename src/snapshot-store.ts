@@ -100,6 +100,8 @@ interface VisibleLeaf {
 	readonly kind: "file" | "symlink";
 	readonly mode: number;
 	readonly fingerprint: string;
+	/** 不含 ctime，用于把 macOS 元数据写入与内容或路径变化区分开。 */
+	readonly stableFingerprint?: string;
 	readonly changedAtNs: bigint;
 	readonly cacheable: boolean;
 }
@@ -136,6 +138,7 @@ interface PersistedLeafCacheEntry {
 	readonly kind: "file" | "symlink";
 	readonly mode: number;
 	readonly fingerprint: string;
+	readonly stableFingerprint?: string;
 	readonly cacheable: boolean;
 	readonly objectId: string;
 	readonly changedAtNs: string;
@@ -515,6 +518,7 @@ export class SnapshotStore {
 				const cache = this.visibleLeafCache.get(gitDirectory);
 				if (cache === undefined) return false;
 				const entriesByPath = new Map(entries.map((entry) => [entry.relativePath, entry]));
+				const expectedObjectIds = new Map(entries.map((entry) => [entry.relativePath, entry.objectId]));
 				for (const leaf of leaves) {
 					const entry = entriesByPath.get(leaf.relativePath);
 					const cached = cache.get(leaf.relativePath);
@@ -548,7 +552,13 @@ export class SnapshotStore {
 					ignoredPresentPaths,
 				})) return false;
 				// metadata 初检与最终复核之间若有变化，放弃 baseline，回退完整 capture。
-				await this.assertVisibleLeavesUnchanged(absoluteRoot, leaves, transactionDirectory);
+				await this.assertVisibleLeavesUnchanged(
+					absoluteRoot,
+					leaves,
+					transactionDirectory,
+					expectedObjectIds,
+					environment,
+				);
 			}
 			return true;
 		} catch (error) {
@@ -1219,7 +1229,8 @@ export class SnapshotStore {
 				...batch.map((leaf) => leaf.relativePath),
 			], { cwd, env: environment });
 			const hashes = parseObjectIdLines(output, batch.length);
-			await this.assertVisibleLeavesUnchanged(cwd, batch);
+			const batchObjectIds = new Map(batch.map((leaf, index) => [leaf.relativePath, hashes[index]!]));
+			await this.assertVisibleLeavesUnchanged(cwd, batch, undefined, batchObjectIds, environment);
 			return batch.map((leaf, index) => [leaf.relativePath, hashes[index]!] as const);
 		});
 		for (const batch of hashedBatches) {
@@ -1240,7 +1251,7 @@ export class SnapshotStore {
 				throw new SnapshotStoreError("capture_failed", `文件对象 materialize 失败：${leaf.relativePath}`);
 			}
 			await assertNoSymlinkEscape(cwd, leaf.relativePath);
-			await this.assertVisibleLeafUnchanged(cwd, leaf);
+			await this.assertVisibleLeafUnchanged(cwd, leaf, objectId, environment);
 			objectIds.set(leaf.relativePath, objectId);
 		}
 		for (const indexInput of indexInfoBatches(leaves, objectIds)) {
@@ -1250,7 +1261,7 @@ export class SnapshotStore {
 				stdin: indexInput,
 			});
 		}
-		await this.assertVisibleLeavesUnchanged(cwd, leaves, requestDirectory);
+		await this.assertVisibleLeavesUnchanged(cwd, leaves, requestDirectory, objectIds, environment);
 		return { leaves, objectIds, verifiedAtNs: BigInt(Date.now()) * 1_000_000n };
 	}
 
@@ -1303,6 +1314,7 @@ export class SnapshotStore {
 					kind: entry.kind,
 					mode: entry.mode,
 					fingerprint: entry.fingerprint,
+					stableFingerprint: entry.stableFingerprint,
 					cacheable: entry.cacheable,
 					changedAtNs: BigInt(entry.changedAtNs),
 					objectId: entry.objectId,
@@ -1326,6 +1338,7 @@ export class SnapshotStore {
 					kind: leaf.kind,
 					mode: leaf.mode,
 					fingerprint: leaf.fingerprint,
+					stableFingerprint: leaf.stableFingerprint,
 					cacheable: leaf.cacheable,
 					objectId: leaf.objectId,
 					changedAtNs: leaf.changedAtNs.toString(),
@@ -1351,6 +1364,8 @@ export class SnapshotStore {
 		cwd: string,
 		leaves: readonly VisibleLeaf[],
 		requestDirectory?: string,
+		expectedObjectIds?: ReadonlyMap<string, string>,
+		environment?: Readonly<Record<string, string | undefined>>,
 	): Promise<void> {
 		if (leaves.length === 0) return;
 		const paths = leaves.map((leaf) => leaf.relativePath);
@@ -1359,32 +1374,105 @@ export class SnapshotStore {
 			await assertNoSymlinkParents(cwd, paths);
 			const inspected = await this.inspectNativeMetadataBatches(cwd, paths, requestDirectory);
 			if (inspected !== undefined) {
+				const contentChecks: VisibleLeaf[] = [];
 				for (let index = 0; index < leaves.length; index += 1) {
 					const leaf = leaves[index]!;
 					const metadata = nativeVisibleLeafMetadata(inspected[index]!);
-					if (metadata === null || visibleLeafFingerprint(metadata) !== leaf.fingerprint) {
+					if (metadata === null || visibleLeafStableFingerprint(metadata) !== leaf.stableFingerprint) {
 						throw new SnapshotStoreError("capture_failed", `捕获期间工作区叶子已变化：${leaf.relativePath}`);
 					}
+					if (visibleLeafFingerprint(metadata) !== leaf.fingerprint) contentChecks.push(leaf);
 				}
+				await mapConcurrentOrdered(contentChecks, FILE_SYSTEM_INSPECTION_CONCURRENCY, (leaf) =>
+					this.assertVisibleLeafContentUnchanged(
+						cwd,
+						leaf,
+						expectedObjectIds?.get(leaf.relativePath),
+						environment,
+					));
 				await assertNoSymlinkParents(cwd, paths);
 				return;
 			}
 			await mapConcurrentOrdered(leaves, FILE_SYSTEM_INSPECTION_CONCURRENCY, (leaf) =>
-				this.assertVisibleLeafUnchanged(cwd, leaf));
+				this.assertVisibleLeafUnchanged(
+					cwd,
+					leaf,
+					expectedObjectIds?.get(leaf.relativePath),
+					environment,
+				));
 			await assertNoSymlinkParents(cwd, paths);
 			return;
 		}
 		await assertNoSymlinkParents(cwd, paths);
 		await mapConcurrentOrdered(leaves, FILE_SYSTEM_INSPECTION_CONCURRENCY, (leaf) =>
-			this.assertVisibleLeafUnchanged(cwd, leaf));
+			this.assertVisibleLeafUnchanged(
+				cwd,
+				leaf,
+				expectedObjectIds?.get(leaf.relativePath),
+				environment,
+			));
 	}
 
-	private async assertVisibleLeafUnchanged(cwd: string, leaf: VisibleLeaf): Promise<void> {
+	private async assertVisibleLeafUnchanged(
+		cwd: string,
+		leaf: VisibleLeaf,
+		expectedObjectId?: string,
+		environment?: Readonly<Record<string, string | undefined>>,
+	): Promise<void> {
 		const metadata = await lstat(join(cwd, ...leaf.relativePath.split("/")), { bigint: true }).catch((error) => {
 			if (hasErrorCode(error, "ENOENT")) return null;
 			throw error;
 		});
-		if (metadata === null || visibleLeafFingerprint(visibleLeafMetadataFromStats(metadata)) !== leaf.fingerprint) {
+		if (metadata === null) {
+			throw new SnapshotStoreError("capture_failed", `捕获期间工作区叶子已变化：${leaf.relativePath}`);
+		}
+		const visibleMetadata = visibleLeafMetadataFromStats(metadata);
+		if (visibleLeafFingerprint(visibleMetadata) === leaf.fingerprint) return;
+		if (visibleLeafStableFingerprint(visibleMetadata) !== leaf.stableFingerprint) {
+			throw new SnapshotStoreError("capture_failed", `捕获期间工作区叶子已变化：${leaf.relativePath}`);
+		}
+		// 首次 hash 前还没有可信对象 ID；稳定元数据不变时先继续，hash 后再做内容证明。
+		if (expectedObjectId === undefined || environment === undefined) return;
+		await this.assertVisibleLeafContentUnchanged(cwd, leaf, expectedObjectId, environment);
+	}
+
+	/** ctime 单独变化时重新核验内容，并确认内容核验期间稳定元数据没有漂移。 */
+	private async assertVisibleLeafContentUnchanged(
+		cwd: string,
+		leaf: VisibleLeaf,
+		expectedObjectId: string | undefined,
+		environment: Readonly<Record<string, string | undefined>> | undefined,
+	): Promise<void> {
+		if (expectedObjectId === undefined || environment === undefined) {
+			throw new SnapshotStoreError("capture_failed", `捕获期间工作区叶子已变化：${leaf.relativePath}`);
+		}
+		let objectId: string;
+		if (leaf.kind === "symlink") {
+			await assertNoSymlinkEscape(cwd, leaf.relativePath);
+			const linkText = await readlink(join(cwd, ...leaf.relativePath.split("/")), { encoding: "buffer" });
+			decodeUtf8(linkText, "symlink target 不是可无损表示的 UTF-8");
+			objectId = (await this.runGit(["hash-object", "--stdin"], {
+				cwd,
+				env: environment,
+				stdin: linkText,
+			})).trim();
+		} else {
+			objectId = (await this.runGit(["hash-object", "--no-filters", "--", leaf.relativePath], {
+				cwd,
+				env: environment,
+			})).trim();
+		}
+		if (!isObjectId(objectId) || objectId !== expectedObjectId) {
+			throw new SnapshotStoreError("capture_failed", `捕获期间工作区叶子已变化：${leaf.relativePath}`);
+		}
+		const finalMetadata = await lstat(join(cwd, ...leaf.relativePath.split("/")), { bigint: true }).catch((error) => {
+			if (hasErrorCode(error, "ENOENT")) return null;
+			throw error;
+		});
+		if (
+			finalMetadata === null ||
+			visibleLeafStableFingerprint(visibleLeafMetadataFromStats(finalMetadata)) !== leaf.stableFingerprint
+		) {
 			throw new SnapshotStoreError("capture_failed", `捕获期间工作区叶子已变化：${leaf.relativePath}`);
 		}
 	}
@@ -1473,6 +1561,7 @@ export class SnapshotStore {
 					? 0o120000
 					: (metadata.mode & 0o111n) === 0n ? 0o100644 : 0o100755,
 				fingerprint: visibleLeafFingerprint(metadata),
+				stableFingerprint: visibleLeafStableFingerprint(metadata),
 				changedAtNs: metadata.mtimeNs > metadata.ctimeNs ? metadata.mtimeNs : metadata.ctimeNs,
 				cacheable,
 			});
@@ -2126,6 +2215,7 @@ function samePersistedLeafCache(
 			existing.kind !== entry.kind ||
 			existing.mode !== entry.mode ||
 			existing.fingerprint !== entry.fingerprint ||
+			existing.stableFingerprint !== entry.stableFingerprint ||
 			existing.cacheable !== entry.cacheable ||
 			existing.objectId !== entry.objectId ||
 			existing.changedAtNs !== entry.changedAtNs ||
@@ -2257,6 +2347,7 @@ function isPersistedLeafCacheFile(value: unknown): value is PersistedLeafCacheFi
 				typeof candidate.mode !== "number" ||
 				typeof candidate.fingerprint !== "string" ||
 				typeof candidate.cacheable !== "boolean" ||
+				(typeof candidate.stableFingerprint !== "undefined" && typeof candidate.stableFingerprint !== "string") ||
 				typeof candidate.objectId !== "string" ||
 				typeof candidate.changedAtNs !== "string" ||
 				typeof candidate.verifiedAtNs !== "string" ||
@@ -2268,6 +2359,17 @@ function isPersistedLeafCacheFile(value: unknown): value is PersistedLeafCacheFi
 		}
 	}
 	return true;
+}
+
+function visibleLeafStableFingerprint(metadata: VisibleLeafMetadata): string {
+	return checksum(canonicalJson({
+		kind: metadata.kind,
+		dev: metadata.dev.toString(),
+		ino: metadata.ino.toString(),
+		mode: metadata.mode.toString(),
+		size: metadata.size.toString(),
+		mtimeNs: metadata.mtimeNs.toString(),
+	}));
 }
 
 function visibleLeafFingerprint(metadata: VisibleLeafMetadata): string {

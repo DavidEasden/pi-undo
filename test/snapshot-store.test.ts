@@ -1,4 +1,4 @@
-import { access, chmod, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -8,6 +8,7 @@ import { GitRunner, type GitRunOptions, type GitRunResult } from "../src/git-run
 import type { ManifestId, SnapshotManifest } from "../src/model.ts";
 import { createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
 import { RootDiscovery, type RootDiscoveryReason, type RootTopology } from "../src/root-discovery.ts";
+import type { NativeMetadataEntry, NativeMetadataPort } from "../src/native-metadata.ts";
 import { SnapshotStore } from "../src/snapshot-store.ts";
 import { WorkspaceLock } from "../src/workspace-lock.ts";
 import {
@@ -101,6 +102,40 @@ class OverridingManifestSnapshotStore extends SnapshotStore {
 	override async loadManifest(id: ManifestId): Promise<SnapshotManifest> {
 		this.loadManifestCalls += 1;
 		return super.loadManifest(id);
+	}
+}
+
+class CtimeRaceMetadataPort implements NativeMetadataPort {
+	private calls = 0;
+	private ctimeTouched = false;
+
+	constructor(private readonly mutateContent: boolean) {}
+
+	async inspect(workspaceRoot: string, paths: readonly string[]): Promise<readonly NativeMetadataEntry[]> {
+		this.calls += 1;
+		return Promise.all(paths.map(async (path): Promise<NativeMetadataEntry> => {
+			const target = join(workspaceRoot, ...path.split("/"));
+			const before = await lstat(target, { bigint: true });
+			if (this.calls === 1 && !this.ctimeTouched && before.isFile()) {
+				this.ctimeTouched = true;
+				const hardLink = `${workspaceRoot}.ctime-link`;
+				await link(target, hardLink);
+				await unlink(hardLink);
+			}
+			if (this.calls === 2 && this.mutateContent) {
+				await writeFile(target, "changed\n");
+			}
+			return {
+				path,
+				kind: before.isSymbolicLink() ? "symlink" : before.isFile() ? "file" : "other",
+				dev: before.dev,
+				ino: before.ino,
+				mode: before.mode,
+				size: before.size,
+				mtimeNs: before.mtimeNs,
+				ctimeNs: before.ctimeNs + (this.calls === 2 ? 1n : 0n),
+			};
+		}));
 	}
 }
 
@@ -571,6 +606,43 @@ describe("SnapshotStore", () => {
 		expect(BigInt(file!.verifiedAtNs)).toBeGreaterThan(
 			BigInt(file!.changedAtNs) + 2_000_000_000n,
 		);
+	});
+
+	it("ctime-only metadata race 通过内容对象 ID复核", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, "file.txt", "stable\n");
+		const git = new RecordingGitRunner();
+		const discovery = new RootDiscovery(git);
+		const store = new SnapshotStore({
+			storeRoot,
+			git,
+			discovery,
+			nativeMetadata: new CtimeRaceMetadataPort(false),
+		});
+		const topology = await discovery.discover(workspace);
+
+		const manifest = await store.capture(topology);
+
+		expect(manifest.roots[0]?.treeId).not.toBeNull();
+		expect(git.calls.filter((call) => call.args[0] === "hash-object").length).toBeGreaterThanOrEqual(2);
+	});
+
+	it("ctime-only metadata 伪装下内容变化仍拒绝 capture", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, "file.txt", "stable\n");
+		const git = new RecordingGitRunner();
+		const discovery = new RootDiscovery(git);
+		const store = new SnapshotStore({
+			storeRoot,
+			git,
+			discovery,
+			nativeMetadata: new CtimeRaceMetadataPort(true),
+		});
+		const topology = await discovery.discover(workspace);
+
+		await expect(store.capture(topology)).rejects.toMatchObject({ code: "capture_failed" });
 	});
 
 	it("损坏的 leaf-cache.json 被忽略，capture 正常走冷路径", async () => {
