@@ -15,13 +15,13 @@ import {
 } from "./pi-sdk.fixture.ts";
 
 /**
- * 真实 pi 0.86.1 SDK + faux provider 回归（夹具见 pi-sdk.fixture.ts）。
+ * 真实 pi 1.2.0 SDK + faux provider 回归（夹具见 pi-sdk.fixture.ts）。
  *
  * 覆盖：普通 undo/redo 与重启重建、第二轮 settled 检查点未完成时的撤销归属、
  * 原生 tree 用户目标（含 pi-undo:start 物理父节点）与带 summary 的导航。
  */
 
-describe("真实 pi 0.86.1 SDK", () => {
+describe("真实 pi 1.2.0 SDK", () => {
 	it("摘要失败没有 session_tree 事件时终结 PREPARED，后续 undo 可用", async () => {
 		const { temp, harness } = await createFreshHarness();
 		try {

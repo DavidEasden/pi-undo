@@ -19,7 +19,7 @@ Each completed agent run creates a checkpoint that captures both the Pi session 
 
 ## Requirements
 
-- Pi `0.86.1` 或更高版本（已在 0.86.1 上验证）。`0.84.4` 及更早版本不再受支持，也不在 CI 中测试：早期版本的会话树与扩展生命周期行为不同，不保证撤回语义正确。
+- Pi `1.2.0` 或更高版本（已在 1.2.0 上验证，见 [Pi 1.2.0 兼容验证记录](docs/pi-1.2.0-validation.md)）。`1.1.x` 及更早版本不再受支持，也不在 CI 中测试：早期版本的扩展生命周期行为不同（例如 `before_agent_start` 的触发范围与会话 busy 语义），不保证撤回语义正确。历史验证记录见 [Pi 0.86.1 撤回修复与验证记录](docs/pi-0.86.1-validation.md)。
 - Node.js `22.19.0` or later.
 - Git available on `PATH` (used internally for content-addressed snapshots).
 
@@ -167,7 +167,7 @@ recovery_required
 
 本机 macOS arm64 的三次 undo 中位数：3,000 包／1 文件从 1,976 ms 降至 924 ms，10,000 包／1 文件从 5,857 ms 降至 2,755 ms；100 文件的子目录撤销从 517 ms 降至 180 ms，混合撤销从 711 ms 降至 186 ms。测量方法和限制见 [原生性能验证记录](docs/native-performance.md)。
 
-可通过真实 Pi 0.86.1 SDK 和离线 faux provider 运行大型工作区基准；它覆盖 3,000／10,000 个依赖包、修改 1／100 个文件，每组撤回三次并验证重做：
+可通过真实 Pi 1.2.0 SDK 和离线 faux provider 运行大型工作区基准；它覆盖 3,000／10,000 个依赖包、修改 1／100 个文件，每组撤回三次并验证重做：
 
 ```bash
 PI_UNDO_LARGE_WORKSPACE=1 npx vitest run test/large-workspace.test.ts

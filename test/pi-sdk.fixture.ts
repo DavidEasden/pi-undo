@@ -20,7 +20,7 @@ import { createPiUndoExtension, type PiUndoRuntime } from "../extensions/pi-undo
 import { createPiUndoRuntime } from "../src/pi-runtime.ts";
 
 /**
- * 真实 pi 0.86.1 SDK + faux provider 测试夹具。
+ * 真实 pi 1.2.0 SDK + faux provider 测试夹具。
  *
  * 不访问模型网络，也不读取用户配置：模型来自内置 faux provider，资源加载器关闭
  * 全部磁盘发现，settings/session/agent 目录都指向临时目录。测试只通过公开 SDK
