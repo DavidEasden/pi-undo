@@ -35,7 +35,9 @@
 		"src",
 		"native/bin",
 		"README.md",
-		"docs/native-performance.md"
+		"docs/native-performance.md",
+		"docs/pi-0.86.1-validation.md",
+		"docs/pi-1.2.0-validation.md"
 	],
 	"scripts": {
 		"test": "vitest run",
