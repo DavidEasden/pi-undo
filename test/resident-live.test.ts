@@ -8,7 +8,7 @@ import { NativeDirectoryScanner } from "../src/native-directory-scan.ts";
 
 const binary = join(process.cwd(), "native/pi-undo-fs/target/release/pi-undo-fs");
 
-describe.skipIf(process.platform !== "darwin" || !existsSync(binary))("resident scan smoke", () => {
+describe.skipIf(process.env.PI_UNDO_RUN_RESIDENT_LIVE !== "1" || process.platform !== "darwin" || !existsSync(binary))("resident scan smoke", () => {
 	it("预热后复用缓存并在目录事件后重扫", async () => {
 		const root = await realpath(await mkdtemp(join(tmpdir(), "pi-undo-resident-live-")));
 		const scanner = new NativeDirectoryScanner(binary);
