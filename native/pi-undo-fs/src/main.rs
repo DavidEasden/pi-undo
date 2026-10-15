@@ -4,6 +4,7 @@ mod directory;
 mod file_batch;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod scan_directories;
+mod serve;
 #[cfg(unix)]
 use file_batch::{
     ParentDirectory, capture_source, create_target, install_target, verify_installed, verify_source,
@@ -139,6 +140,10 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if first == "--serve" {
+        // 常驻扫描：stdin/stdout 逐行 JSON 协议。
+        return serve::run(std::io::stdin(), std::io::stdout());
+    }
     if first == "--scan-directories" {
         let path = std::env::args().nth(2).ok_or("缺少目录扫描 request path")?;
         return scan_directories::run(Path::new(&path));
