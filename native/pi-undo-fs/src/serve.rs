@@ -375,6 +375,7 @@ mod watch_impl {
     pub(super) struct Watch {
         dirty: Arc<AtomicBool>,
         stream: *mut std::ffi::c_void,
+        run_loop: *mut std::ffi::c_void,
         thread: Option<std::thread::JoinHandle<()>>,
     }
 
@@ -446,26 +447,46 @@ mod watch_impl {
                 return Err("FSEventStream 创建失败".into());
             }
             // 监听跑在独立线程的 RunLoop 上；主线程继续服务 stdin 请求。
-            let started = Arc::new(std::sync::Barrier::new(2));
-            let started_thread = started.clone();
+            // 通过 channel 把 RunLoop 句柄和启动结果交回主线程，避免启动失败时
+            // 主线程永久等待 Barrier，而析构时也能明确停止监听线程。
+            let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
             let stream_addr = stream as usize;
             let thread = std::thread::spawn(move || {
                 let stream = stream_addr as *mut std::ffi::c_void;
                 let run_loop = unsafe { CFRunLoopGetCurrent() };
                 unsafe {
                     FSEventStreamScheduleWithRunLoop(stream, run_loop, kCFRunLoopDefaultMode);
-                    if !FSEventStreamStart(stream) {
-                        CFRunLoopStop(run_loop);
+                    let started = FSEventStreamStart(stream);
+                    let _ = started_tx.send((run_loop as usize, started));
+                    if !started {
                         return;
                     }
+                    CFRunLoopRun();
                 }
-                started_thread.wait();
-                unsafe { CFRunLoopRun() };
             });
-            started.wait();
+            let (run_loop_addr, started) = match started_rx.recv() {
+                Ok(value) => value,
+                Err(_) => {
+                    unsafe {
+                        FSEventStreamInvalidate(stream);
+                        FSEventStreamRelease(stream);
+                    }
+                    let _ = thread.join();
+                    return Err("FSEventStream 启动线程失败".into());
+                }
+            };
+            if !started {
+                unsafe {
+                    FSEventStreamInvalidate(stream);
+                    FSEventStreamRelease(stream);
+                }
+                let _ = thread.join();
+                return Err("FSEventStream 启动失败".into());
+            }
             Ok(Self {
                 dirty,
                 stream,
+                run_loop: run_loop_addr as *mut std::ffi::c_void,
                 thread: Some(thread),
             })
         }
@@ -480,6 +501,9 @@ mod watch_impl {
     impl Drop for Watch {
         fn drop(&mut self) {
             unsafe {
+                // 监听线程阻塞在 CFRunLoopRun；仅停止 stream 不会唤醒它，
+                // 必须先停止 RunLoop，否则后续 join 会永久等待。
+                CFRunLoopStop(self.run_loop);
                 FSEventStreamStop(self.stream);
                 FSEventStreamInvalidate(self.stream);
                 FSEventStreamRelease(self.stream);
