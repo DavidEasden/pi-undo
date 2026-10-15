@@ -4,6 +4,7 @@ mod directory;
 mod file_batch;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod scan_directories;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod serve;
 #[cfg(unix)]
 use file_batch::{
@@ -125,11 +126,16 @@ fn main() {
 fn run() -> Result<(), String> {
     let first = std::env::args().nth(1).ok_or("缺少 request path")?;
     if first == "--capabilities" {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        println!(
-            "{}",
-            r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","inspect-batches-v1","scan-directories-v1","scan-directories-v2","restore-files-v2"]}"#
-        );
+        #[cfg(target_os = "macos")]
+        {
+            let capabilities = r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","inspect-batches-v1","scan-directories-v1","scan-directories-v2","scan-serve-v1","restore-files-v2"]}"#;
+            println!("{capabilities}");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let capabilities = r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","inspect-batches-v1","scan-directories-v1","scan-directories-v2","restore-files-v2"]}"#;
+            println!("{capabilities}");
+        }
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
         println!(
             "{}",

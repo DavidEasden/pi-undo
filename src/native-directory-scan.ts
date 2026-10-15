@@ -7,6 +7,7 @@ import { GitRunError, runSupervisedProcess } from "./git-runner.ts";
 import { probeNativeCapabilities } from "./native-capabilities.ts";
 import { nativeExecutable } from "./native-restore.ts";
 import { checkOperation, configuredTimeout, OperationError, operationProcessOptions } from "./operation-context.ts";
+import { ResidentScanClient } from "./resident-scan-client.ts";
 
 export interface NativeRepositoryCandidate {
 	readonly path: string;
@@ -21,6 +22,10 @@ export interface NativeDirectoryScan {
 
 export interface NativeDirectoryScanPort {
 	scan(workspaceRoot: string): Promise<NativeDirectoryScan | undefined>;
+	/** 可选的会话级预热；测试替身和旧调用方无需实现。 */
+	prewarm?(workspaceRoot: string): void;
+	/** 运行时销毁时关闭常驻 helper，避免跨会话遗留进程。 */
+	dispose?(): Promise<void>;
 }
 
 const nativeScanCacheDirectories = new Set<string>();
@@ -45,30 +50,92 @@ function isPathInside(root: string, candidate: string): boolean {
 /** 原生 helper 能力之外，目录快照只在逐目录元数据仍可证明时复用。 */
 export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 	private readonly executable: string | undefined;
-	private capability: Promise<"v2" | "v1" | undefined> | undefined;
+	private capabilities: Promise<ReadonlySet<string>> | undefined;
 	private cacheDirectory: Promise<string> | undefined;
+	private resident: { readonly workspaceRoot: string; readonly client: ResidentScanClient } | undefined;
+	private prewarmInFlight: { readonly workspaceRoot: string; readonly promise: Promise<void> } | undefined;
 
 	constructor(executable = nativeExecutable()) {
 		this.executable = process.env.PI_UNDO_DISABLE_NATIVE === "1" || process.platform === "win32"
 			? undefined : executable;
 	}
 
+	/**
+	 * 会话初始化时只预热常驻扫描，不触发一次性 helper。
+	 * 正式 discover 会等待这次预热完成，然后请求同一个 serve 缓存，保证变化仍被事件失效检查覆盖。
+	 */
+	prewarm(workspaceRoot: string): void {
+		if (this.executable === undefined || this.prewarmInFlight?.workspaceRoot === workspaceRoot) return;
+		const promise = this.prewarmResident(workspaceRoot).catch(() => undefined).finally(() => {
+			if (this.prewarmInFlight?.promise === promise) this.prewarmInFlight = undefined;
+		});
+		this.prewarmInFlight = { workspaceRoot, promise };
+	}
+
+	/** 运行时销毁时关闭常驻 helper。 */
+	async dispose(): Promise<void> {
+		await this.prewarmInFlight?.promise;
+		await this.resident?.client.close();
+		this.resident = undefined;
+	}
+
+	private async prewarmResident(workspaceRoot: string): Promise<void> {
+		const temporaryRoot = await realpath(tmpdir()).catch(() => undefined);
+		if (temporaryRoot === undefined || isPathInside(workspaceRoot, temporaryRoot)) return;
+		const requestDirectory = await mkdtemp(join(temporaryRoot, "pi-undo-native-serve-probe-"));
+		try {
+			const capabilities = await this.probeCapabilities(requestDirectory);
+			if (!capabilities.has("scan-serve-v1")) return;
+			const client = this.ensureResident(workspaceRoot);
+			if (client !== undefined) await client.prewarm();
+		} finally {
+			await rm(requestDirectory, { recursive: true, force: true }).catch(() => {});
+		}
+	}
+
+	private ensureResident(workspaceRoot: string): ResidentScanClient | undefined {
+		if (this.executable === undefined) return undefined;
+		if (this.resident?.workspaceRoot === workspaceRoot) return this.resident.client;
+		if (this.resident !== undefined) void this.resident.client.close();
+		const client = new ResidentScanClient(
+			this.executable,
+			workspaceRoot,
+			configuredTimeout("PI_UNDO_OPERATION_TIMEOUT_MS", 300_000),
+		);
+		this.resident = { workspaceRoot, client };
+		return client;
+	}
+
 	async scan(workspaceRoot: string): Promise<NativeDirectoryScan | undefined> {
 		checkOperation();
-		if (this.executable === undefined ||
-			(this.capability !== undefined && await this.capability === undefined)) return undefined;
+		if (this.executable === undefined) return undefined;
+		const pendingPrewarm = this.prewarmInFlight;
+		if (pendingPrewarm?.workspaceRoot === workspaceRoot) await pendingPrewarm.promise;
+		checkOperation();
 		// TMPDIR 可能通过符号链接指向工作区；先核验真实路径，再创建任何请求或缓存。
 		const temporaryRoot = await realpath(tmpdir()).catch(() => undefined);
 		if (temporaryRoot === undefined || isPathInside(workspaceRoot, temporaryRoot)) return undefined;
 		const requestDirectory = await mkdtemp(join(temporaryRoot, "pi-undo-native-scan-"));
 		try {
-			this.capability ??= this.supportsScan(requestDirectory).catch((error) => {
-				// 取消或未确认终止不能污染后续操作的能力缓存。
-				this.capability = undefined;
-				throw error;
-			});
-			const version = await this.capability;
+			const capabilities = await this.probeCapabilities(requestDirectory);
+			const version = capabilities.has("scan-directories-v2") ? "v2"
+				: capabilities.has("scan-directories-v1") ? "v1" : undefined;
 			if (version === undefined) return undefined;
+
+			if (capabilities.has("scan-serve-v1")) {
+				const client = this.ensureResident(workspaceRoot);
+				if (client !== undefined) {
+					const response = await client.scan();
+					checkOperation();
+					if (response !== undefined) {
+						const parsed = parseResidentResponse(response);
+						if (parsed !== undefined) return parsed;
+						client.reset();
+					}
+				}
+				// serve 失败或协议无效：继续使用一次性 helper。
+			}
+
 			const budget = operationProcessOptions(configuredTimeout("PI_UNDO_OPERATION_TIMEOUT_MS", 300_000));
 			const requestPath = join(requestDirectory, "request.json");
 			const cachePath = version === "v2"
@@ -102,15 +169,22 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 		}
 	}
 
-	private async supportsScan(directory: string): Promise<"v2" | "v1" | undefined> {
+	private async probeCapabilities(directory: string): Promise<ReadonlySet<string>> {
 		try {
 			await access(this.executable!, constants.X_OK);
 		} catch {
-			return undefined;
+			return new Set<string>();
 		}
-		const capabilities = await probeNativeCapabilities(this.executable!, directory);
-		if (capabilities.has("scan-directories-v2")) return "v2";
-		return capabilities.has("scan-directories-v1") ? "v1" : undefined;
+		if (this.capabilities === undefined) {
+			const probe = probeNativeCapabilities(this.executable!, directory).catch((error) => {
+				// 取消或未确认退出不能污染后续操作的能力缓存；普通的不支持结果由
+				// probeNativeCapabilities 返回空集合并可安全缓存。
+				this.capabilities = undefined;
+				throw error;
+			});
+			this.capabilities = probe;
+		}
+		return await this.capabilities;
 	}
 
 	private async directoryCachePath(
@@ -160,6 +234,34 @@ function parseScanResponse(text: string): NativeDirectoryScan | undefined {
 		seen.add(candidate.path);
 		return { path: candidate.path, dev: parseIdentity(candidate.dev), ino: parseIdentity(candidate.ino) };
 	});
+	return { directories: value.directories as number, repositories };
+}
+
+function parseResidentResponse(value: Record<string, unknown>): NativeDirectoryScan | undefined {
+	try {
+		return parseScanValue(value);
+	} catch {
+		return undefined;
+	}
+}
+
+function parseScanValue(value: unknown): NativeDirectoryScan | undefined {
+	if (!isRecord(value) || value.ok !== true || !Number.isSafeInteger(value.directories) ||
+		(value.directories as number) < 1 || !Array.isArray(value.repositories) ||
+		value.repositories.length >= (value.directories as number)) {
+		throw new Error("native 目录扫描响应无效");
+	}
+	const seen = new Set<string>();
+	const repositories: NativeRepositoryCandidate[] = [];
+	for (const candidate of value.repositories) {
+		if (!isRecord(candidate) || typeof candidate.path !== "string" || candidate.path.includes("\0") ||
+			candidate.path.split("/").some((part) => part === "" || part === "." || part === ".." || part === ".git") ||
+			seen.has(candidate.path)) {
+			throw new Error("native 仓库候选路径无效");
+		}
+		seen.add(candidate.path);
+		repositories.push({ path: candidate.path, dev: parseIdentity(candidate.dev), ino: parseIdentity(candidate.ino) });
+	}
 	return { directories: value.directories as number, repositories };
 }
 

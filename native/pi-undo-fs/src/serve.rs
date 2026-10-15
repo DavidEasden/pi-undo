@@ -8,8 +8,8 @@
 
 use crate::directory::Directory;
 use crate::scan_directories::{
-    metadata_matches, scan, DirectoryCache, Repository, Response, ScanState,
-    CACHE_SCHEMA_VERSION, WATCH_TREE_MAX_DEPTH,
+    metadata_matches, scan, DirectoryCache, Repository, Response, ScanState, CACHE_SCHEMA_VERSION,
+    WATCH_TREE_MAX_DEPTH,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -17,8 +17,14 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use std::time::{Duration, Instant};
 
 const SERVE_PROTOCOL_VERSION: u32 = 1;
+/// 闲置超时：无请求持续该时长后自杀，由调用方按需重启。
+const SERVE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -37,7 +43,31 @@ struct ResidentState {
     overflow: bool,
 }
 
-fn main_loop(mut input: BufReader<impl std::io::Read>, mut output: impl std::io::Write) -> Result<(), String> {
+fn main_loop(
+    mut input: BufReader<impl std::io::Read>,
+    mut output: impl std::io::Write,
+) -> Result<(), String> {
+    // 闲置自杀看门狗：无请求持续 SERVE_IDLE_TIMEOUT 后进程退出，由调用方按需重启。
+    // busy 标志在请求处理期间置 1，处理结束归 0；扫描长操作不受影响（最长操作时间远小于超时也成立：
+    // 看门狗只看 busy，不看总时长）。
+    let busy = Arc::new(AtomicBool::new(true));
+    {
+        let busy_flag = busy.clone();
+        std::thread::spawn(move || {
+            let mut idle_start: Option<Instant> = None;
+            loop {
+                std::thread::sleep(Duration::from_millis(250));
+                if busy_flag.load(Ordering::Relaxed) {
+                    idle_start = None;
+                } else {
+                    let since = *idle_start.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= SERVE_IDLE_TIMEOUT {
+                        std::process::exit(0);
+                    }
+                }
+            }
+        });
+    }
     let mut line = String::new();
     input
         .read_line(&mut line)
@@ -92,9 +122,12 @@ fn main_loop(mut input: BufReader<impl std::io::Read>, mut output: impl std::io:
         "repositories": response.repositories,
     });
     writeln!(output, "{initial}").map_err(|error| format!("写 serve 响应失败：{error}"))?;
-    output.flush().map_err(|error| format!("flush 失败：{error}"))?;
+    output
+        .flush()
+        .map_err(|error| format!("flush 失败：{error}"))?;
 
     loop {
+        busy.store(false, Ordering::Relaxed);
         let mut line = Vec::new();
         let read = input
             .read_until(b'\n', &mut line)
@@ -102,16 +135,19 @@ fn main_loop(mut input: BufReader<impl std::io::Read>, mut output: impl std::io:
         if read == 0 {
             return Ok(()); // 客户端关闭：进程随之退出。
         }
+        busy.store(true, Ordering::Relaxed);
         if line.last() == Some(&b'\n') {
             line.pop();
         }
         if line.is_empty() {
+            busy.store(false, Ordering::Relaxed);
             continue;
         }
         let _request: ScanRequest = match serde_json::from_slice(&line) {
             Ok(request) => request,
             Err(error) => {
                 write_error(&mut output, &format!("解析 scan 请求失败：{error}"))?;
+                busy.store(false, Ordering::Relaxed);
                 continue;
             }
         };
@@ -141,7 +177,10 @@ fn main_loop(mut input: BufReader<impl std::io::Read>, mut output: impl std::io:
             }
             Err(error) => write_error(&mut output, &error)?,
         }
-        output.flush().map_err(|error| format!("flush 失败：{error}"))?;
+        output
+            .flush()
+            .map_err(|error| format!("写 serve 响应失败：{error}"))?;
+        busy.store(false, Ordering::Relaxed);
     }
 }
 
@@ -160,10 +199,7 @@ struct ScanRequest {
 
 /// 缓存命中路径：逐目录打开 + fstat 校验身份/时间戳，不做 readdir。
 /// 树结构与缓存 children 完全一致才成功；任何偏差返回 Err，调用方回退重扫。
-fn serve_cache_hit(
-    state: &mut ResidentState,
-    root: &Directory,
-) -> Result<HitResponse, String> {
+fn serve_cache_hit(state: &mut ResidentState, root: &Directory) -> Result<HitResponse, String> {
     let current = fs::symlink_metadata(&state.workspace).map_err(|error| error.to_string())?;
     if !(current.is_dir()
         && current.dev() == state.workspace_dev
@@ -193,7 +229,10 @@ fn verify_tree(
     let Some(cached) = state.directories.get(path).cloned() else {
         return Err(format!("缓存缺少目录：{path}"));
     };
-    let metadata = directory.file.metadata().map_err(|error| error.to_string())?;
+    let metadata = directory
+        .file
+        .metadata()
+        .map_err(|error| error.to_string())?;
     if !metadata_matches(&cached, &metadata) {
         return Err(format!("目录与缓存不匹配：{path}"));
     }
@@ -260,7 +299,8 @@ fn serve_rescan(state: &mut ResidentState, root: &Directory) -> Result<HitRespon
     Ok(HitResponse {
         directories: response.directories,
         repositories: response.repositories,
-        cache_hits: scan_state.reused_directories == response.directories && response.directories > 0,
+        cache_hits: scan_state.reused_directories == response.directories
+            && response.directories > 0,
     })
 }
 
@@ -294,7 +334,14 @@ mod watch_impl {
     unsafe extern "C" {
         fn FSEventStreamCreate(
             allocator: *const std::ffi::c_void,
-            callback: extern "C" fn(*const std::ffi::c_void, *mut std::ffi::c_void, usize, *const std::ffi::c_void, *const u32, *const u64),
+            callback: extern "C" fn(
+                *const std::ffi::c_void,
+                *mut std::ffi::c_void,
+                usize,
+                *const std::ffi::c_void,
+                *const u32,
+                *const u64,
+            ),
             context: *mut std::ffi::c_void,
             paths: *const std::ffi::c_void,
             since_when: u64,
@@ -325,7 +372,6 @@ mod watch_impl {
     const K_FSEVENTSTREAMIGNORESELF: u32 = 0x00000008;
     const K_CFSTRINGENCODING_UTF8: u32 = 0x08000100;
 
-
     pub(super) struct Watch {
         dirty: Arc<AtomicBool>,
         stream: *mut std::ffi::c_void,
@@ -354,14 +400,23 @@ mod watch_impl {
             let path_c = CString::new(workspace.to_str().ok_or("workspace 路径不是 UTF-8")?)
                 .map_err(|_| "workspace 路径含 NUL")?;
             let cf_path = unsafe {
-                CFStringCreateWithCString(std::ptr::null(), path_c.as_ptr(), K_CFSTRINGENCODING_UTF8)
+                CFStringCreateWithCString(
+                    std::ptr::null(),
+                    path_c.as_ptr(),
+                    K_CFSTRINGENCODING_UTF8,
+                )
             };
             if cf_path.is_null() {
                 return Err("CFString 创建失败".into());
             }
             let paths = [cf_path];
             let array = unsafe {
-                CFArrayCreate(std::ptr::null(), paths.as_ptr() as *const _, 1, std::ptr::null())
+                CFArrayCreate(
+                    std::ptr::null(),
+                    paths.as_ptr() as *const _,
+                    1,
+                    std::ptr::null(),
+                )
             };
             if array.is_null() {
                 return Err("CFArray 创建失败".into());
@@ -380,7 +435,8 @@ mod watch_impl {
                     on_events,
                     &mut context as *mut FSEventStreamContext as *mut std::ffi::c_void,
                     array,
-                    /* since_when */ u64::MAX, // kFSEventStreamEventIdSinceNow：只收启动后的新事件
+                    /* since_when */
+                    u64::MAX, // kFSEventStreamEventIdSinceNow：只收启动后的新事件
                     /* latency */ 0.1,
                     K_FSEVENTSTREAMIGNORESELF | K_FSEVENTSTREAMCREATENOFLAGS,
                 )
