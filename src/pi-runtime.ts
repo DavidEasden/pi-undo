@@ -58,14 +58,14 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 	const capture = async (scopePaths?: readonly string[]) => {
 		const topology = await discovery.discover(context.cwd);
 		if (topology.workspaceIdentity !== initialTopology.workspaceIdentity) {
-			throw new Error("workspace identity 已变化");
+			throw new Error("workspace_identity_changed: workspace root canonical path changed; run /undo-recover");
 		}
 		return store.capture(topology, scopePaths, { topologyAlreadyValidated: true });
 	};
 	const captureBaseline = async (baseline: SnapshotManifest) => {
 		const topology = await discovery.discover(context.cwd);
 		if (topology.workspaceIdentity !== initialTopology.workspaceIdentity) {
-			throw new Error("workspace identity 已变化");
+			throw new Error("workspace_identity_changed: workspace root canonical path changed; run /undo-recover");
 		}
 		return store.captureBaseline(topology, baseline, undefined, { topologyAlreadyValidated: true });
 	};
@@ -150,6 +150,7 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 
 	let finalizationQueue: Promise<void> = Promise.resolve();
 	let finalizationFailure: unknown;
+	let controller: UndoControllerImpl | undefined;
 	const waitForFinalization = async (): Promise<void> => {
 		await finalizationQueue;
 		if (finalizationFailure !== undefined) throw finalizationFailure;
@@ -179,6 +180,9 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 			}
 		}))).catch((error: unknown) => {
 			finalizationFailure = error;
+			controller?.markRecoveryRequired(`finalization_failed:${opId}`);
+			reporter.setRecoveryRequired(`finalization_failed:${opId}`);
+			context.ui.notify(`pi-undo 后台持久化失败（op:${opId}）：已锁定撤回历史，请运行 /undo-recover 重试`, "error");
 		});
 	};
 	const transactionJournal: ControllerDependencies["journal"] = {
@@ -301,14 +305,16 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 		initialTopology.workspaceIdentity,
 		() => recovery.recover(),
 	);
-	const controller = new UndoControllerImpl(dependencies, {
+	controller = new UndoControllerImpl(dependencies, {
 		...rebuildControllerState(manager, sessionIdentity),
 		locked: startupRecovery.kind === "locked",
 		recoveryReason: startupRecovery.kind === "locked" ? startupRecovery.reason : undefined,
 		recoveryCompleted: true,
 	});
+	const activeController = controller;
+	if (activeController === undefined) throw new Error("pi-undo controller 初始化失败");
 	return {
-		controller,
+		controller: activeController,
 		reporter,
 		diffSource: store,
 		recovery: startupRecovery.kind === "locked"
@@ -316,7 +322,7 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 			: undefined,
 		async dispose(): Promise<void> {
 			try {
-				await controller.dispose();
+				await activeController.dispose();
 				await finalizationQueue;
 				if (isUnconfirmedExit(finalizationFailure)) throw finalizationFailure;
 			} finally {

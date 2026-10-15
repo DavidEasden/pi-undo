@@ -164,6 +164,8 @@ export interface UndoController {
 	cancelOperation?(): boolean;
 	dispose?(): Promise<void>;
 	recover(): Promise<void>;
+	/** 后台耐久化失败时锁住当前 runtime，等待显式 recovery。 */
+	markRecoveryRequired?(reason: string): void;
 	history(): HistoryState;
 	/** 当前 recovery lock 的原因；未锁定时返回 undefined。 */
 	recoveryReason?(): string | undefined;
@@ -340,6 +342,10 @@ export class UndoControllerImpl implements UndoController {
 			const normalized = truncateReason(reason);
 			this.lockedReason = normalized.length === 0 ? "recovery_required" : normalized;
 		}
+	}
+
+	markRecoveryRequired(reason: string): void {
+		this.lock(reason);
 	}
 
 	private recoveryResult(changedFiles = 0): OperationResult {

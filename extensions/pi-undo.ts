@@ -1,6 +1,7 @@
 import { performance } from "node:perf_hooks";
 
 import type {
+	BeforeAgentStartEvent,
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
@@ -94,6 +95,12 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 						next.controller.recoveryReason?.() ?? next.recovery?.reason ?? "pending journal",
 						next.recovery,
 					);
+					if (next.recovery?.reason === "mutation_conflict") {
+						context.ui.notify(
+							"pi-undo 检测到外部文件冲突：请先备份工作区，停止其他写入程序，再检查事务后运行 /undo-recover",
+							"error",
+						);
+					}
 				} else next.reporter.setReady(history.undoCount, history.redoCount);
 			} catch (error) {
 				if (currentGeneration !== generation) return;
@@ -283,8 +290,11 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 				if (active === undefined) return;
 				const history = active.controller.history();
 				if (history.locked) {
+					const reason = active.controller.recoveryReason?.() ?? "pending journal";
 					context.ui.notify(
-						`pi-undo: still locked (${active.controller.recoveryReason?.() ?? "pending journal"}); resolve the blocking session, then run /undo-recover again`,
+						reason === "mutation_conflict"
+						? "pi-undo 仍检测到外部文件冲突：请备份工作区和 session，停止其他写入程序，检查事务后再运行 /undo-recover"
+						: `pi-undo: still locked (${reason}); resolve the blocking session, then run /undo-recover again`,
 						"warning",
 					);
 					return;
@@ -345,7 +355,7 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 				captureFailureNotified = true;
 				const reason = active.controller.captureFailureReason();
 				context.ui.notify(
-					`pi-undo: pre-input snapshot failed${reason === undefined || reason.length === 0 ? "" : ` (${reason})`}; this run will not be undoable`,
+					`pi-undo: pre-input snapshot failed${reason === undefined || reason.length === 0 ? "" : ` (${reason})`}; 本次 run 不可撤回。若原因包含 workspace_identity_changed，请运行 /undo-recover 重建 runtime`,
 					"warning",
 				);
 			}
@@ -362,12 +372,15 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 				captureFailureNotified = true;
 				const reason = active.controller.captureFailureReason();
 				context.ui.notify(
-					`pi-undo: pre-input snapshot failed${reason === undefined || reason.length === 0 ? "" : ` (${reason})`}; this run will not be undoable`,
+					`pi-undo: pre-input snapshot failed${reason === undefined || reason.length === 0 ? "" : ` (${reason})`}; 本次 run 不可撤回。若原因包含 workspace_identity_changed，请运行 /undo-recover 重建 runtime`,
 					"warning",
 				);
 			}
 		});
-		pi.on("before_agent_start", async () => {
+		pi.on("before_agent_start", async (event: BeforeAgentStartEvent) => {
+			// pi 1.2+ 还会为 extension-triggered custom run 派发此事件；这种 run
+			// 没有 input 阶段，不应被当成一个可撤回的用户 Agent run。
+			if (event.messageType === "custom") return;
 			const active = runtime;
 			const startGeneration = generation;
 			if (active === undefined) return;

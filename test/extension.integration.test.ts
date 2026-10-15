@@ -330,8 +330,10 @@ describe("pi-undo extension", () => {
 		};
 
 		await handlers.get("session_start")!({}, context);
+		await handlers.get("before_agent_start")!({ messageType: "custom" }, context);
+		expect(calls).toEqual([]);
 		await handlers.get("input")!({ text: "快速输入", source: "interactive" }, context);
-		await handlers.get("before_agent_start")!({}, context);
+		await handlers.get("before_agent_start")!({ messageType: "user" }, context);
 		expect(calls).toEqual(["begin", "before"]);
 		await handlers.get("message_end")!({ message: { role: "user" } }, context);
 		expect(calls).toEqual(["begin", "before", "commit"]);

@@ -104,6 +104,17 @@ function dependencies(overrides: Partial<ControllerDependencies> = {}): Controll
 }
 
 describe("UndoController", () => {
+	it("后台持久化失败可立即锁定当前 runtime", async () => {
+		const controller = new UndoControllerImpl(dependencies());
+
+		expect(controller.history().locked).toBe(false);
+		controller.markRecoveryRequired("finalization_failed:operation-1");
+
+		expect(controller.history().locked).toBe(true);
+		expect(controller.recoveryReason()).toBe("finalization_failed:operation-1");
+		expect(await controller.undo()).toMatchObject({ code: "recovery_required" });
+	});
+
 	it("dispose 让出事件循环期间收到迟到的 settled 不再捕获或追加检查点", async () => {
 		const capture = vi.fn(async () => manifest("a"));
 		const deps = dependencies({ capture });
