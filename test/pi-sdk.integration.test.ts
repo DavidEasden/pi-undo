@@ -2,6 +2,7 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 
+import { RootDiscovery } from "../src/root-discovery.ts";
 import { RestoreEngine } from "../src/restore-engine.ts";
 import {
 	closeHarness,
@@ -165,6 +166,55 @@ describe("真实 pi 1.2.0 SDK", () => {
 			await closeHarness(harness, temp.sessionDir);
 		}
 	});
+
+	it("中断的 run 在 settled 快照进行中时 abort 立即返回，检查点随后仍完整入栈", async () => {
+		const { temp, harness } = await createFreshHarness(undefined, { tokensPerSecond: 2_000 });
+		const { session } = harness;
+		const faux = harness.faux;
+		try {
+			await setUpRun(faux, "value.txt", "after\n", "第一轮完成");
+			await session.prompt("把 value.txt 改为 after");
+			expect(harness.runtime().controller.history()).toEqual({ undoCount: 1, redoCount: 0, locked: false });
+
+			// 用 gate 只拦截中断后的 settled 快照 discover（第 3 次：两次输入前捕获之后）；
+			// 前两次分别是两个 run 的输入前捕获，不能拦截。
+			const originalDiscover = RootDiscovery.prototype.discover;
+			let releaseGate: () => void = () => {};
+			const gate = new Promise<void>((resolve) => { releaseGate = resolve; });
+			let gatedCalls = 0;
+			RootDiscovery.prototype.discover = async function (...args: Parameters<typeof originalDiscover>) {
+				gatedCalls += 1;
+				if (gatedCalls >= 3) await gate;
+				return originalDiscover.apply(this, args);
+			};
+			try {
+				// 慢速流式让 abort 落在 run 中途，而不是等文本瞬间输出完。
+				faux.setResponses([fauxAssistantMessage("慢速输出".repeat(2_000))]);
+				const runPromise = session.prompt("慢慢输出");
+				await vi.waitFor(() => expect(session.isIdle).toBe(false), { timeout: 5_000 });
+				await delay(200);
+
+				const abortStarted = performance.now();
+				await session.abort();
+				const abortMs = performance.now() - abortStarted;
+				expect(abortMs, "abort 必须在快照完成前返回").toBeLessThan(1_500);
+
+				releaseGate();
+				await runPromise;
+				// 中断路径下检查点在后台完成，稍等它入栈后再断言。
+				await vi.waitFor(() =>
+					expect(harness.runtime().controller.history()).toEqual({ undoCount: 2, redoCount: 0, locked: false }),
+					{ timeout: 10_000 });
+				await session.prompt("/undo");
+				expect(harness.runtime().controller.history()).toEqual({ undoCount: 1, redoCount: 1, locked: false });
+			} finally {
+				releaseGate();
+				RootDiscovery.prototype.discover = originalDiscover;
+			}
+		} finally {
+			await closeHarness(harness, temp.sessionDir);
+		}
+	}, 30_000);
 
 	it("原生 tree 导航到用户目标时按逻辑叶恢复工作区（物理父节点是 pi-undo:start）", async () => {
 		const { temp, harness } = await createFreshHarness();
