@@ -45,6 +45,9 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 	const privateRoot = join(manager.getSessionDir(), ".pi-undo");
 	const discovery = new RootDiscovery();
 	const initialTopology = await discovery.discover(context.cwd);
+	// 初始 topology 建立后启动常驻 helper，避免冷启动预热与首次 discovery 争用目录读取；
+	// 首次 prompt capture 会等待这次预热完成并复用同一缓存。
+	discovery.warmScanCache(context.cwd);
 	const store = new SnapshotStore({ storeRoot: privateRoot, discovery });
 	const restore = new RestoreEngine({ workspaceRoot: context.cwd, store, discovery });
 	const journal = new JournalStore({ transactionsRoot: join(privateRoot, "transactions") });
@@ -312,10 +315,14 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 			? { reason: startupRecovery.reason, files: startupRecovery.files, opId: startupRecovery.opId }
 			: undefined,
 		async dispose(): Promise<void> {
-			await controller.dispose();
-			await finalizationQueue;
-			if (isUnconfirmedExit(finalizationFailure)) throw finalizationFailure;
-			reporter.endOperation();
+			try {
+				await controller.dispose();
+				await finalizationQueue;
+				if (isUnconfirmedExit(finalizationFailure)) throw finalizationFailure;
+			} finally {
+				await discovery.dispose();
+				reporter.endOperation();
+			}
 		},
 		setCommandContext(next: ExtensionCommandContext | undefined): void {
 			commandContext = next;

@@ -17,52 +17,53 @@ struct Request {
     cache_path: Option<String>,
 }
 
-const CACHE_SCHEMA_VERSION: u32 = 2;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 2;
+pub(crate) const WATCH_TREE_MAX_DEPTH: usize = 128;
 const RACY_DIRECTORY_WINDOW_NS: u128 = 2_000_000_000;
 static NEXT_CACHE_WRITE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct DirectoryCache {
-    schema_version: u32,
-    workspace_root: String,
-    workspace_dev: u64,
-    workspace_ino: u64,
-    directories: BTreeMap<String, CachedDirectory>,
+pub(crate) struct DirectoryCache {
+    pub(crate) schema_version: u32,
+    pub(crate) workspace_root: String,
+    pub(crate) workspace_dev: u64,
+    pub(crate) workspace_ino: u64,
+    pub(crate) directories: BTreeMap<String, CachedDirectory>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CachedDirectory {
-    dev: u64,
-    ino: u64,
-    mtime: i64,
-    mtime_nsec: i64,
-    ctime: i64,
-    ctime_nsec: i64,
-    has_git: bool,
-    racy: bool,
-    children: Vec<String>,
+pub(crate) struct CachedDirectory {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    pub(crate) mtime: i64,
+    pub(crate) mtime_nsec: i64,
+    pub(crate) ctime: i64,
+    pub(crate) ctime_nsec: i64,
+    pub(crate) has_git: bool,
+    pub(crate) racy: bool,
+    pub(crate) children: Vec<String>,
 }
 
-struct ScanState<'a> {
-    previous: Option<&'a DirectoryCache>,
-    next: BTreeMap<String, CachedDirectory>,
-    reused_directories: usize,
-}
-
-#[derive(Serialize)]
-struct Repository {
-    path: String,
-    dev: String,
-    ino: String,
+pub(crate) struct ScanState<'a> {
+    pub(crate) previous: Option<&'a DirectoryCache>,
+    pub(crate) next: BTreeMap<String, CachedDirectory>,
+    pub(crate) reused_directories: usize,
 }
 
 #[derive(Serialize)]
-struct Response {
-    ok: bool,
-    directories: usize,
-    repositories: Vec<Repository>,
+pub(crate) struct Repository {
+    pub(crate) path: String,
+    pub(crate) dev: String,
+    pub(crate) ino: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct Response {
+    pub(crate) ok: bool,
+    pub(crate) directories: usize,
+    pub(crate) repositories: Vec<Repository>,
 }
 
 pub(crate) fn run(request_path: &Path) -> Result<(), String> {
@@ -136,7 +137,7 @@ pub(crate) fn run(request_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn scan(
+pub(crate) fn scan(
     directory: &Directory,
     path: &str,
     depth: usize,
@@ -244,7 +245,7 @@ fn scan(
     Ok(())
 }
 
-fn assert_unchanged(
+pub(crate) fn assert_unchanged(
     path: &str,
     before: &std::fs::Metadata,
     after: &std::fs::Metadata,
@@ -263,7 +264,7 @@ fn assert_unchanged(
     Ok(())
 }
 
-fn cached_directory(
+pub(crate) fn cached_directory(
     metadata: &std::fs::Metadata,
     has_git: bool,
     children: Vec<String>,
@@ -283,7 +284,7 @@ fn cached_directory(
     }
 }
 
-fn metadata_matches(cached: &CachedDirectory, metadata: &std::fs::Metadata) -> bool {
+pub(crate) fn metadata_matches(cached: &CachedDirectory, metadata: &std::fs::Metadata) -> bool {
     cached.dev == metadata.dev()
         && cached.ino == metadata.ino()
         && cached.mtime == metadata.mtime()
@@ -292,7 +293,7 @@ fn metadata_matches(cached: &CachedDirectory, metadata: &std::fs::Metadata) -> b
         && cached.ctime_nsec == metadata.ctime_nsec()
 }
 
-fn directory_is_racy(metadata: &std::fs::Metadata, observed_at: SystemTime) -> bool {
+pub(crate) fn directory_is_racy(metadata: &std::fs::Metadata, observed_at: SystemTime) -> bool {
     if metadata.mtime_nsec() == 0 || metadata.ctime_nsec() == 0 {
         return true;
     }

@@ -73,9 +73,22 @@ export interface RootDiscovery {
 export class RootDiscovery {
 	private readonly git: GitRunner;
 	private lastDirectoryCount: number | undefined;
+	private readonly nativeScan: NativeDirectoryScanPort;
 
-	constructor(git = new GitRunner(), private readonly nativeScan: NativeDirectoryScanPort = new NativeDirectoryScanner()) {
+	constructor(git = new GitRunner(), nativeScan: NativeDirectoryScanPort = new NativeDirectoryScanner()) {
 		this.git = git;
+		this.nativeScan = nativeScan;
+	}
+
+	/** 常驻扫描预热：仅对后续会选择 native 的大目录树启动 helper。 */
+	warmScanCache(workspaceRoot: string): void {
+		if (this.lastDirectoryCount === undefined || this.lastDirectoryCount < NATIVE_SCAN_MIN_DIRECTORIES) return;
+		this.nativeScan.prewarm?.(workspaceRoot);
+	}
+
+	/** 关闭 native 常驻扫描客户端。 */
+	async dispose(): Promise<void> {
+		await this.nativeScan.dispose?.();
 	}
 
 	async discover(workspaceRoot: string, reason: RootDiscoveryReason = "unspecified"): Promise<RootTopology> {

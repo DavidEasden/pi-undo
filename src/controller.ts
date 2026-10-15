@@ -816,11 +816,11 @@ export class UndoControllerImpl implements UndoController {
 		this.lastSafetyManifestId = null;
 		let lease: { release(): Promise<void> } | undefined;
 		try {
-			if (!await profile.measure("idle", () => this.ensureIdle())) {
-				checkOperation();
-				return done({ code: "idle_timeout", changedFiles: 0 });
-			}
-			if (!await profile.measure("checkpoint", () => this.waitForCheckpoint())) {
+			const [idleReady, checkpointReady] = await Promise.all([
+				profile.measure("idle", () => this.ensureIdle()),
+				profile.measure("checkpoint", () => this.waitForCheckpoint()),
+			]);
+			if (!idleReady || !checkpointReady) {
 				checkOperation();
 				return done({ code: "idle_timeout", changedFiles: 0 });
 			}
