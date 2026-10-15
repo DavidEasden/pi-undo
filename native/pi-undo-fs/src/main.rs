@@ -150,6 +150,7 @@ fn run() -> Result<(), String> {
         // 常驻扫描：stdin/stdout 逐行 JSON 协议。
         return serve::run(std::io::stdin(), std::io::stdout());
     }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     if first == "--scan-directories" {
         let path = std::env::args().nth(2).ok_or("缺少目录扫描 request path")?;
         return scan_directories::run(Path::new(&path));
