@@ -13,13 +13,15 @@ Each completed agent run creates a checkpoint that captures both the Pi session 
 - **Deferred prompts** — text, images, `@file` references, and paste content entered during an undo/redo are queued and processed in FIFO order once the operation completes. Prompts are never lost.
 - **Crash recovery** — a write-ahead log (WAL), mutation journal, and quarantine artifacts allow in-progress operations to be rolled forward or back on restart.
 - **External concurrency detection** — file fingerprint and inode checks detect external modification. Conflicting changes are never silently overwritten; the system fails closed or enters `recovery required`.
+- **后台持久化故障即时锁定** — durable pack finalization 失败会立即进入 `recovery_required`，不会等到下次启动才暴露问题。
+- **Pi 1.3 生命周期兼容** — `before_agent_start` 会忽略 `pi.sendMessage(..., { triggerTurn: true })` 产生的 custom run，避免把没有用户输入边界的内部任务误记为可撤回 run。
 - **No Git workflow** — snapshots use a private object database. No `git commit`, `git stash`, `git reset`, branches, or forges are required.
 - **Nested repositories** and **initialized submodules** are handled as independent roots. Their `.git` metadata is never modified.
 - **Performance** — batch WAL operations (up to 1,024 files per batch), scoped safety snapshots, prebuilt durable transaction packs, native Rust no-clobber file helper (macOS/Linux, arm64/x64), indexed WAL record and conflict lookups, and parallel manifest blob reads keep restore fast at scale. Unsupported platforms and failed integrity checks automatically use the TypeScript fallback.
 
 ## Requirements
 
-- Pi `1.2.0` 或更高版本（已在 1.2.0 上验证，见 [Pi 1.2.0 兼容验证记录](docs/pi-1.2.0-validation.md)）。`1.1.x` 及更早版本不再受支持，也不在 CI 中测试：早期版本的扩展生命周期行为不同（例如 `before_agent_start` 的触发范围与会话 busy 语义），不保证撤回语义正确。历史验证记录见 [Pi 0.86.1 撤回修复与验证记录](docs/pi-0.86.1-validation.md)。
+- Pi `1.2.0` 或更高版本（已在 1.2.0 和 1.3.0 上验证，见 [Pi 1.3.0 兼容验证记录](docs/pi-1.3.0-validation.md)）。`1.1.x` 及更早版本不再受支持，也不在 CI 中测试：早期版本的扩展生命周期行为不同（例如 `before_agent_start` 的触发范围与会话 busy 语义），不保证撤回语义正确。历史验证记录见 [Pi 0.86.1 撤回修复与验证记录](docs/pi-0.86.1-validation.md)。
 - Node.js `22.19.0` or later.
 - Git available on `PATH` (used internally for content-addressed snapshots).
 
@@ -77,6 +79,10 @@ If an operation fails mid-flight (for example, the process is killed while files
 ```
 
 to re-run recovery in place: it re-verifies pending journals, settles provably-safe transactions, rebuilds the undo/redo stacks, and refreshes the status line — the in-process equivalent of restarting the session window. If the workspace is still locked afterwards, the blocking transaction belongs to another session in the same workspace; open (or restart) that session and run `/undo-recover` there.
+
+如果提示中包含 `workspace_identity_changed`，说明当前 runtime 绑定的工作区 canonical root 已变化，本次输入会继续执行但不会被纳入撤回历史。先停止导致目录切换或替换的操作，再运行 `/undo-recover` 重新发现工作区；不要手动删除 `.pi-undo`。
+
+如果提示包含 `mutation_conflict`，pi-undo 不会猜测应该回滚还是前进。先备份工作区和 session JSONL，停止编辑器、formatter、watcher 以及其他 Pi 实例，按提示中的 `opId` 检查事务；确认文件回到操作前或操作后的完整状态后，再运行 `/undo-recover`。
 
 ### Diff
 
