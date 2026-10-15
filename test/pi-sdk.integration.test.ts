@@ -167,6 +167,37 @@ describe("真实 pi 1.2.0 SDK", () => {
 		}
 	});
 
+	it("TUI 的正常 settled 快照也不阻塞 prompt 和后续 Esc", async () => {
+		const { temp, harness } = await createFreshHarness(undefined, { mode: "tui" });
+		const controller = harness.runtime().controller;
+		const originalAgentSettled = controller.agentSettled.bind(controller);
+		let releaseGate: () => void = () => {};
+		const gate = new Promise<void>((resolve) => { releaseGate = resolve; });
+		let settledEntered = false;
+		const settledSpy = vi.spyOn(controller, "agentSettled").mockImplementation(async () => {
+			settledEntered = true;
+			await gate;
+			await originalAgentSettled();
+		});
+		try {
+			setUpRun(harness.faux, "value.txt", "after\n", "完成");
+			let promptReturned = false;
+			const prompt = harness.session.prompt("修改文件").finally(() => { promptReturned = true; });
+			await vi.waitFor(() => expect(settledEntered).toBe(true));
+			await delay(100);
+			expect(promptReturned, "TUI prompt 不得等待后台 settled 快照").toBe(true);
+			releaseGate();
+			await prompt;
+			await vi.waitFor(() =>
+				expect(controller.history()).toEqual({ undoCount: 1, redoCount: 0, locked: false }),
+			);
+		} finally {
+			releaseGate();
+			settledSpy.mockRestore();
+			await closeHarness(harness, temp.sessionDir);
+		}
+	}, 30_000);
+
 	it("中断的 run 在 settled 快照进行中时 abort 立即返回，检查点随后仍完整入栈", async () => {
 		const { temp, harness } = await createFreshHarness(undefined, { tokensPerSecond: 2_000 });
 		const { session } = harness;

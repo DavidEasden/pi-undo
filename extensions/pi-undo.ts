@@ -382,7 +382,7 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 				acceptedReplay = undefined;
 			}
 		});
-		pi.on("agent_settled", (event) => {
+		pi.on("agent_settled", (event, context) => {
 			const active = runtime;
 			const settledGeneration = generation;
 			if (active === undefined) return;
@@ -400,14 +400,10 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 				restoreDeferredPrompts(runtimeContext);
 			};
 		const settling = active.controller.agentSettled();
-		// Pi 会等待非 aborted 的 settled 事件处理器，正常完成时保留原有语义：
-		// prompt 返回前检查点已落盘。用户中断时则立即返回，让双击 Esc 先停止输出；
-		// controller.runCompletion 仍会让后续 /undo 等待后台检查点完成。
-		if (event.aborted) {
-			void settling.then(finishSettled, failSettled);
-			return;
-		}
-		return settling.then(finishSettled, failSettled);
+		// RPC/print 的正常调用仍保留“prompt 返回即检查点完成”的契约；用户中断的 run
+		// 和交互式 TUI 则必须让生命周期事件立即返回，否则 Esc/树导航会被快照拖住。
+		if (context.mode !== "tui" && !event.aborted) return settling.then(finishSettled, failSettled);
+		void settling.then(finishSettled, failSettled);
 		});
 		pi.on("session_before_tree", async (event: PiSessionBeforeTreeEvent, context: ExtensionContext) => {
 			if (runtime === undefined || initializing) return { cancel: true };

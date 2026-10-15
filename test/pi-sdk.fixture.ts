@@ -81,6 +81,8 @@ export interface SdkHarnessOptions {
 	readonly agentDir: string;
 	readonly sessionManager: SessionManager;
 	readonly additionalExtensions?: Array<(pi: ExtensionAPI) => void>;
+	/** 测试绑定模式；TUI 模式用于验证交互事件不能被后台快照阻塞。 */
+	readonly mode?: "rpc" | "tui";
 	/** faux provider 流速（tokens/s）；默认极快，测试流式中断时可调慢。 */
 	readonly tokensPerSecond?: number;
 }
@@ -150,7 +152,7 @@ async function bindHarness(options: SdkHarnessOptions): Promise<SdkHarness> {
 	const statuses: string[] = [];
 	const notices: SdkHarness["notices"] = [];
 	await session.bindExtensions({
-		mode: "rpc",
+		mode: options.mode ?? "rpc",
 		uiContext: createUiContext({ statuses, notices }),
 		commandContextActions: {
 			waitForIdle: () => session.waitForIdle(),
