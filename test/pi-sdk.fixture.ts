@@ -81,6 +81,8 @@ export interface SdkHarnessOptions {
 	readonly agentDir: string;
 	readonly sessionManager: SessionManager;
 	readonly additionalExtensions?: Array<(pi: ExtensionAPI) => void>;
+	/** faux provider 流速（tokens/s）；默认极快，测试流式中断时可调慢。 */
+	readonly tokensPerSecond?: number;
 }
 
 export async function createHarness(options: SdkHarnessOptions): Promise<SdkHarness> {
@@ -97,7 +99,7 @@ export async function createHarness(options: SdkHarnessOptions): Promise<SdkHarn
 
 async function bindHarness(options: SdkHarnessOptions): Promise<SdkHarness> {
 	// 固定回复的 faux provider：没有网络请求，也没有模型费用。
-	const faux = fauxProvider({ tokensPerSecond: 1_000_000 });
+	const faux = fauxProvider({ tokensPerSecond: options.tokensPerSecond ?? 1_000_000 });
 	const modelRuntime = await ModelRuntime.create({
 		credentials: new InMemoryCredentialStore(),
 		modelsPath: null,
@@ -179,7 +181,7 @@ async function bindHarness(options: SdkHarnessOptions): Promise<SdkHarness> {
 	};
 }
 
-export async function createFreshHarness(additionalExtensions?: SdkHarnessOptions["additionalExtensions"]): Promise<{ temp: TempRoot; harness: SdkHarness }> {
+export async function createFreshHarness(additionalExtensions?: SdkHarnessOptions["additionalExtensions"], harnessOptions: Partial<SdkHarnessOptions> = {}): Promise<{ temp: TempRoot; harness: SdkHarness }> {
 	const temp = await createTempRoot();
 	await writeFile(join(temp.workspace, "value.txt"), "before\n");
 	const harness = await createHarness({
@@ -187,6 +189,7 @@ export async function createFreshHarness(additionalExtensions?: SdkHarnessOption
 		agentDir: temp.agentDir,
 		sessionManager: SessionManager.create(temp.workspace, temp.sessionDir),
 		additionalExtensions,
+		...harnessOptions,
 	});
 	return { temp, harness };
 }

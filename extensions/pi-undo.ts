@@ -382,17 +382,32 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 				acceptedReplay = undefined;
 			}
 		});
-		pi.on("agent_settled", async () => {
+		pi.on("agent_settled", (event) => {
 			const active = runtime;
 			const settledGeneration = generation;
 			if (active === undefined) return;
-			await active.controller.agentSettled();
-			if (runtime !== active || generation !== settledGeneration) return;
-			if (activeCommands.size === 0) resumeDeferredPrompts(
-				active,
-				settledGeneration,
-				active.controller.recoveryReason?.() ?? "session state ambiguous",
-			);
+			const finishSettled = (): void => {
+				if (runtime !== active || generation !== settledGeneration) return;
+				if (activeCommands.size === 0) resumeDeferredPrompts(
+					active,
+					settledGeneration,
+					active.controller.recoveryReason?.() ?? "session state ambiguous",
+				);
+			};
+			const failSettled = (error: unknown): void => {
+				if (runtime !== active || generation !== settledGeneration) return;
+				active.reporter.setRecoveryRequired(errorMessage(error));
+				restoreDeferredPrompts(runtimeContext);
+			};
+		const settling = active.controller.agentSettled();
+		// Pi 会等待非 aborted 的 settled 事件处理器，正常完成时保留原有语义：
+		// prompt 返回前检查点已落盘。用户中断时则立即返回，让双击 Esc 先停止输出；
+		// controller.runCompletion 仍会让后续 /undo 等待后台检查点完成。
+		if (event.aborted) {
+			void settling.then(finishSettled, failSettled);
+			return;
+		}
+		return settling.then(finishSettled, failSettled);
 		});
 		pi.on("session_before_tree", async (event: PiSessionBeforeTreeEvent, context: ExtensionContext) => {
 			if (runtime === undefined || initializing) return { cancel: true };
