@@ -101,7 +101,12 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 							"error",
 						);
 					}
-				} else next.reporter.setReady(history.undoCount, history.redoCount);
+				} else {
+					next.reporter.setReady(history.undoCount, history.redoCount);
+					// 首次会话通常没有可复用的 baseline；把冷 capture 提前到空闲时间。
+					// 有历史的 resumed session 已经有持久化叶子缓存，不再额外扫描。
+					if (history.undoCount === 0 && history.redoCount === 0) next.controller.warmUp();
+				}
 			} catch (error) {
 				if (currentGeneration !== generation) return;
 				runtime = undefined;

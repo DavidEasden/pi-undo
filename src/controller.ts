@@ -362,7 +362,7 @@ export class UndoControllerImpl implements UndoController {
 
 	warmUp(): void {
 		if (this.disposed || this.locked || this.warmUpInFlight !== undefined) return;
-		this.warmUpInFlight = this.runBackground(async () => {
+		const warmUp = this.runBackground(async () => {
 			try {
 				this.warmUpManifest = await this.captureWithWorkspaceLock();
 			} catch (error) {
@@ -370,6 +370,12 @@ export class UndoControllerImpl implements UndoController {
 				// 预热是 best-effort：失败静默，正式 capture 会再次尝试并上报。
 			}
 		});
+		this.warmUpInFlight = warmUp;
+		void warmUp.finally(() => {
+			if (this.warmUpInFlight === warmUp && this.warmUpManifest === undefined) {
+				this.warmUpInFlight = undefined;
+			}
+		}).catch(() => {});
 	}
 
 	captureFailureReason(): string | undefined {
@@ -491,6 +497,7 @@ export class UndoControllerImpl implements UndoController {
 		if (warmUp !== undefined) await warmUp;
 		const warmUpManifest = this.warmUpManifest;
 		this.warmUpManifest = undefined;
+		if (this.warmUpInFlight === warmUp) this.warmUpInFlight = undefined;
 		const capture = (): Promise<SnapshotManifest> => warmUpManifest !== undefined && this.dependencies.captureBaseline !== undefined
 			? this.captureBaselineWithWorkspaceLock(warmUpManifest)
 			: this.captureWithWorkspaceLock();
@@ -569,20 +576,10 @@ export class UndoControllerImpl implements UndoController {
 			const changedPaths = await measure("settled.changedPaths", () =>
 				this.dependencies.changedPaths(staged.before, after));
 			if (changedPaths.length > 0 && this.dependencies.prepareDurableRestore !== undefined) {
-				// /undo 在流式中断后正等待本次 settled；关键路径只预制立即使用的 after → before。
-				const preparations = this.operationAction === "undo"
-					? [measure("settled.prepareUndo", () =>
-						this.dependencies.prepareDurableRestore!(after, staged.before, changedPaths))]
-					: [
-						measure("settled.prepareRedo", () =>
-							this.dependencies.prepareDurableRestore!(staged.before, after, changedPaths)),
-						measure("settled.prepareUndo", () =>
-							this.dependencies.prepareDurableRestore!(after, staged.before, changedPaths)),
-					];
-				const outcomes = await Promise.allSettled(preparations);
-				for (const outcome of outcomes) {
-					if (outcome.status === "rejected" && this.recordUnsafeExit(outcome.reason)) throw outcome.reason;
-				}
+				// undo 是完成后最常见、也最需要即时响应的方向；redo cache 放到后台构建，
+				// 避免每个普通 run 的 agent_settled 同步等待两套 durable pack。
+				await measure("settled.prepareUndo", () =>
+					this.dependencies.prepareDurableRestore!(after, staged.before, changedPaths));
 				checkOperation();
 			}
 			const endLeafId = this.dependencies.getLogicalLeafId() ?? staged.startEntryId;
@@ -595,6 +592,20 @@ export class UndoControllerImpl implements UndoController {
 				return;
 			}
 			this.undoStack.push(checkpoint);
+			if (
+				changedPaths.length > 0 && this.dependencies.prepareDurableRestore !== undefined &&
+				this.operationAction !== "undo"
+			) {
+				const prepareRedo = this.runBackground(async () => {
+					try {
+						await this.dependencies.prepareDurableRestore!(staged.before, after, changedPaths);
+					} catch (error) {
+						// redo 有安全的惰性路径；后台预制失败不应拖慢或暂停当前历史。
+						this.recordUnsafeExit(error);
+					}
+				});
+				void prepareRedo.catch(() => {});
+			}
 		} catch (error) {
 			this.recordUnsafeExit(error);
 			this.historyPaused = true;

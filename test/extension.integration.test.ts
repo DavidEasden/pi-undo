@@ -266,11 +266,13 @@ describe("pi-undo extension", () => {
 		expect(sent).toEqual([]);
 	});
 
-	it("session 初始化不启动全量 warmUp", async () => {
+	it("session 初始化仅在空历史时启动后台 warmUp", async () => {
 		const handlers = new Map<string, (event: any, context: any) => any>();
 		const calls: string[] = [];
+		let undoCount = 0;
+		let redoCount = 0;
 		const controller = {
-			history: () => ({ undoCount: 0, redoCount: 0, locked: false }),
+			history: () => ({ undoCount, redoCount, locked: false }),
 			listCheckpoints: () => [],
 			recover: async () => { calls.push("recover"); },
 			captureFailed: () => false,
@@ -295,7 +297,17 @@ describe("pi-undo extension", () => {
 		};
 
 		await handlers.get("session_start")!({ type: "session_start" }, context);
+		expect(calls).toEqual(["recover", "warmUp"]);
 
+		undoCount = 1;
+		calls.length = 0;
+		await handlers.get("session_start")!({ type: "session_start" }, context);
+		expect(calls).toEqual(["recover"]);
+
+		undoCount = 0;
+		redoCount = 1;
+		calls.length = 0;
+		await handlers.get("session_start")!({ type: "session_start" }, context);
 		expect(calls).toEqual(["recover"]);
 	});
 

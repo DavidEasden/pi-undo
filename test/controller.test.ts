@@ -628,10 +628,17 @@ describe("UndoController", () => {
 		]));
 	});
 
-	it("没有待执行 undo 时 settled 仍并行预制 redo 与 undo 两个方向", async () => {
+	it("没有待执行 undo 时 settled 先完成 undo 预制，redo 预制在后台完成", async () => {
 		const prepared: string[] = [];
+		let releaseRedo!: () => void;
+		let redoStarted!: () => void;
+		const redoReady = new Promise<void>((resolve) => { redoStarted = resolve; });
 		const deps = dependencies({
 			prepareDurableRestore: async (current, target) => {
+				if (current.manifestId[0] === "a") {
+					redoStarted();
+					await new Promise<void>((resolve) => { releaseRedo = resolve; });
+				}
 				prepared.push(`${current.manifestId[0]}->${target.manifestId[0]}`);
 			},
 		});
@@ -640,7 +647,10 @@ describe("UndoController", () => {
 		await controller.prepareInput("正常 run", { streaming: false });
 		await controller.beforeAgentStart();
 		await controller.agentSettled();
-
+		expect(prepared).toEqual(["c->a"]);
+		await redoReady;
+		releaseRedo();
+		await controller.dispose();
 		expect(prepared.sort()).toEqual(["a->c", "c->a"]);
 	});
 
