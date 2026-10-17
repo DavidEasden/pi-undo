@@ -9,7 +9,7 @@ import type { ManifestId, SnapshotManifest } from "../src/model.ts";
 import { createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
 import { RootDiscovery, type RootDiscoveryReason, type RootTopology } from "../src/root-discovery.ts";
 import type { NativeMetadataEntry, NativeMetadataPort } from "../src/native-metadata.ts";
-import { SnapshotStore } from "../src/snapshot-store.ts";
+import { SnapshotStore, type CaptureDiagnostic } from "../src/snapshot-store.ts";
 import { WorkspaceLock } from "../src/workspace-lock.ts";
 import {
 	createGitRepo,
@@ -422,7 +422,25 @@ describe("SnapshotStore", () => {
 		const baseline = await store.capture(topology);
 
 		git.calls.length = 0;
-		const reused = await store.captureBaseline(topology, baseline);
+		const reuseDiagnostics: CaptureDiagnostic[] = [];
+		const reuseTimings: { phase: string; durationMs: number }[] = [];
+		const reused = await store.captureBaseline(topology, baseline, undefined, {
+			onDiagnostics: (diagnostic) => reuseDiagnostics.push(diagnostic),
+			onTiming: (phase, durationMs) => reuseTimings.push({ phase, durationMs }),
+		});
+
+		expect(reuseDiagnostics).toEqual([expect.objectContaining({
+			strategy: "baseline-reused",
+			rootCount: 1,
+			visibleFilesInspected: 2,
+			cacheHits: 2,
+			hashFilesPlanned: 0,
+			hashBytesPlanned: 0,
+			ignoredFiles: 0,
+		})]);
+		expect(reuseTimings).toEqual(expect.arrayContaining([
+			expect.objectContaining({ phase: "settled.baselineValidation" }),
+		]));
 
 		expect(reused).toEqual(baseline);
 		expect(git.calls.some((call) => call.args[0] === "hash-object")).toBe(false);
@@ -432,7 +450,23 @@ describe("SnapshotStore", () => {
 
 		await writeFixtureFile(repository.root, "stable.txt", "changed\n");
 		git.calls.length = 0;
-		const changed = await store.captureBaseline(topology, baseline);
+		const changedDiagnostics: CaptureDiagnostic[] = [];
+		const changedTimings: { phase: string; durationMs: number }[] = [];
+		const changed = await store.captureBaseline(topology, baseline, undefined, {
+			onDiagnostics: (diagnostic) => changedDiagnostics.push(diagnostic),
+			onTiming: (phase, durationMs) => changedTimings.push({ phase, durationMs }),
+		});
+
+		expect(changedDiagnostics).toEqual([expect.objectContaining({
+			strategy: "baseline-fallback",
+			rootCount: 1,
+			visibleFilesInspected: 4,
+			baselineProbeFiles: 2,
+			cacheHits: 2,
+			hashFilesPlanned: 1,
+			hashBytesPlanned: 8,
+		})]);
+		expect(changedTimings.map((timing) => timing.phase)).toContain("settled.fullCapture");
 
 		expect(changed.manifestId).not.toBe(baseline.manifestId);
 		expect(git.calls.some((call) => call.args[0] === "hash-object")).toBe(true);

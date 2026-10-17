@@ -3,7 +3,6 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 
 import { RootDiscovery } from "../src/root-discovery.ts";
-import { RestoreEngine } from "../src/restore-engine.ts";
 import {
 	closeHarness,
 	createFreshHarness,
@@ -113,24 +112,22 @@ describe("真实 pi 1.2.0 SDK", () => {
 		await session.prompt("把 value.txt 改为 after");
 		expect(harness.runtime().controller.history()).toEqual({ undoCount: 1, redoCount: 0, locked: false });
 
-		// 确定性 gate：卡住第二轮 agentSettled 内部的 durable 预制，稳定复现“Pi 已空闲、
-		// 本轮检查点尚未入栈”的窗口。
-		const originalPrepare = RestoreEngine.prototype.prepareDurableRestore;
+		// 用 RootDiscovery.prototype.discover gate 卡住第二轮 settled 的 capture 关键路径，
+		// 稳定复现"Pi 已空闲、本轮检查点尚未入栈"的窗口。
+		const originalDiscover = RootDiscovery.prototype.discover;
 		let releaseGate: () => void = () => {};
 		const gate = new Promise<void>((resolve) => { releaseGate = resolve; });
 		let markPreparing: () => void = () => {};
 		const preparing = new Promise<void>((resolve) => { markPreparing = resolve; });
-		let gateSignalled = false;
-		RestoreEngine.prototype.prepareDurableRestore = async function (
-			this: RestoreEngine,
-			...args: Parameters<typeof originalPrepare>
-		) {
-			if (!gateSignalled) {
-				gateSignalled = true;
+		let discoverCalls = 0;
+		RootDiscovery.prototype.discover = async function (...args: Parameters<typeof originalDiscover>) {
+			discoverCalls += 1;
+			// 前两次是两轮的输入前 capture，第三次是第二轮的 settled capture。
+			if (discoverCalls === 3) {
 				markPreparing();
+				await gate;
 			}
-			await gate;
-			return originalPrepare.apply(this, args);
+			return originalDiscover.apply(this, args);
 		};
 
 		let duringGateValue = "";
@@ -156,7 +153,7 @@ describe("真实 pi 1.2.0 SDK", () => {
 				afterGateValue = await readValue(temp.workspace);
 			} finally {
 				releaseGate();
-				RestoreEngine.prototype.prepareDurableRestore = originalPrepare;
+				RootDiscovery.prototype.discover = originalDiscover;
 			}
 
 			expect(duringGateValue, "settled 检查点完成前 undo 不得改动工作区").toBe("second\n");
@@ -237,6 +234,73 @@ describe("真实 pi 1.2.0 SDK", () => {
 					expect(harness.runtime().controller.history()).toEqual({ undoCount: 2, redoCount: 0, locked: false }),
 					{ timeout: 10_000 });
 				await session.prompt("/undo");
+				expect(harness.runtime().controller.history()).toEqual({ undoCount: 1, redoCount: 1, locked: false });
+			} finally {
+				releaseGate();
+				RootDiscovery.prototype.discover = originalDiscover;
+			}
+		} finally {
+			await closeHarness(harness, temp.sessionDir);
+		}
+	}, 30_000);
+
+	it("中断后立即 /undo 会等待检查点并继续恢复文件，而不是停在旧内容", async () => {
+		// 场景：第一轮正常完成，第二轮运行期间用户按了 Esc 中断。
+		// Pi 返回空闲后用户立即输入 /undo。
+		// 预期：/undo 应等待第二轮检查点完成再恢复（回到 after），
+		// 而不是撤回第一轮（回到 before）。
+		const { temp, harness } = await createFreshHarness(undefined, { tokensPerSecond: 2_000 });
+		const { session } = harness;
+		const faux = harness.faux;
+		try {
+			await setUpRun(faux, "value.txt", "after\n", "第一轮完成");
+			await session.prompt("把 value.txt 改为 after");
+			expect(await readValue(temp.workspace)).toBe("after\n");
+			expect(harness.runtime().controller.history()).toEqual({ undoCount: 1, redoCount: 0, locked: false });
+
+			// gate 卡住第二轮 settled 的 topology discovery，使检查点尚未入栈时可立即触发 undo。
+			const originalDiscover = RootDiscovery.prototype.discover;
+			let releaseGate: () => void = () => {};
+			let markGated: () => void = () => {};
+			const gate = new Promise<void>((resolve) => { releaseGate = resolve; });
+			const gated = new Promise<void>((resolve) => { markGated = resolve; });
+			let secondRunStarted = false;
+			let secondDiscoverCalls = 0;
+			RootDiscovery.prototype.discover = async function (...args: Parameters<typeof originalDiscover>) {
+				if (secondRunStarted && args[1] === undefined) {
+					secondDiscoverCalls += 1;
+					// 输入前 capture 后，第二次 discovery 是 settled capture。
+					if (secondDiscoverCalls === 2) {
+						markGated();
+						await gate;
+					}
+				}
+				return originalDiscover.apply(this, args);
+			};
+			try {
+				// 第二轮：先写文件，再慢速输出（使得 abort 落在输出期间）。
+				faux.setResponses([
+					fauxAssistantMessage(fauxToolCall("write", { path: "value.txt", content: "intermediate\n" }), { stopReason: "toolUse" }),
+					fauxAssistantMessage("慢速输出".repeat(2_000)),
+				]);
+				secondRunStarted = true;
+				const runPromise = session.prompt("慢慢输出");
+				await vi.waitFor(() => expect(session.isIdle).toBe(false), { timeout: 5_000 });
+				await delay(200);
+
+				// 中断后立即发起 /undo；gate 连第二轮检查点入栈也平行防护。
+				await session.abort();
+				const undoPromise = session.prompt("/undo");
+
+				// 等到第二轮 settled capture 被阻塞，此时用户立即输入 undo。
+				await Promise.race([gated, delay(5_000)]);
+				expect(secondDiscoverCalls).toBe(2);
+				expect(await readValue(temp.workspace)).toBe("intermediate\n");
+
+				// 放开 gate，允许第二轮检查点入栈；undo 应等待并撤回第二轮（intermediate → after）。
+				releaseGate();
+				await Promise.all([runPromise, undoPromise]);
+				expect(await readValue(temp.workspace)).toBe("after\n");
 				expect(harness.runtime().controller.history()).toEqual({ undoCount: 1, redoCount: 1, locked: false });
 			} finally {
 				releaseGate();

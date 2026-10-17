@@ -17,6 +17,7 @@ import type {
 	SnapshotManifest,
 } from "./model.ts";
 import type { RestorePlan, RestoreResult } from "./restore-engine.ts";
+import type { CaptureDiagnostic } from "./snapshot-store.ts";
 
 const INPUT_CAPTURE_RETRY_DELAY_MS = 250;
 
@@ -44,7 +45,11 @@ export interface ControllerDependencies {
 	readonly appendControl: (customType: string, data?: unknown) => Promise<string | null>;
 	readonly appendCursor: (cursor: CursorState) => Promise<CursorAppendResult>;
 	readonly capture: (scopePaths?: readonly string[]) => Promise<SnapshotManifest>;
-	readonly captureBaseline?: (baseline: SnapshotManifest) => Promise<SnapshotManifest>;
+	readonly captureBaseline?: (
+		baseline: SnapshotManifest,
+		onDiagnostics?: (diagnostic: CaptureDiagnostic) => void,
+		onTiming?: (phase: string, durationMs: number) => void,
+	) => Promise<SnapshotManifest>;
 	readonly captureSafety?: (
 		referenceManifestId: ManifestId,
 		targetManifestId: ManifestId,
@@ -79,6 +84,7 @@ export interface ControllerDependencies {
 	readonly onOperationStart?: (opId: string) => void;
 	readonly onProcess?: (diagnostic: ProcessDiagnostic) => void;
 	readonly onOperationEnd?: (opId: string, result: OperationResult) => Promise<void>;
+	readonly onSettlement?: (diagnostic: SettlementDiagnostic) => void | Promise<void>;
 }
 
 export interface JournalPort {
@@ -109,12 +115,24 @@ export interface OperationTiming {
 	readonly durationMs: number;
 }
 
+export interface SettlementDiagnostic {
+	readonly outcome: "ok" | "failed";
+	readonly durationMs: number;
+	readonly timings: readonly OperationTiming[];
+	readonly changedFiles?: number;
+	readonly failureStage?: string;
+	readonly failureName?: string;
+	readonly failureCode?: string;
+	readonly captures?: readonly CaptureDiagnostic[];
+}
+
 export interface OperationResult {
 	readonly code: ResultCode;
 	readonly changedFiles: number;
 	readonly message?: string;
 	readonly refillPrompt?: string;
 	readonly timings?: readonly OperationTiming[];
+	readonly settlement?: SettlementDiagnostic;
 }
 
 export type InputEventResult =
@@ -179,6 +197,7 @@ export interface UndoController {
 
 interface RunCompletion {
 	started: boolean;
+	settlement?: SettlementDiagnostic;
 	readonly promise: Promise<void>;
 	readonly resolve: () => void;
 }
@@ -228,7 +247,7 @@ export class UndoControllerImpl implements UndoController {
 	private historyPaused = false;
 	private operationInFlight = false;
 	private operationAction: "undo" | "redo" | undefined;
-	private operationProfiler: OperationProfiler | undefined;
+	private lastSettlementDiagnostic: SettlementDiagnostic | undefined;
 	private promptDeferralInFlight = false;
 	private lastSafetyManifestId: ManifestId | null = null;
 	private lastCaptureFailed = false;
@@ -448,6 +467,7 @@ export class UndoControllerImpl implements UndoController {
 	}
 
 	private beginRun(): RunCompletion {
+		this.lastSettlementDiagnostic = undefined;
 		this.finishRun(this.runCompletion);
 		let resolve!: () => void;
 		const promise = new Promise<void>((done) => { resolve = done; });
@@ -541,15 +561,16 @@ export class UndoControllerImpl implements UndoController {
 		if (this.disposed) return Promise.resolve();
 		if (this.settling !== undefined) return this.settling;
 		const run = this.runCompletion;
-		const settled = this.runBackground(() => this.settleRun());
+		const settled = this.runBackground(() => this.settleRun(run));
 		this.settling = settled.finally(() => {
 			this.settling = undefined;
+			// settleRun 成功或失败后都结束本轮等待凭据。
 			this.finishRun(run);
 		});
 		return this.settling;
 	}
 
-	private async settleRun(): Promise<void> {
+	private async settleRun(run?: RunCompletion): Promise<void> {
 		const staged = this.staged;
 		this.staged = undefined;
 		if (this.disposed || this.locked || staged === undefined) return;
@@ -565,68 +586,119 @@ export class UndoControllerImpl implements UndoController {
 			await this.dependencies.appendControl("pi-undo:barrier", { reason: "user_entry_missing" }).catch(() => {});
 			return;
 		}
-		const profiler = this.operationProfiler;
-		const measure = <T>(phase: string, operation: () => Promise<T>): Promise<T> =>
-			profiler === undefined ? operation() : profiler.measure(phase, operation);
+		const phaseTimings: OperationTiming[] = [];
+		const captureDiagnostics: CaptureDiagnostic[] = [];
+		const recordCaptureTiming = (phase: string, durationMs: number) => {
+			try { phaseTimings.push({ phase, durationMs: Math.round(durationMs) }); } catch { /* diagnostics cannot affect capture */ }
+		};
+		const startedAt = performance.now();
+		let failureStage = "settled.capture";
+		let failureName: string | undefined;
+		let failureCode: string | undefined;
+		let changedFiles: number | undefined;
+		let outcome: SettlementDiagnostic["outcome"] = "failed";
+		const measure = async <T>(phase: string, operation: () => Promise<T>): Promise<T> => {
+			this.dependencies.onProgress?.(phase);
+			const phaseStartedAt = performance.now();
+			try {
+				return await operation();
+			} finally {
+				phaseTimings.push({ phase, durationMs: Math.round(performance.now() - phaseStartedAt) });
+			}
+		};
 		try {
 			// settled 复用 run 开始时的 before；helper 在缺少 captureBaseline 时回退完整 capture。
 			// 撕裂捕获（并发写撞上断言窗口）是暂态的：短暂退避后重试一次，成功则不清空历史。
 			const after = await measure("settled.capture", () =>
-				this.captureSettledBaselineWithRetry(staged.before));
+				this.captureSettledBaselineWithRetry(
+					staged.before,
+					(diagnostic) => captureDiagnostics.push(diagnostic),
+					recordCaptureTiming,
+				));
+			failureStage = "settled.changedPaths";
 			const changedPaths = await measure("settled.changedPaths", () =>
 				this.dependencies.changedPaths(staged.before, after));
-			if (changedPaths.length > 0 && this.dependencies.prepareDurableRestore !== undefined) {
-				// undo 是完成后最常见、也最需要即时响应的方向；redo cache 放到后台构建，
-				// 避免每个普通 run 的 agent_settled 同步等待两套 durable pack。
-				await measure("settled.prepareUndo", () =>
-					this.dependencies.prepareDurableRestore!(after, staged.before, changedPaths));
-				checkOperation();
-			}
+			changedFiles = changedPaths.length;
 			const endLeafId = this.dependencies.getLogicalLeafId() ?? staged.startEntryId;
 			const checkpoint = this.createCheckpoint(staged, after, changedPaths, userEntryId, endLeafId);
+			failureStage = "settled.checkpoint";
 			const checkpointEntryId = await measure("settled.checkpoint", () =>
 				this.dependencies.appendControl("pi-undo:checkpoint", checkpoint));
 			if (checkpointEntryId === null) {
+				failureStage = "checkpoint_entry_missing";
 				this.lock("checkpoint_entry_missing");
 				await this.dependencies.appendControl("pi-undo:barrier", { reason: "checkpoint_entry_missing" }).catch(() => {});
 				return;
 			}
+			outcome = "ok";
 			this.undoStack.push(checkpoint);
-			if (
-				changedPaths.length > 0 && this.dependencies.prepareDurableRestore !== undefined &&
-				this.operationAction !== "undo"
-			) {
-				const prepareRedo = this.runBackground(async () => {
+			// agentSettled 的 finally 会在结算摘要写入 run 后解除等待；durable pack 继续后台预制。
+			// applyRestore 有惰性路径，可在预制未完成时现场创建 durable pack。
+			// 两个方向放在同一个后台任务里串行：并发创建两份 durable pack 会让文件 IO
+			// 与事件循环压力翻倍，大工作区下足以让 TUI 按键（含 Esc 中断）得不到处理。
+			if (changedPaths.length > 0 && this.dependencies.prepareDurableRestore !== undefined) {
+				const prepareDurable = this.runBackground(async () => {
 					try {
-						await this.dependencies.prepareDurableRestore!(staged.before, after, changedPaths);
+						// undo 是撤回时立即需要的方向，优先预制。
+						await this.dependencies.prepareDurableRestore!(after, staged.before, changedPaths);
+						if (this.operationAction !== "undo") {
+							await this.dependencies.prepareDurableRestore!(staged.before, after, changedPaths);
+						}
 					} catch (error) {
-						// redo 有安全的惰性路径；后台预制失败不应拖慢或暂停当前历史。
+						// 两个方向都有安全的惰性路径；后台预制失败不应暂停当前历史。
 						this.recordUnsafeExit(error);
 					}
 				});
-				void prepareRedo.catch(() => {});
+				void prepareDurable.catch(() => {});
 			}
 		} catch (error) {
+			const candidate = error as { name?: unknown; code?: unknown };
+			failureName = safeDiagnosticLabel(candidate.name) ?? "Error";
+			failureCode = safeDiagnosticLabel(candidate.code);
 			this.recordUnsafeExit(error);
 			this.historyPaused = true;
 			this.undoStack.length = 0;
 			this.redoStack.length = 0;
 			await this.dependencies.appendControl("pi-undo:barrier", { reason: "settled_capture_failed" }).catch(() => {});
+		} finally {
+			const diagnostic: SettlementDiagnostic = {
+				outcome,
+				durationMs: Math.round(performance.now() - startedAt),
+				timings: phaseTimings,
+				...(changedFiles === undefined ? {} : { changedFiles }),
+				...(outcome === "failed" ? { failureStage, failureName, ...(failureCode === undefined ? {} : { failureCode }) } : {}),
+				...(captureDiagnostics.length === 0 ? {} : { captures: captureDiagnostics }),
+			};
+			if (run !== undefined) run.settlement = diagnostic;
+			this.lastSettlementDiagnostic = diagnostic;
+			try {
+				const report = this.dependencies.onSettlement?.(diagnostic);
+				if (report !== undefined) void Promise.resolve(report).catch(() => {});
+			} catch { /* 诊断写入失败不能改变检查点结果 */ }
 		}
 	}
 
 	async undo(): Promise<OperationResult> {
 		if (this.locked) return this.recoveryResult();
-		if (this.historyPaused) return { code: "history_paused", changedFiles: 0 };
+		if (this.historyPaused) return this.historyPausedResult();
 		return this.runOperation("undo");
 	}
 
 	async redo(): Promise<OperationResult> {
 		if (this.locked) return this.recoveryResult();
-		if (this.historyPaused) return { code: "history_paused", changedFiles: 0 };
+		if (this.historyPaused) return this.historyPausedResult();
 		// 新 run 开始时 redo frontier 已失效；空栈命令不得为了确认 noop 而中断正在运行的 Agent。
 		if (this.redoStack.length === 0) return noop();
 		return this.runOperation("redo");
+	}
+
+	private historyPausedResult(): OperationResult {
+		const settlement = this.lastSettlementDiagnostic;
+		return {
+			code: "history_paused",
+			changedFiles: 0,
+			...(settlement === undefined ? {} : { settlement, timings: settlement.timings }),
+		};
 	}
 
 	beforeTree(event: SessionBeforeTreeEvent): Promise<SessionBeforeTreeResult | undefined> {
@@ -825,24 +897,31 @@ export class UndoControllerImpl implements UndoController {
 		if (this.locked) return this.recoveryResult();
 		if (this.operationInFlight) return { code: "busy", changedFiles: 0 };
 		const profile = new OperationProfiler(this.dependencies.onProgress);
-		const done = (result: OperationResult): OperationResult => profile.attach(result);
+		let settlement: SettlementDiagnostic | undefined;
+		const done = (result: OperationResult): OperationResult => profile.attach({
+			...result,
+			...(settlement === undefined || (settlement.outcome === "ok" && settlement.durationMs < 1_000)
+				? {} : { settlement }),
+		});
 		this.operationInFlight = true;
 		this.operationAction = action;
-		this.operationProfiler = profile;
 		this.promptDeferralInFlight = true;
 		this.lastSafetyManifestId = null;
 		let lease: { release(): Promise<void> } | undefined;
 		try {
+			const checkpointRun = this.runCompletion;
 			const [idleReady, checkpointReady] = await Promise.all([
 				profile.measure("idle", () => this.ensureIdle()),
 				profile.measure("checkpoint", () => this.waitForCheckpoint()),
 			]);
+			settlement = checkpointRun?.settlement;
+			if (settlement !== undefined) profile.addSettlement(settlement);
 			if (!idleReady || !checkpointReady) {
 				checkOperation();
 				return done({ code: "idle_timeout", changedFiles: 0 });
 			}
 			if (this.locked) return done(this.recoveryResult());
-			if (this.historyPaused) return done({ code: "history_paused", changedFiles: 0 });
+			if (this.historyPaused) return done(this.historyPausedResult());
 			if (this.disposed) return done({ code: "busy", changedFiles: 0 });
 			// Pi 空闲早于扩展 settled 完成；只有本轮完成凭据已终结才能选择目标。
 			const redo = action === "redo" ? this.redoStack.at(-1) : undefined;
@@ -967,7 +1046,6 @@ export class UndoControllerImpl implements UndoController {
 				await profile.measure("unlock", () =>
 					activeLease.release().catch(() => { this.lock("workspace_lock_release_failed"); }));
 			}
-			if (this.operationProfiler === profile) this.operationProfiler = undefined;
 			this.operationAction = undefined;
 			this.promptDeferralInFlight = false;
 			this.operationInFlight = false;
@@ -1139,16 +1217,28 @@ export class UndoControllerImpl implements UndoController {
 		}
 	}
 
-	private async captureBaselineWithWorkspaceLock(baseline: SnapshotManifest): Promise<SnapshotManifest> {
+	private async captureBaselineWithWorkspaceLock(
+		baseline: SnapshotManifest,
+		onDiagnostics?: (diagnostic: CaptureDiagnostic) => void,
+		onTiming?: (phase: string, durationMs: number) => void,
+	): Promise<SnapshotManifest> {
 		const captureBaseline = this.dependencies.captureBaseline;
 		if (captureBaseline === undefined) return this.captureWithWorkspaceLock();
-		const lease = await this.dependencies.acquireWorkspaceLock();
+		const lockStartedAt = performance.now();
+		let lease: Awaited<ReturnType<ControllerDependencies["acquireWorkspaceLock"]>>;
 		try {
-			return await captureBaseline(baseline);
+			lease = await this.dependencies.acquireWorkspaceLock();
+		} finally {
+			reportCaptureTiming(onTiming, "settled.workspaceLock", performance.now() - lockStartedAt);
+		}
+		const captureStartedAt = performance.now();
+		try {
+			return await captureBaseline(baseline, onDiagnostics, onTiming);
 		} catch (error) {
 			this.recordUnsafeExit(error);
 			throw error;
 		} finally {
+			reportCaptureTiming(onTiming, "settled.captureBaseline", performance.now() - captureStartedAt);
 			if (!this.unsafeExit) await lease.release();
 		}
 	}
@@ -1158,14 +1248,20 @@ export class UndoControllerImpl implements UndoController {
 	 * （捕获期间叶子变化）或短暂持有 workspace lock。settled 失败会清空整个 undo 历史，
 	 * 不能因一次暂态冲突就放弃；持续失败仍由调用方走原有 historyPaused 路径。
 	 */
-	private async captureSettledBaselineWithRetry(baseline: SnapshotManifest): Promise<SnapshotManifest> {
+	private async captureSettledBaselineWithRetry(
+		baseline: SnapshotManifest,
+		onDiagnostics?: (diagnostic: CaptureDiagnostic) => void,
+		onTiming?: (phase: string, durationMs: number) => void,
+	): Promise<SnapshotManifest> {
 		try {
-			return await this.captureBaselineWithWorkspaceLock(baseline);
+			return await this.captureBaselineWithWorkspaceLock(baseline, onDiagnostics, onTiming);
 		} catch (error) {
 			rethrowOperationFailure(error);
 			if (!isTransientCaptureFailure(error)) throw error;
+			const retryStartedAt = performance.now();
 			await sleep(250);
-			return await this.captureBaselineWithWorkspaceLock(baseline);
+			onTiming?.("settled.captureRetryDelay", performance.now() - retryStartedAt);
+			return await this.captureBaselineWithWorkspaceLock(baseline, onDiagnostics, onTiming);
 		}
 	}
 
@@ -1337,6 +1433,7 @@ function emptyRestorePlan(currentManifestId: ManifestId, targetManifestId: Manif
 
 class OperationProfiler {
 	private readonly durations = new Map<string, number>();
+	private settlementTimings: readonly OperationTiming[] = [];
 
 	constructor(private readonly onProgress?: (phase: string) => void) {}
 
@@ -1347,8 +1444,16 @@ class OperationProfiler {
 		try {
 			return await operation();
 		} finally {
-			this.durations.set(phase, (this.durations.get(phase) ?? 0) + performance.now() - started);
+			this.record(phase, performance.now() - started);
 		}
+	}
+
+	record(phase: string, durationMs: number): void {
+		this.durations.set(phase, (this.durations.get(phase) ?? 0) + durationMs);
+	}
+
+	addSettlement(settlement: SettlementDiagnostic): void {
+		this.settlementTimings = settlement.timings;
 	}
 
 	attach(result: OperationResult): OperationResult {
@@ -1356,10 +1461,13 @@ class OperationProfiler {
 		if (total < 1_000) return result;
 		return {
 			...result,
-			timings: [...this.durations].map(([phase, durationMs]) => ({
-				phase,
-				durationMs: Math.round(durationMs),
-			})),
+			timings: [
+				...([...this.durations].map(([phase, durationMs]) => ({
+					phase,
+					durationMs: Math.round(durationMs),
+				}))),
+				...this.settlementTimings,
+			],
 		};
 	}
 }
@@ -1386,6 +1494,18 @@ async function waitForCompletion(task: Promise<void>, deadline: number): Promise
 
 function noop(): OperationResult {
 	return { code: "noop", changedFiles: 0 };
+}
+
+function reportCaptureTiming(
+	callback: ((phase: string, durationMs: number) => void) | undefined,
+	phase: string,
+	durationMs: number,
+): void {
+	try { callback?.(phase, durationMs); } catch { /* diagnostics cannot affect capture */ }
+}
+
+function safeDiagnosticLabel(value: unknown): string | undefined {
+	return typeof value === "string" && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(value) ? value : undefined;
 }
 
 function truncateReason(reason: string): string {

@@ -275,16 +275,27 @@ describe("UndoController", () => {
 		expect(controller.history().locked).toBe(true);
 	});
 	it("Pi 已空闲而本轮仍在预制检查点时，undo 等待最新轮次且不提前拿锁", async () => {
+		// 用 appendControl gate 阻塞 checkpoint entry，让检查点入栈延迟，
+		// 模拟大工作区下 settled capture 耗时的场景。
 		let enter!: () => void;
 		let release!: () => void;
 		const entered = new Promise<void>((resolve) => { enter = resolve; });
 		const gate = new Promise<void>((resolve) => { release = resolve; });
 		const navigate = vi.fn(dependencies().navigateSession);
 		const acquire = vi.fn(dependencies().acquireWorkspaceLock);
+		const baseAppendControl = dependencies().appendControl;
+		let gatePending = false;
 		const deps = dependencies({
 			navigateSession: navigate,
 			acquireWorkspaceLock: acquire,
-			prepareDurableRestore: async () => { enter(); await gate; },
+			appendControl: async (type, data) => {
+				if (type === "pi-undo:checkpoint" && !gatePending) {
+					gatePending = true;
+					enter();
+					await gate;
+				}
+				return baseAppendControl(type, data);
+			},
 		});
 		const controller = new UndoControllerImpl(deps, { undoStack: [restoredCheckpoint("上一轮")] });
 		await controller.prepareInput("最新一轮", { streaming: false });
@@ -346,13 +357,71 @@ describe("UndoController", () => {
 		expect(navigate).not.toHaveBeenCalled();
 	});
 
+	it("settled 捕获失败后 undo 诊断包含阶段、失败类型和规模指标", async () => {
+		let enter!: () => void;
+		let release!: () => void;
+		const entered = new Promise<void>((resolve) => { enter = resolve; });
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const navigate = vi.fn(dependencies().navigateSession);
+		const onSettlement = vi.fn();
+		const captureDiagnostic = {
+			strategy: "baseline-fallback" as const,
+			rootCount: 1,
+			directoriesVisited: 240,
+			visibleFilesInspected: 12_000,
+			baselineProbeFiles: 0,
+			cacheHits: 11_500,
+			hashFilesPlanned: 500,
+			symlinksPlanned: 0,
+			hashCommandsPlanned: 2,
+			hashBytesPlanned: 8_000_000,
+			ignoredFiles: 0,
+			failureName: "SnapshotStoreError",
+			failureCode: "manifest_invalid",
+		};
+		const controller = new UndoControllerImpl(dependencies({
+			navigateSession: navigate,
+			onSettlement,
+			captureBaseline: async (_baseline, onDiagnostics) => {
+				enter();
+				await gate;
+				onDiagnostics?.(captureDiagnostic);
+				throw Object.assign(new Error("捕获失败"), { name: "SnapshotStoreError", code: "manifest_invalid" });
+			},
+		}), { undoStack: [restoredCheckpoint()] });
+		await controller.prepareInput("本轮", { streaming: false });
+		await controller.beforeAgentStart();
+		const settled = controller.agentSettled();
+		await entered;
+		const undo = controller.undo();
+		release();
+		await settled;
+		const result = await undo;
+
+		expect(result.code).toBe("history_paused");
+		expect(result.settlement).toMatchObject({
+			outcome: "failed",
+			failureStage: "settled.capture",
+			failureName: "SnapshotStoreError",
+			failureCode: "manifest_invalid",
+			captures: [captureDiagnostic],
+			timings: expect.arrayContaining([expect.objectContaining({ phase: "settled.capture" })]),
+		});
+		expect(onSettlement).toHaveBeenCalledWith(result.settlement);
+		const repeated = await controller.undo();
+		expect(repeated.settlement).toEqual(result.settlement);
+		expect(navigate).not.toHaveBeenCalled();
+	});
+
 	it("settled 期间原生 tree 取消，普通输入暂存", async () => {
+		// 用 captureBaseline gate 阻塞 settled 的关键路径（capture → changedPaths → checkpoint），
+		// 让 settling 保持 truthy，验证 tree 取消和输入 defer 行为。
 		let enter!: () => void;
 		let release!: () => void;
 		const entered = new Promise<void>((resolve) => { enter = resolve; });
 		const gate = new Promise<void>((resolve) => { release = resolve; });
 		const controller = new UndoControllerImpl(dependencies({
-			prepareDurableRestore: async () => { enter(); await gate; },
+			captureBaseline: async () => { enter(); await gate; return manifest("c"); },
 		}));
 		await controller.prepareInput("本轮", { streaming: false });
 		await controller.beforeAgentStart();
@@ -623,7 +692,6 @@ describe("UndoController", () => {
 		expect(result.timings).toEqual(expect.arrayContaining([
 			expect.objectContaining({ phase: "settled.capture", durationMs: 100 }),
 			expect.objectContaining({ phase: "settled.changedPaths", durationMs: 100 }),
-			expect.objectContaining({ phase: "settled.prepareUndo", durationMs: 100 }),
 			expect.objectContaining({ phase: "settled.checkpoint", durationMs: 100 }),
 		]));
 	});
@@ -759,7 +827,7 @@ describe("UndoController", () => {
 		await controller.beforeAgentStart();
 		await controller.agentSettled();
 
-		expect(await controller.undo()).toEqual({ code: "history_paused", changedFiles: 0 });
+		expect(await controller.undo()).toMatchObject({ code: "history_paused", changedFiles: 0 });
 		expect(deps.calls).toEqual([
 			"lock", "capture", "unlock", "entry:pi-undo:start",
 			"lock", "captureBaseline", "unlock", "entry:pi-undo:barrier",
@@ -977,7 +1045,7 @@ describe("UndoController", () => {
 		await controller.beforeAgentStart();
 		await controller.agentSettled();
 
-		expect(await controller.undo()).toEqual({ code: "history_paused", changedFiles: 0 });
+		expect(await controller.undo()).toMatchObject({ code: "history_paused", changedFiles: 0 });
 		expect(deps.calls).toContain("entry:pi-undo:barrier");
 		expect(await controller.prepareInput("恢复轮", { streaming: false })).toEqual({ action: "continue" });
 		await controller.beforeAgentStart();
@@ -1033,7 +1101,7 @@ describe("UndoController", () => {
 		await controller.agentSettled();
 
 		expect(captures).toBe(3);
-		expect(await controller.undo()).toEqual({ code: "history_paused", changedFiles: 0 });
+		expect(await controller.undo()).toMatchObject({ code: "history_paused", changedFiles: 0 });
 		expect(deps.calls).toContain("entry:pi-undo:barrier");
 	});
 
@@ -1052,7 +1120,7 @@ describe("UndoController", () => {
 		await controller.agentSettled();
 
 		expect(captures).toBe(2);
-		expect(await controller.undo()).toEqual({ code: "history_paused", changedFiles: 0 });
+		expect(await controller.undo()).toMatchObject({ code: "history_paused", changedFiles: 0 });
 	});
 
 	it("start entry 未获得物理 ID 时不生成不可信 checkpoint，并写 barrier 锁住历史", async () => {

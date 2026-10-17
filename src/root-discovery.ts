@@ -39,6 +39,8 @@ export interface RootTopology {
 	readonly workspaceIdentity: string;
 	readonly roots: readonly DiscoveryRoot[];
 	readonly fingerprint: string;
+	/** 本次扫描检查的目录数，仅供性能诊断，不参与 identity/fingerprint。 */
+	readonly directoriesVisited?: number;
 }
 
 /**
@@ -119,6 +121,7 @@ export class RootDiscovery {
 			workspaceIdentity,
 			roots,
 			fingerprint: topologyFingerprint(workspaceIdentity, roots),
+			directoriesVisited: this.lastDirectoryCount ?? 0,
 		};
 	}
 

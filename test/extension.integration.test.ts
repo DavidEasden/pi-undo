@@ -730,6 +730,41 @@ describe("StatusReporter", () => {
 		};
 	}
 
+	it("history_paused 通知展示前一轮文件规模与 settled 捕获诊断", () => {
+		const fake = context("tui");
+		const reporter = new StatusReporter(fake.value);
+
+		reporter.result({
+			code: "history_paused",
+			changedFiles: 0,
+			settlement: {
+				outcome: "failed",
+				durationMs: 117_484,
+				changedFiles: 12,
+				failureStage: "settled.capture",
+				failureName: "SnapshotStoreError",
+				failureCode: "capture_failed",
+				timings: [{ phase: "settled.captureBaseline", durationMs: 117_400 }],
+				captures: [{
+					strategy: "baseline-fallback",
+					rootCount: 1,
+					directoriesVisited: 240,
+					visibleFilesInspected: 12_000,
+					baselineProbeFiles: 0,
+					cacheHits: 11_500,
+					hashFilesPlanned: 500,
+				symlinksPlanned: 0,
+				hashCommandsPlanned: 2,
+				hashBytesPlanned: 8_000_000,
+				ignoredFiles: 0,
+			}],
+			},
+		});
+
+		expect(fake.notifications[0]![0]).toContain("changed:12 scan:12000 hit:11500 hash:500");
+		expect(fake.notifications[0]![0]).toContain("settled:117484ms");
+	});
+
 	it("所有状态只使用 pi-undo footer key，并清理换行、路径、token 与控制字符", () => {
 		const fake = context("tui");
 		const reporter = new StatusReporter(fake.value);

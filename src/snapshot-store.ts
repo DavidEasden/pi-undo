@@ -98,6 +98,7 @@ interface VisibleLeafMetadata {
 interface VisibleLeaf {
 	readonly relativePath: string;
 	readonly kind: "file" | "symlink";
+	readonly size?: number;
 	readonly mode: number;
 	readonly fingerprint: string;
 	/** 不含 ctime，用于把 macOS 元数据写入与内容或路径变化区分开。 */
@@ -145,6 +146,76 @@ interface PersistedLeafCacheEntry {
 	readonly verifiedAtNs: string;
 }
 
+export interface CaptureDiagnostic {
+	readonly strategy: "full" | "baseline-check" | "baseline-reused" | "baseline-fallback";
+	readonly rootCount: number;
+	readonly directoriesVisited: number;
+	readonly visibleFilesInspected: number;
+	readonly baselineProbeFiles: number;
+	readonly cacheHits: number;
+	readonly hashFilesPlanned: number;
+	readonly symlinksPlanned: number;
+	readonly hashCommandsPlanned: number;
+	readonly hashBytesPlanned: number;
+	readonly ignoredFiles: number;
+	readonly failureName?: string;
+	readonly failureCode?: string;
+}
+
+interface MutableCaptureDiagnostic {
+	strategy: CaptureDiagnostic["strategy"];
+	rootCount: number;
+	directoriesVisited: number;
+	visibleFilesInspected: number;
+	baselineProbeFiles: number;
+	cacheHits: number;
+	hashFilesPlanned: number;
+	symlinksPlanned: number;
+	hashCommandsPlanned: number;
+	hashBytesPlanned: number;
+	ignoredFiles: number;
+	failureName?: string;
+	failureCode?: string;
+}
+
+function createCaptureDiagnostic(
+	strategy: CaptureDiagnostic["strategy"],
+	rootCount: number,
+	directoriesVisited: number,
+): MutableCaptureDiagnostic {
+	return {
+		strategy, rootCount, directoriesVisited, visibleFilesInspected: 0, baselineProbeFiles: 0, cacheHits: 0,
+		hashFilesPlanned: 0, symlinksPlanned: 0, hashCommandsPlanned: 0, hashBytesPlanned: 0, ignoredFiles: 0,
+	};
+}
+
+function sumSaturated(left: number, right: number): number {
+	return Math.min(Number.MAX_SAFE_INTEGER, left + right);
+}
+
+function publishCaptureTiming(callback: CaptureOptions["onTiming"], phase: string, startedAt: number): void {
+	try { callback?.(phase, performance.now() - startedAt); } catch { /* diagnostics cannot affect snapshot correctness */ }
+}
+
+function safeDiagnosticLabel(value: unknown): string | undefined {
+	return typeof value === "string" && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(value) ? value : undefined;
+}
+
+function publishCaptureDiagnostic(
+	callback: CaptureOptions["onDiagnostics"],
+	diagnostic: MutableCaptureDiagnostic,
+	error?: unknown,
+): void {
+	if (error !== undefined) {
+		const candidate = error as { name?: unknown; code?: unknown };
+		const failureName = safeDiagnosticLabel(candidate.name);
+		const failureCode = safeDiagnosticLabel(candidate.code);
+		if (failureName !== undefined) diagnostic.failureName = failureName;
+		if (failureCode !== undefined) diagnostic.failureCode = failureCode;
+	}
+	try { callback?.({ ...diagnostic }); } catch { /* diagnostics cannot affect snapshot correctness */ }
+}
+
 export interface SnapshotStoreOptions {
 	readonly storeRoot?: string;
 	readonly git?: GitRunner;
@@ -161,6 +232,10 @@ export interface CaptureOptions {
 	 * 因此校验窗口内出现的漂移依然会被拒绝。仅限调用方与本次枚举之间没有文件变更时使用。
 	 */
 	readonly topologyAlreadyValidated?: boolean;
+	/** 只报告数量和错误类型，不包含路径、文件内容或异常消息。 */
+	readonly onDiagnostics?: (diagnostic: CaptureDiagnostic) => void;
+	/** 报告 capture 内部 wall-time 阶段；回调失败不影响捕获。 */
+	readonly onTiming?: (phase: string, durationMs: number) => void;
 }
 
 export interface VisibleLeafOptions extends CaptureOptions {
@@ -279,15 +354,26 @@ export class SnapshotStore {
 		scope?: readonly string[],
 		options: CaptureOptions = {},
 	): Promise<SnapshotManifest> {
-		await this.assertPrivateStore(topology.workspaceIdentity);
-		const lockIdentity = `snapshot-store:${await prospectiveCanonicalPath(this.storesRoot)}`;
-		return this.lock.withLock(lockIdentity, () => this.captureLocked(topology, scope, options));
+		const diagnostic = createCaptureDiagnostic("full", topology.roots.length, topology.directoriesVisited ?? 0);
+		let reported = false;
+		try {
+			await this.assertPrivateStore(topology.workspaceIdentity);
+			const lockIdentity = `snapshot-store:${await prospectiveCanonicalPath(this.storesRoot)}`;
+			return await this.lock.withLock(lockIdentity, () => this.captureLocked(topology, scope, options, diagnostic));
+		} catch (error) {
+			reported = true;
+			publishCaptureDiagnostic(options.onDiagnostics, diagnostic, error);
+			throw error;
+		} finally {
+			if (!reported) publishCaptureDiagnostic(options.onDiagnostics, diagnostic);
+		}
 	}
 
 	private async captureLocked(
 		topology: RootTopology,
 		scope: readonly string[] | undefined,
 		options: CaptureOptions,
+		diagnostic?: MutableCaptureDiagnostic,
 	): Promise<SnapshotManifest> {
 		let transactionDirectory: string | undefined;
 		try {
@@ -335,6 +421,7 @@ export class SnapshotStore {
 						activeTransactionDirectory,
 						scope,
 						artifactExclusions,
+						diagnostic,
 					);
 					return {
 						root: snapshotRoot(root, captured),
@@ -389,9 +476,19 @@ export class SnapshotStore {
 		scope?: readonly string[],
 		options: CaptureOptions = {},
 	): Promise<SnapshotManifest> {
-		await this.assertPrivateStore(topology.workspaceIdentity);
-		const lockIdentity = `snapshot-store:${await prospectiveCanonicalPath(this.storesRoot)}`;
-		return this.lock.withLock(lockIdentity, () => this.captureBaselineLocked(topology, baseline, scope, options));
+		const diagnostic = createCaptureDiagnostic("baseline-check", topology.roots.length, topology.directoriesVisited ?? 0);
+		let reported = false;
+		try {
+			await this.assertPrivateStore(topology.workspaceIdentity);
+			const lockIdentity = `snapshot-store:${await prospectiveCanonicalPath(this.storesRoot)}`;
+			return await this.lock.withLock(lockIdentity, () => this.captureBaselineLocked(topology, baseline, scope, options, diagnostic));
+		} catch (error) {
+			reported = true;
+			publishCaptureDiagnostic(options.onDiagnostics, diagnostic, error);
+			throw error;
+		} finally {
+			if (!reported) publishCaptureDiagnostic(options.onDiagnostics, diagnostic);
+		}
 	}
 
 	private async captureBaselineLocked(
@@ -399,6 +496,7 @@ export class SnapshotStore {
 		baseline: SnapshotManifest,
 		scope: readonly string[] | undefined,
 		options: CaptureOptions,
+		diagnostic?: MutableCaptureDiagnostic,
 	): Promise<SnapshotManifest> {
 		try {
 			if (topology.fingerprint !== topologyFingerprint(topology.workspaceIdentity, topology.roots)) {
@@ -411,13 +509,27 @@ export class SnapshotStore {
 			if (brokenRoots.length > 0) {
 				throw new SnapshotStoreError("capture_failed", `broken root 不能静默进入 baseline 校验: ${brokenRoots.join(", ")}`);
 			}
-			if (await this.isBaselineFresh(topology, baseline, scope, options)) {
+			const baselineValidationStartedAt = performance.now();
+			let baselineFresh: boolean;
+			try {
+				baselineFresh = await this.isBaselineFresh(topology, baseline, scope, options, diagnostic);
+			} finally {
+				publishCaptureTiming(options.onTiming, "settled.baselineValidation", baselineValidationStartedAt);
+			}
+			if (baselineFresh) {
+				if (diagnostic !== undefined) diagnostic.strategy = "baseline-reused";
 				await this.assertTopology(topology, "捕获期间 topology 已变化", "safety-snapshot");
 				await this.touchStore(this.storeDirectory(topology));
 				return baseline;
 			}
 			// 已完成一次捕获前 topology 校验；完整回退仍保留捕获后的校验。
-			return this.captureLocked(topology, scope, { ...options, topologyAlreadyValidated: true });
+			if (diagnostic !== undefined) diagnostic.strategy = "baseline-fallback";
+			const fullCaptureStartedAt = performance.now();
+			try {
+				return await this.captureLocked(topology, scope, { ...options, topologyAlreadyValidated: true }, diagnostic);
+			} finally {
+				publishCaptureTiming(options.onTiming, "settled.fullCapture", fullCaptureStartedAt);
+			}
 		} catch (error) {
 			if (error instanceof SnapshotStoreError) {
 				throw error;
@@ -431,6 +543,7 @@ export class SnapshotStore {
 		baseline: SnapshotManifest,
 		scope: readonly string[] | undefined,
 		options: CaptureOptions,
+		diagnostic?: MutableCaptureDiagnostic,
 	): Promise<boolean> {
 		try {
 			assertManifest(baseline);
@@ -509,6 +622,10 @@ export class SnapshotStore {
 					exactExclusions,
 					transactionDirectory,
 				);
+				if (diagnostic !== undefined) {
+					diagnostic.visibleFilesInspected += leaves.length;
+					diagnostic.baselineProbeFiles += leaves.length;
+				}
 				if (!samePathList(
 					leaves.map((leaf) => leaf.relativePath).sort(comparePaths),
 					entries.map((entry) => entry.relativePath).sort(comparePaths),
@@ -534,6 +651,7 @@ export class SnapshotStore {
 					) {
 						return false;
 					}
+					if (diagnostic !== undefined) diagnostic.cacheHits += 1;
 				}
 
 				const ignoredPresentPaths = await this.captureIgnoredPresentPaths(
@@ -545,6 +663,7 @@ export class SnapshotStore {
 					exactExclusions,
 					transactionDirectory,
 				);
+				if (diagnostic !== undefined) diagnostic.ignoredFiles += ignoredPresentPaths.length;
 				if (!samePathList(ignoredPresentPaths, baselineRoot.ignoredPresentPaths)) return false;
 				if (baselineRoot.ignoreClosure !== ignoredPresentClosure({
 					coverage: baselineRoot.coverage,
@@ -1005,6 +1124,7 @@ export class SnapshotStore {
 		transactionDirectory: string,
 		scope: readonly string[] | undefined,
 		artifactExclusions: readonly string[],
+		diagnostic?: MutableCaptureDiagnostic,
 	): Promise<CapturedRootResult> {
 		const storeDirectory = this.storeDirectory(topology);
 		const gitDirectory = this.rootGitDirectory(storeDirectory, root);
@@ -1032,6 +1152,7 @@ export class SnapshotStore {
 			exactExclusions,
 			this.visibleLeafCache.get(gitDirectory),
 			transactionDirectory,
+			diagnostic,
 		);
 		const coverage = rootCoverageFromInclusions(inclusions);
 		const ignoredPresentPaths = await this.captureIgnoredPresentPaths(
@@ -1043,6 +1164,7 @@ export class SnapshotStore {
 			exactExclusions,
 			transactionDirectory,
 		);
+		if (diagnostic !== undefined) diagnostic.ignoredFiles += ignoredPresentPaths.length;
 		const treeId = (await this.runGit(["write-tree"], { cwd: absoluteRoot, env: environment })).trim();
 		if (!isObjectId(treeId)) {
 			throw new SnapshotStoreError("capture_failed", "git write-tree 未返回有效对象 ID");
@@ -1194,6 +1316,7 @@ export class SnapshotStore {
 		exactExclusions: ReadonlySet<string>,
 		cache: ReadonlyMap<string, CachedVisibleLeaf> | undefined,
 		requestDirectory: string,
+		diagnostic?: MutableCaptureDiagnostic,
 	): Promise<StagedWorktree> {
 		const leaves = await this.collectVisibleLeaves(
 			cwd,
@@ -1206,6 +1329,8 @@ export class SnapshotStore {
 		);
 		const objectIds = new Map<string, string>();
 		const uncached: VisibleLeaf[] = [];
+		let cacheHits = 0;
+		if (diagnostic !== undefined) diagnostic.visibleFilesInspected += leaves.length;
 		for (const leaf of leaves) {
 			const cached = cache?.get(leaf.relativePath);
 			if (
@@ -1214,11 +1339,23 @@ export class SnapshotStore {
 				cached.verifiedAtNs > cached.changedAtNs + RACY_CLEAN_WINDOW_NS
 			) {
 				objectIds.set(leaf.relativePath, cached.objectId);
+				cacheHits += 1;
 			} else {
 				uncached.push(leaf);
 			}
 		}
 		const hashBatches = hashPathBatches(uncached.filter((leaf) => leaf.kind === "file"));
+		const hashedFileLeaves = uncached.filter((leaf) => leaf.kind === "file");
+		const hashedSymlinkCount = uncached.length - hashedFileLeaves.length;
+		if (diagnostic !== undefined) {
+			diagnostic.cacheHits += cacheHits;
+			diagnostic.hashFilesPlanned += hashedFileLeaves.length;
+			diagnostic.symlinksPlanned += hashedSymlinkCount;
+			diagnostic.hashCommandsPlanned += hashBatches.length + hashedSymlinkCount;
+			diagnostic.hashBytesPlanned = sumSaturated(diagnostic.hashBytesPlanned, hashedFileLeaves.reduce(
+				(total, leaf) => sumSaturated(total, leaf.size ?? 0), 0,
+			));
+		}
 		const hashedBatches = await mapConcurrentOrdered(hashBatches, HASH_BATCH_CONCURRENCY, async (batch) => {
 			await this.assertVisibleLeavesUnchanged(cwd, batch);
 			const output = await this.runGit([
@@ -1242,6 +1379,9 @@ export class SnapshotStore {
 			await this.assertVisibleLeafUnchanged(cwd, leaf);
 			const linkText = await readlink(join(cwd, ...leaf.relativePath.split("/")), { encoding: "buffer" });
 			decodeUtf8(linkText, "symlink target 不是可无损表示的 UTF-8");
+			if (diagnostic !== undefined) {
+				diagnostic.hashBytesPlanned = sumSaturated(diagnostic.hashBytesPlanned, linkText.byteLength);
+			}
 			const objectId = (await this.runGit(["hash-object", "-w", "--stdin"], {
 				cwd,
 				env: environment,
@@ -1262,7 +1402,11 @@ export class SnapshotStore {
 			});
 		}
 		await this.assertVisibleLeavesUnchanged(cwd, leaves, requestDirectory, objectIds, environment);
-		return { leaves, objectIds, verifiedAtNs: BigInt(Date.now()) * 1_000_000n };
+		return {
+			leaves,
+			objectIds,
+			verifiedAtNs: BigInt(Date.now()) * 1_000_000n,
+		};
 	}
 
 	private rememberVisibleLeaves(update: VisibleLeafCacheUpdate): void {
@@ -1557,6 +1701,7 @@ export class SnapshotStore {
 			leaves.push({
 				relativePath,
 				kind: metadata.kind,
+				size: Number(metadata.size > BigInt(Number.MAX_SAFE_INTEGER) ? BigInt(Number.MAX_SAFE_INTEGER) : metadata.size),
 				mode: metadata.kind === "symlink"
 					? 0o120000
 					: (metadata.mode & 0o111n) === 0n ? 0o100644 : 0o100755,

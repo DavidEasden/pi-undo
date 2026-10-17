@@ -11,6 +11,7 @@ import {
 	UndoControllerImpl,
 	type ControllerDependencies,
 	type ControllerInitialState,
+	type SettlementDiagnostic,
 } from "./controller.ts";
 import { finalizeDurablePack, hasDurablePack, loadDurablePack } from "./durable-pack.ts";
 import { assertCursor, canonicalJson, checksum, sameWorkspaceSnapshot } from "./encoding.ts";
@@ -24,9 +25,9 @@ import {
 import { JournalRecovery } from "./recovery.ts";
 import { QuarantineManager } from "./quarantine.ts";
 import { RestoreEngine } from "./restore-engine.ts";
-import { RootDiscovery } from "./root-discovery.ts";
+import { RootDiscovery, type RootTopology } from "./root-discovery.ts";
 import { DurableCursorWriter, SessionState, type SessionEntrySource } from "./session-state.ts";
-import { SnapshotStore } from "./snapshot-store.ts";
+import { SnapshotStore, type CaptureDiagnostic } from "./snapshot-store.ts";
 import { StatusReporter } from "./status-reporter.ts";
 import { WorkspaceLock } from "./workspace-lock.ts";
 import { allCompleted, checkOperation, configuredTimeout, currentOperationContext, isUnconfirmedExit, operationHasUnconfirmedExit, runWithOperationContext, withRecoveryBudget, type ProcessDiagnostic } from "./operation-context.ts";
@@ -62,12 +63,26 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 		}
 		return store.capture(topology, scopePaths, { topologyAlreadyValidated: true });
 	};
-	const captureBaseline = async (baseline: SnapshotManifest) => {
-		const topology = await discovery.discover(context.cwd);
+	const captureBaseline = async (
+		baseline: SnapshotManifest,
+		onDiagnostics?: (diagnostic: CaptureDiagnostic) => void,
+		onTiming?: (phase: string, durationMs: number) => void,
+	) => {
+		const discoveryStartedAt = performance.now();
+		let topology: RootTopology;
+		try {
+			topology = await discovery.discover(context.cwd);
+		} finally {
+			try { onTiming?.("settled.rootDiscovery", performance.now() - discoveryStartedAt); } catch { /* diagnostics must not affect capture */ }
+		}
 		if (topology.workspaceIdentity !== initialTopology.workspaceIdentity) {
 			throw new Error("workspace_identity_changed: workspace root canonical path changed; run /undo-recover");
 		}
-		return store.captureBaseline(topology, baseline, undefined, { topologyAlreadyValidated: true });
+		return store.captureBaseline(topology, baseline, undefined, {
+			topologyAlreadyValidated: true,
+			onDiagnostics,
+			onTiming,
+		});
 	};
 	const recovery = new JournalRecovery({
 		sessionIdentity,
@@ -297,7 +312,15 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 			const totalMs = Math.round(performance.now() - operationStarted);
 			if (totalMs < 1_000 && (result.code === "ok" || result.code === "noop")) return;
 			await writeJsonAtomic(join(privateRoot, "diagnostics", `${manager.getSessionId()}-latest.json`), {
-				schemaVersion: 1, opId, code: result.code, totalMs, phases, processes: diagnostics,
+				schemaVersion: 1, opId, code: result.code, totalMs, phases,
+				operationTimings: result.timings ?? [], settlement: result.settlement ?? null, processes: diagnostics,
+			});
+		},
+		onSettlement: async (settlement: SettlementDiagnostic) => {
+			if (settlement.outcome === "ok" && settlement.durationMs < 1_000) return;
+			await writeJsonAtomic(join(privateRoot, "diagnostics", `${manager.getSessionId()}-settlement-diagnostic.json`), {
+				schemaVersion: 1,
+				settlement,
 			});
 		},
 	};
