@@ -598,6 +598,43 @@ describe("undo/redo restore performance", () => {
 		}
 	}, 180_000);
 
+	it("一万零一普通文件 overwrite restore 使用 native batch", async () => {
+		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-overwrite-native-perf-"));
+		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-overwrite-native-perf-store-"));
+		const journalRoot = await mkdtemp(join(tmpdir(), "pi-undo-overwrite-native-perf-journal-"));
+		try {
+			const files = Array.from(
+				{ length: 10_001 },
+				(_, index) => `file-${String(index).padStart(5, "0")}.txt`,
+			);
+			await Promise.all(files.map((path) => writeFile(join(workspace, path), "before\n")));
+			const discovery = new RootDiscovery();
+			const store = new SnapshotStore({ storeRoot, discovery });
+			const restore = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+			const topology = await discovery.discover(workspace);
+			const target = await store.capture(topology);
+			await Promise.all(files.map((path) => writeFile(join(workspace, path), "after\n")));
+			const current = await store.capture(topology, files);
+			const plan = await restore.plan(current, target, files);
+			await restore.prepareDurableRestore(current, target, files);
+			const result = await restore.apply(plan, target, {
+				opId: "overwrite-native-performance",
+				mutationJournal: new MutationJournal(
+					join(journalRoot, "mutations.jsonl"),
+					"overwrite-native-performance",
+				),
+				deferDurability: true,
+			});
+			expect(plan.deletePaths).toHaveLength(0);
+			expect(plan.writePaths).toHaveLength(10_001);
+			expect(result).toMatchObject({ code: "ok", verifiedPaths: 10_001, totalPaths: 10_001 });
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+			await rm(journalRoot, { recursive: true, force: true });
+		}
+	}, 180_000);
+
 	it("完整 restore 冷 blob 按 root 批量预取，不产生每文件 cat-file blob", async () => {
 		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-complete-prefetch-"));
 		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-complete-prefetch-store-"));

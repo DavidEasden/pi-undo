@@ -11,6 +11,7 @@ import {
 	hasDurablePack,
 	loadDurablePack,
 	publishCachedDurablePack,
+	publishResidentDurablePack,
 	removeDurablePack,
 	type DurableLeafInput,
 	type DurablePack,
@@ -189,6 +190,7 @@ export class RestoreEngine {
 	private readonly preparedPlans = new Map<string, PreparedRestorePlan>();
 	private readonly durablePackCache = new Map<string, CachedDurablePack>();
 	private readonly durablePackByPair = new Map<string, CachedDurablePair>();
+	private readonly verifiedDurablePacks = new Set<string>();
 	private readonly durableIndexLock = new WorkspaceLock({
 		leaseMs: 10_000,
 		retryMs: 25,
@@ -343,6 +345,7 @@ export class RestoreEngine {
 					false,
 				);
 			}
+			this.verifiedDurablePacks.add(`${pairKey}:${cached.planDigest}`);
 			return true;
 		} catch (error) {
 			rethrowOperationFailure(error);
@@ -859,12 +862,25 @@ export class RestoreEngine {
 					cached.currentManifestId === current.manifestId &&
 					cached.targetManifestId === target.manifestId
 				) {
-					durablePack = await publishCachedDurablePack(
-						cached.path,
-						options.mutationJournal,
-						plan.planDigest,
-						cached.packChecksum,
-					);
+					const pairKey = durablePairKey(current.manifestId, target.manifestId, plan.scopePaths ?? []);
+					const residentKey = `${pairKey}:${plan.planDigest}`;
+					const resident = this.verifiedDurablePacks.has(residentKey)
+						? this.durablePackByPair.get(pairKey)
+						: undefined;
+					if (resident?.planDigest === plan.planDigest && resident.pack.packChecksum === cached.packChecksum) {
+						durablePack = await publishResidentDurablePack(
+							resident.pack,
+							options.mutationJournal,
+							plan.planDigest,
+						);
+					} else {
+						durablePack = await publishCachedDurablePack(
+							cached.path,
+							options.mutationJournal,
+							plan.planDigest,
+							cached.packChecksum,
+						);
+					}
 				} else {
 					durablePack = await createDurablePack(options.mutationJournal, {
 						opId: options.opId,

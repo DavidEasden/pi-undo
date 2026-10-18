@@ -118,6 +118,10 @@ export class DurablePack {
 		return this.entries.get(path)?.targetFingerprint;
 	}
 
+	withStoragePath(storagePath: string): DurablePack {
+		return new DurablePack(this.opId, this.planDigest, storagePath, this.packChecksum, this.entries);
+	}
+
 	leaf(path: string, fingerprint: string): DurableLeaf | undefined {
 		const leaf = this.entries.get(path)?.variants.get(fingerprint);
 		if (leaf === undefined) return undefined;
@@ -282,16 +286,36 @@ export async function hasDurablePack(journal: MutationJournal): Promise<boolean>
 	}
 }
 
+export async function publishResidentDurablePack(
+	cached: DurablePack,
+	journal: MutationJournal,
+	expectedPlanDigest: string,
+): Promise<DurablePack> {
+	if (cached.planDigest !== expectedPlanDigest) throw new Error("durable cache planDigest 不匹配");
+	const target = durablePackPath(journal);
+	await rm(target, { force: true });
+	try {
+		await link(cached.storagePath, target);
+		await fsyncDirectory(dirname(target));
+	} catch (error) {
+		if (!hasErrorCode(error, "EXDEV")) throw error;
+		await copyFile(cached.storagePath, target);
+		await fsyncFile(target);
+		await fsyncDirectory(dirname(target));
+	}
+	return cached.withStoragePath(target);
+}
+
 export async function publishCachedDurablePack(
 	cachedPath: string,
 	journal: MutationJournal,
 	expectedPlanDigest: string,
 	expectedPackChecksum: string,
 ): Promise<DurablePack> {
-	const target = durablePackPath(journal);
 	if (checksum(await readFile(cachedPath)) !== expectedPackChecksum) {
 		throw new Error("durable cache pack checksum 不匹配");
 	}
+	const target = durablePackPath(journal);
 	await rm(target, { force: true });
 	try {
 		await link(cachedPath, target);

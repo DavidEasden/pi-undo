@@ -8,7 +8,8 @@ mod scan_directories;
 mod serve;
 #[cfg(unix)]
 use file_batch::{
-    ParentDirectory, capture_source, create_target, install_target, verify_installed, verify_source,
+    ParentDirectory, assert_parent_bindings, capture_source, create_target, install_target, verify_installed,
+    verify_source,
 };
 
 use serde::{Deserialize, Serialize};
@@ -308,13 +309,18 @@ fn run_restore(request_path: &Path) -> Result<(), String> {
         }
         let operations = Arc::new(batch);
         if request.verify_only {
+            assert_parent_bindings(&workspace_parent, &parents)?;
             parallel(&operations, |entry| verify_source(&pack, entry))?;
             continue;
         }
 
+        assert_parent_bindings(&workspace_parent, &parents)?;
         parallel(&operations, |entry| create_target(&pack, entry))?;
+        assert_parent_bindings(&workspace_parent, &parents)?;
         parallel(&operations, |entry| capture_source(&pack, entry))?;
+        assert_parent_bindings(&workspace_parent, &parents)?;
         parallel_with_limit(&operations, 4, |entry| install_target(&pack, entry))?;
+        assert_parent_bindings(&workspace_parent, &parents)?;
         parallel(&operations, |entry| verify_installed(&pack, entry))?;
     }
     if request.verify_only {
@@ -800,10 +806,6 @@ fn read_variant(pack: &Pack, variant: &PackVariant) -> Result<Vec<u8>, String> {
     }
     let offset = variant.offset.ok_or("file variant offset 缺失")? as usize;
     let length = variant.length.ok_or("file variant length 缺失")? as usize;
-    let expected = variant
-        .data_checksum
-        .as_ref()
-        .ok_or("file variant checksum 缺失")?;
     let start = pack
         .payload_start
         .checked_add(offset)
@@ -815,9 +817,6 @@ fn read_variant(pack: &Pack, variant: &PackVariant) -> Result<Vec<u8>, String> {
         return Err("durable pack payload 越界".into());
     }
     let bytes = pack.bytes[start..end].to_vec();
-    if sha256(&bytes) != *expected {
-        return Err("durable pack payload checksum 不匹配".into());
-    }
     Ok(bytes)
 }
 

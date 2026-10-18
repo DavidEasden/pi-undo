@@ -49,6 +49,16 @@ impl ParentDirectory {
         }
         Ok(())
     }
+
+    pub(crate) fn assert_direct_bound(&self) -> Result<(), String> {
+        let Some(parent) = &self.parent else {
+            return self.assert_bound();
+        };
+        parent
+            .directory
+            .assert_child(self.path.file_name().unwrap(), &self.directory)
+            .map_err(|error| format!("native 父目录绑定变化：{}: {error}", self.path.display()))
+    }
 }
 
 pub(crate) fn open_parent(
@@ -85,13 +95,21 @@ pub(crate) fn open_parent(
     Ok(current)
 }
 
+pub(crate) fn assert_parent_bindings(
+    root: &Arc<ParentDirectory>,
+    parents: &BTreeMap<PathBuf, Arc<ParentDirectory>>,
+) -> Result<(), String> {
+    root.assert_bound()?;
+    for parent in parents.values() {
+        parent.assert_direct_bound()?;
+    }
+    Ok(())
+}
+
 fn names(entry: &OperationEntry) -> Result<(&ParentDirectory, &OsStr, &OsStr), String> {
     let parent = entry.parent.as_deref().ok_or("native parent handle 缺失")?;
     let original = entry.original.file_name().ok_or("native 文件名缺失")?;
     let source = entry.source.file_name().ok_or("native source 文件名缺失")?;
-    parent
-        .assert_bound()
-        .map_err(|error| format!("{}: {error}", entry.path))?;
     Ok((parent, original, source))
 }
 
@@ -103,11 +121,18 @@ fn absent(parent: &ParentDirectory, name: &OsStr) -> Result<(), String> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct FileIdentity {
+    dev: u64,
+    ino: u64,
+    size: u64,
+}
+
 fn verify_file(
     parent: &ParentDirectory,
     name: &OsStr,
     variant: &PackVariant,
-) -> Result<(), String> {
+) -> Result<FileIdentity, String> {
     let mut file = parent
         .directory
         .open_file(name, libc::O_RDONLY | libc::O_NONBLOCK, 0)
@@ -139,6 +164,46 @@ fn verify_file(
         || linked.st_ino as u64 != metadata.ino()
     {
         return Err("native 普通文件读取期间身份变化".into());
+    }
+    Ok(FileIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        size: metadata.len(),
+    })
+}
+
+fn verify_file_metadata(
+    parent: &ParentDirectory,
+    name: &OsStr,
+    variant: &PackVariant,
+    expected_size: u64,
+) -> Result<libc::stat, String> {
+    let metadata = parent
+        .directory
+        .stat(name)
+        .map_err(|error| format!("检查普通文件失败：{}: {error}", name.to_string_lossy()))?;
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFREG || variant.kind != "file" {
+        return Err("native 普通文件类型冲突".into());
+    }
+    let mode = if metadata.st_mode & 0o111 == 0 { 0o644 } else { 0o755 };
+    if Some(mode) != variant.mode {
+        return Err("native 普通文件 mode 冲突".into());
+    }
+    if metadata.st_size < 0 || metadata.st_size as u64 != expected_size {
+        return Err("native 普通文件大小冲突".into());
+    }
+    Ok(metadata)
+}
+
+fn verify_file_shape(
+    parent: &ParentDirectory,
+    name: &OsStr,
+    variant: &PackVariant,
+    expected: FileIdentity,
+) -> Result<(), String> {
+    let metadata = verify_file_metadata(parent, name, variant, expected.size)?;
+    if metadata.st_dev as u64 != expected.dev || metadata.st_ino as u64 != expected.ino {
+        return Err("native 普通文件身份变化".into());
     }
     Ok(())
 }
@@ -235,7 +300,7 @@ pub(crate) fn verify_source(_pack: &Pack, entry: &OperationEntry) -> Result<(), 
     if entry.source_variant.kind == "absent" {
         absent(parent, original)
     } else {
-        verify_file(parent, original, &entry.source_variant)
+        verify_file(parent, original, &entry.source_variant).map(|_| ())
     }
 }
 
@@ -254,7 +319,7 @@ pub(crate) fn create_target(pack: &Pack, entry: &OperationEntry) -> Result<(), S
     file.write_all(&bytes).map_err(|error| error.to_string())?;
     file.set_permissions(fs::Permissions::from_mode(mode))
         .map_err(|error| error.to_string())?;
-    verify_file(parent, name, &entry.target_variant)
+    verify_file_metadata(parent, name, &entry.target_variant, bytes.len() as u64).map(|_| ())
 }
 
 pub(crate) fn capture_source(_pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
@@ -263,19 +328,18 @@ pub(crate) fn capture_source(_pack: &Pack, entry: &OperationEntry) -> Result<(),
     if entry.source_variant.kind == "absent" {
         return absent(parent, original);
     }
-    verify_file(parent, original, &entry.source_variant)?;
+    let source_identity = verify_file(parent, original, &entry.source_variant)?;
     if entry.target.is_none() {
         link(parent, original, source)?;
-        verify_file(parent, original, &entry.source_variant)?;
-        verify_file(parent, source, &entry.source_variant)?;
+        verify_file_shape(parent, source, &entry.source_variant, source_identity)?;
         same_file(parent, original, source)?;
-        parent.assert_bound()?;
         unlink(parent, original)?;
         absent(parent, original)?;
+        verify_file_shape(parent, source, &entry.source_variant, source_identity)
     } else {
         rename(parent, original, source)?;
+        verify_file_shape(parent, source, &entry.source_variant, source_identity)
     }
-    verify_file(parent, source, &entry.source_variant)
 }
 
 pub(crate) fn install_target(_pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
@@ -285,14 +349,18 @@ pub(crate) fn install_target(_pack: &Pack, entry: &OperationEntry) -> Result<(),
     };
     let target = target.file_name().ok_or("native target 文件名缺失")?;
     absent(parent, original)?;
-    verify_file(parent, target, &entry.target_variant)?;
+    let target_size = entry
+        .target_variant
+        .length
+        .ok_or("target variant length 缺失")?;
+    verify_file_metadata(parent, target, &entry.target_variant, target_size).map(|_| ())?;
     link(parent, target, original)
 }
 
 pub(crate) fn verify_installed(_pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
     let (parent, original, source) = names(entry)?;
     if let Some(target) = &entry.target {
-        verify_file(parent, original, &entry.target_variant)?;
+        verify_file(parent, original, &entry.target_variant).map(|_| ())?;
         same_file(
             parent,
             original,
@@ -302,7 +370,7 @@ pub(crate) fn verify_installed(_pack: &Pack, entry: &OperationEntry) -> Result<(
         absent(parent, original)?;
     }
     if entry.source_variant.kind == "file" {
-        verify_file(parent, source, &entry.source_variant)?;
+        verify_file(parent, source, &entry.source_variant).map(|_| ())?;
     } else {
         absent(parent, source)?;
     }
