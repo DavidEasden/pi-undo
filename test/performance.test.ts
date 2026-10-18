@@ -887,12 +887,13 @@ describe("undo/redo restore performance", () => {
 			expect(result.code).toBe("ok");
 			expect(await readFile(join(workspace, "value.txt"), "utf8")).toBe("before\n");
 			expect(discovery.reasons.length).toBeLessThanOrEqual(5);
-			// 安全快照 1 次、恢复前 1 次；native exact-leaf 最终复核不再重复构造可见路径索引。
+			// 安全快照 1 次、恢复前 1 次，两次可见路径枚举各只保留枚举后的复核。
 			expect(discovery.reasons).toEqual([
 				"safety-snapshot",
 				"restore-pre",
 				"visible-paths-post",
 				"restore-post",
+				"visible-paths-post",
 			]);
 		} finally {
 			await rm(workspace, { recursive: true, force: true });

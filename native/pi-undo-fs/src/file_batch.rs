@@ -1,5 +1,5 @@
 use crate::directory::{Directory, same_directory};
-use crate::{OperationEntry, Pack, PackVariant, sha256, variant_bytes};
+use crate::{OperationEntry, Pack, PackVariant, read_variant, sha256};
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr};
 use std::fs;
@@ -185,11 +185,7 @@ fn verify_file_metadata(
     if metadata.st_mode & libc::S_IFMT != libc::S_IFREG || variant.kind != "file" {
         return Err("native 普通文件类型冲突".into());
     }
-    let mode = if metadata.st_mode & 0o111 == 0 {
-        0o644
-    } else {
-        0o755
-    };
+    let mode = if metadata.st_mode & 0o111 == 0 { 0o644 } else { 0o755 };
     if Some(mode) != variant.mode {
         return Err("native 普通文件 mode 冲突".into());
     }
@@ -314,15 +310,16 @@ pub(crate) fn create_target(pack: &Pack, entry: &OperationEntry) -> Result<(), S
         return Ok(());
     };
     let name = target.file_name().ok_or("native target 文件名缺失")?;
-    let bytes = variant_bytes(pack, &entry.target_variant)?;
+    let bytes = read_variant(pack, &entry.target_variant)?;
     let mode = entry.target_variant.mode.ok_or("native target mode 缺失")?;
     let mut file = parent
         .directory
         .open_file(name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL, mode)
         .map_err(|error| format!("创建 target artifact 失败：{error}"))?;
-    file.write_all(bytes).map_err(|error| error.to_string())?;
+    file.write_all(&bytes).map_err(|error| error.to_string())?;
     file.set_permissions(fs::Permissions::from_mode(mode))
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    verify_file_metadata(parent, name, &entry.target_variant, bytes.len() as u64).map(|_| ())
 }
 
 pub(crate) fn capture_source(_pack: &Pack, entry: &OperationEntry) -> Result<(), String> {

@@ -726,7 +726,7 @@ fn create_target(pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
         return Ok(());
     };
     assert_absent(target, &entry.path)?;
-    let bytes = variant_bytes(pack, &entry.target_variant)?;
+    let bytes = read_variant(pack, &entry.target_variant)?;
     let mode = entry
         .target_variant
         .mode
@@ -738,7 +738,7 @@ fn create_target(pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
     let mut file = options
         .open(target)
         .map_err(error_path("创建 target artifact 失败", &entry.path))?;
-    file.write_all(bytes)
+    file.write_all(&bytes)
         .map_err(error_path("写入 target artifact 失败", &entry.path))?;
     #[cfg(unix)]
     file.set_permissions(fs::Permissions::from_mode(mode))
@@ -800,7 +800,7 @@ fn assert_same_file_identity(_left: &Path, _right: &Path, logical: &str) -> Resu
     ))
 }
 
-fn variant_bytes<'a>(pack: &'a Pack, variant: &PackVariant) -> Result<&'a [u8], String> {
+fn read_variant(pack: &Pack, variant: &PackVariant) -> Result<Vec<u8>, String> {
     if variant.kind != "file" {
         return Err("只有 file variant 包含 bytes".into());
     }
@@ -816,10 +816,7 @@ fn variant_bytes<'a>(pack: &'a Pack, variant: &PackVariant) -> Result<&'a [u8], 
     if end > pack.bytes.len() {
         return Err("durable pack payload 越界".into());
     }
-    let bytes = pack
-        .bytes
-        .get(start..end)
-        .ok_or("durable pack payload 越界")?;
+    let bytes = pack.bytes[start..end].to_vec();
     Ok(bytes)
 }
 
