@@ -126,6 +126,7 @@ interface VisibleSubsetCheck {
 	readonly extraExclusions?: readonly string[];
 	readonly scopePaths?: readonly string[];
 	readonly ownedPaths?: readonly (ReadonlyMap<string, OwnedPath> | undefined)[];
+	readonly skipVisibleEnumeration?: boolean;
 }
 
 interface PreparedRestorePlan {
@@ -1070,6 +1071,7 @@ export class RestoreEngine {
 					}),
 					scopePaths: plan.scopePaths,
 					ownedPaths: [targetPaths],
+					skipVisibleEnumeration: canSkipNativeVisibleSubset(plan, currentPaths, targetPaths),
 				},
 			);
 			const totalPaths = plan.deletePaths.length + plan.writePaths.length;
@@ -1889,9 +1891,13 @@ export class RestoreEngine {
 		}
 
 		const exclusions = new Set(check.extraExclusions ?? []);
+		let activeArtifacts: ReadonlySet<string> = new Set();
 		if (mutationJournal !== undefined) {
-			for (const path of await mutationJournal.activeArtifacts()) exclusions.add(path);
+			activeArtifacts = await mutationJournal.activeArtifacts();
+			for (const path of activeArtifacts) exclusions.add(path);
 		}
+		// native 已逐项复核 exact-leaf scope；没有活动 WAL 时无需再次构造 Git 可见路径索引。
+		if (check.skipVisibleEnumeration && activeArtifacts.size === 0) return;
 		const livePaths = await this.store.listVisibleLeafPaths(topology, {
 			excludePaths: exclusions.size === 0 ? undefined : [...exclusions],
 			includePaths: check.scopePaths,
@@ -2166,6 +2172,28 @@ function sameEntry(left: RestorePath, right: RestorePath): boolean {
 
 function entriesEquivalent(left: OwnedPath | undefined, right: OwnedPath): boolean {
 	return left !== undefined && sameEntry(left.entry, right.entry);
+}
+
+function canSkipNativeVisibleSubset(
+	plan: RestorePlan,
+	currentPaths: ReadonlyMap<string, OwnedPath>,
+	targetPaths: ReadonlyMap<string, OwnedPath>,
+): boolean {
+	const scopePaths = plan.scopePaths;
+	if (scopePaths === undefined || scopePaths.length === 0 || scopePaths.includes(".")) return false;
+	const sortedScope = [...scopePaths].sort(comparePaths);
+	for (let index = 0; index < sortedScope.length; index += 1) {
+		const path = sortedScope[index]!;
+		const owned = targetPaths.get(path) ?? currentPaths.get(path);
+		if (owned === undefined || owned.entry.kind === "directory") return false;
+		const next = sortedScope[index + 1];
+		if (next !== undefined && next.startsWith(`${path}/`)) return false;
+	}
+	const scoped = new Set(scopePaths);
+	const mutationPaths = new Set([...plan.deletePaths, ...plan.writePaths]);
+	return mutationPaths.size === scopePaths.length &&
+		scoped.size === scopePaths.length &&
+		[...mutationPaths].every((path) => scoped.has(path));
 }
 
 function isPathAffectedByMutations(
