@@ -805,7 +805,7 @@ fn assert_same_file_identity(_left: &Path, _right: &Path, logical: &str) -> Resu
     ))
 }
 
-fn read_variant(pack: &Pack, variant: &PackVariant) -> Result<Vec<u8>, String> {
+fn read_variant<'a>(pack: &'a Pack, variant: &PackVariant) -> Result<&'a [u8], String> {
     if variant.kind != "file" {
         return Err("只有 file variant 包含 bytes".into());
     }
@@ -821,7 +821,7 @@ fn read_variant(pack: &Pack, variant: &PackVariant) -> Result<Vec<u8>, String> {
     if end > pack.bytes.len() {
         return Err("durable pack payload 越界".into());
     }
-    let bytes = pack.bytes[start..end].to_vec();
+    let bytes = &pack.bytes[start..end];
     Ok(bytes)
 }
 

@@ -172,6 +172,26 @@ fn verify_file(
     })
 }
 
+fn verify_file_metadata_values(
+    is_file: bool,
+    mode_bits: u32,
+    size: u64,
+    variant: &PackVariant,
+    expected_size: u64,
+) -> Result<(), String> {
+    if !is_file || variant.kind != "file" {
+        return Err("native 普通文件类型冲突".into());
+    }
+    let mode = if mode_bits & 0o111 == 0 { 0o644 } else { 0o755 };
+    if Some(mode) != variant.mode {
+        return Err("native 普通文件 mode 冲突".into());
+    }
+    if size != expected_size {
+        return Err("native 普通文件大小冲突".into());
+    }
+    Ok(())
+}
+
 fn verify_file_metadata(
     parent: &ParentDirectory,
     name: &OsStr,
@@ -182,17 +202,26 @@ fn verify_file_metadata(
         .directory
         .stat(name)
         .map_err(|error| format!("检查普通文件失败：{}: {error}", name.to_string_lossy()))?;
-    if metadata.st_mode & libc::S_IFMT != libc::S_IFREG || variant.kind != "file" {
-        return Err("native 普通文件类型冲突".into());
-    }
-    let mode = if metadata.st_mode & 0o111 == 0 { 0o644 } else { 0o755 };
-    if Some(mode) != variant.mode {
-        return Err("native 普通文件 mode 冲突".into());
-    }
-    if metadata.st_size < 0 || metadata.st_size as u64 != expected_size {
+    if metadata.st_size < 0 {
         return Err("native 普通文件大小冲突".into());
     }
+    verify_file_metadata_values(
+        metadata.st_mode & libc::S_IFMT == libc::S_IFREG,
+        metadata.st_mode as u32,
+        metadata.st_size as u64,
+        variant,
+        expected_size,
+    )?;
     Ok(metadata)
+}
+
+fn verify_open_file_metadata(
+    file: &std::fs::File,
+    variant: &PackVariant,
+    expected_size: u64,
+) -> Result<(), String> {
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    verify_file_metadata_values(metadata.is_file(), metadata.mode(), metadata.len(), variant, expected_size)
 }
 
 fn verify_file_shape(
@@ -319,7 +348,7 @@ pub(crate) fn create_target(pack: &Pack, entry: &OperationEntry) -> Result<(), S
     file.write_all(&bytes).map_err(|error| error.to_string())?;
     file.set_permissions(fs::Permissions::from_mode(mode))
         .map_err(|error| error.to_string())?;
-    verify_file_metadata(parent, name, &entry.target_variant, bytes.len() as u64).map(|_| ())
+    verify_open_file_metadata(&file, &entry.target_variant, bytes.len() as u64)
 }
 
 pub(crate) fn capture_source(_pack: &Pack, entry: &OperationEntry) -> Result<(), String> {
