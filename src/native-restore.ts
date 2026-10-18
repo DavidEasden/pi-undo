@@ -24,7 +24,7 @@ export async function createNativeFileBatch(options: {
 	readonly journal: MutationJournal;
 	/** 测试注入用；默认使用随包分发的平台二进制。 */
 	readonly executable?: string;
-	readonly requiredCapability?: "restore-files-v2";
+	readonly requiredCapability?: "restore-files-v2" | "restore-files-v3";
 }): Promise<NativeFileBatch | undefined> {
 	if (process.env.PI_UNDO_DISABLE_NATIVE === "1") return undefined;
 	const executable = options.executable ?? nativeExecutable();
@@ -90,11 +90,26 @@ export async function createNativeFileBatch(options: {
 	};
 }
 
-export function nativeRestoreCapability(pack: DurablePack): "restore-files-v2" | undefined {
+function nativeRestoreBatchRequired(paths: readonly string[]): boolean {
+	if (process.platform === "win32") return false;
+	const parents = new Set<string>();
+	for (const path of paths) {
+		const parentEnd = path.lastIndexOf("/");
+		let separator = path.indexOf("/");
+		while (separator !== -1 && separator <= parentEnd) {
+			parents.add(path.slice(0, separator));
+			if (parents.size > 128) return true;
+			separator = path.indexOf("/", separator + 1);
+		}
+	}
+	return false;
+}
+
+export function nativeRestoreCapability(pack: DurablePack): "restore-files-v2" | "restore-files-v3" | undefined {
 	const paths = pack.paths();
 	const deletes = paths.filter((path) => pack.artifacts(path)?.target === null);
-	return deletes.some((path) => path.includes("/")) || (deletes.length > 0 && deletes.length < paths.length)
-		? "restore-files-v2" : undefined;
+	const requiresV2 = deletes.some((path) => path.includes("/")) || (deletes.length > 0 && deletes.length < paths.length);
+	return nativeRestoreBatchRequired(paths) ? "restore-files-v3" : requiresV2 ? "restore-files-v2" : undefined;
 }
 
 export function nativeExecutable(): string | undefined {

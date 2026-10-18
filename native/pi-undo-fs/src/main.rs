@@ -128,18 +128,18 @@ fn run() -> Result<(), String> {
     if first == "--capabilities" {
         #[cfg(target_os = "macos")]
         {
-            let capabilities = r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","inspect-batches-v1","scan-directories-v1","scan-directories-v2","scan-serve-v1","restore-files-v2"]}"#;
+            let capabilities = r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","inspect-batches-v1","scan-directories-v1","scan-directories-v2","scan-serve-v1","restore-files-v2","restore-files-v3"]}"#;
             println!("{capabilities}");
         }
         #[cfg(target_os = "linux")]
         {
-            let capabilities = r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","inspect-batches-v1","scan-directories-v1","scan-directories-v2","restore-files-v2"]}"#;
+            let capabilities = r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","inspect-batches-v1","scan-directories-v1","scan-directories-v2","restore-files-v2","restore-files-v3"]}"#;
             println!("{capabilities}");
         }
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
         println!(
             "{}",
-            r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","inspect-batches-v1","restore-files-v2"]}"#
+            r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","inspect-batches-v1","restore-files-v2","restore-files-v3"]}"#
         );
         #[cfg(not(unix))]
         println!("{}", r#"{"ok":true,"capabilities":["restore-v1"]}"#);
@@ -191,9 +191,10 @@ fn run_restore(request_path: &Path) -> Result<(), String> {
     }
     #[cfg(unix)]
     let workspace_parent = ParentDirectory::root(&workspace)?;
-    #[cfg(unix)]
-    let mut parents = BTreeMap::new();
     let mut operations = Vec::with_capacity(request.entries.len());
+    let mut operation_batches = Vec::new();
+    #[cfg(unix)]
+    let mut batch_parents = BTreeSet::new();
     let mut requested_paths = BTreeMap::new();
     let mut reserved_paths = BTreeSet::new();
     for entry in request.entries {
@@ -226,12 +227,6 @@ fn run_restore(request_path: &Path) -> Result<(), String> {
             .as_ref()
             .map(|artifact| safe_artifact(&workspace, &entry.path, artifact, "target"))
             .transpose()?;
-        #[cfg(unix)]
-        let parent = Some(file_batch::open_parent(
-            &workspace_parent,
-            &entry.path,
-            &mut parents,
-        )?);
         #[cfg(not(unix))]
         if target.is_none() {
             return Err("当前平台 native delete 不支持，回退 TypeScript restore".into());
@@ -258,7 +253,7 @@ fn run_restore(request_path: &Path) -> Result<(), String> {
         if target.is_some() && target_variant.kind != "file" {
             return Err(format!("native batch target 不是普通文件：{}", entry.path));
         }
-        operations.push(OperationEntry {
+        let operation = OperationEntry {
             path: entry.path,
             original,
             source,
@@ -266,8 +261,25 @@ fn run_restore(request_path: &Path) -> Result<(), String> {
             source_variant,
             target_variant,
             #[cfg(unix)]
-            parent,
-        });
+            parent: None,
+        };
+        #[cfg(unix)]
+        {
+            let required_parents = parent_paths(&operation.path);
+            if required_parents.len() > 128 {
+                return Err(format!("native 父目录层级超过限制：{}", operation.path));
+            }
+            let added = required_parents
+                .iter()
+                .filter(|path| !batch_parents.contains(*path))
+                .count();
+            if !operations.is_empty() && batch_parents.len() + added > 128 {
+                operation_batches.push(std::mem::take(&mut operations));
+                batch_parents.clear();
+            }
+            batch_parents.extend(required_parents);
+        }
+        operations.push(operation);
     }
     for path in &reserved_paths {
         if Path::new(path)
@@ -278,20 +290,39 @@ fn run_restore(request_path: &Path) -> Result<(), String> {
             return Err(format!("native 路径前缀重叠：{path}"));
         }
     }
-    let operations = Arc::new(operations);
+    if !operations.is_empty() {
+        operation_batches.push(operations);
+    }
+    let operation_count = operation_batches.iter().map(Vec::len).sum::<usize>();
     let pack = Arc::new(pack);
+    for mut batch in operation_batches {
+        #[cfg(unix)]
+        let mut parents = BTreeMap::new();
+        #[cfg(unix)]
+        for entry in &mut batch {
+            entry.parent = Some(file_batch::open_parent(
+                &workspace_parent,
+                &entry.path,
+                &mut parents,
+            )?);
+        }
+        let operations = Arc::new(batch);
+        if request.verify_only {
+            parallel(&operations, |entry| verify_source(&pack, entry))?;
+            continue;
+        }
+
+        parallel(&operations, |entry| create_target(&pack, entry))?;
+        parallel(&operations, |entry| capture_source(&pack, entry))?;
+        parallel_with_limit(&operations, 4, |entry| install_target(&pack, entry))?;
+        parallel(&operations, |entry| verify_installed(&pack, entry))?;
+    }
     if request.verify_only {
-        parallel(&operations, |entry| verify_source(&pack, entry))?;
-        println!("{{\"ok\":true,\"processed\":{}}}", operations.len());
+        println!("{{\"ok\":true,\"processed\":{operation_count}}}");
         return Ok(());
     }
 
-    parallel(&operations, |entry| create_target(&pack, entry))?;
-    parallel(&operations, |entry| capture_source(&pack, entry))?;
-    parallel_with_limit(&operations, 4, |entry| install_target(&pack, entry))?;
-    parallel(&operations, |entry| verify_installed(&pack, entry))?;
-
-    println!("{{\"ok\":true,\"processed\":{}}}", operations.len());
+    println!("{{\"ok\":true,\"processed\":{operation_count}}}");
     Ok(())
 }
 
@@ -904,6 +935,20 @@ fn safe_artifact(root: &Path, path: &str, artifact: &str, role: &str) -> Result<
         return Err(format!("artifact nonce 不受支持：{artifact}"));
     }
     safe_path(root, artifact)
+}
+
+#[cfg(unix)]
+fn parent_paths(path: &str) -> BTreeSet<PathBuf> {
+    let components = Path::new(path).components().collect::<Vec<_>>();
+    let mut parent = PathBuf::new();
+    let mut paths = BTreeSet::new();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        if let Component::Normal(value) = component {
+            parent.push(value);
+            paths.insert(parent.clone());
+        }
+    }
+    paths
 }
 
 fn parallel<F>(entries: &Arc<Vec<OperationEntry>>, operation: F) -> Result<(), String>

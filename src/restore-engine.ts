@@ -898,7 +898,10 @@ export class RestoreEngine {
 			);
 		}
 		const durablePackEnabled = durablePack !== undefined;
-		if (nativeFileBatch !== undefined && durablePack !== undefined && this.canUseNativeFilePlan(plan, currentPaths, targetPaths)) {
+		if (
+			nativeFileBatch !== undefined && durablePack !== undefined &&
+			this.canUseNativeFilePlan(plan, currentPaths, targetPaths)
+		) {
 			const result = await this.applyNativeFilePlan(
 				plan,
 				current,
@@ -1018,9 +1021,8 @@ export class RestoreEngine {
 		if (!plan.writePaths.every((path) =>
 			targetPaths.get(path)?.entry.kind === "file" &&
 			(currentPaths.get(path) === undefined || currentPaths.get(path)?.entry.kind === "file"))) return false;
-		// 与 helper 的句柄上限一致；目录创建、类型替换及过多父目录继续使用 TypeScript。
-		const parents = new Set([...plan.deletePaths, ...plan.writePaths].flatMap(strictPathAncestors));
-		return process.platform === "win32" || parents.size <= 128;
+		const paths = [...plan.deletePaths, ...plan.writePaths];
+		return process.platform === "win32" || paths.every((path) => strictPathAncestors(path).length <= 128);
 	}
 
 	private async applyNativeFilePlan(

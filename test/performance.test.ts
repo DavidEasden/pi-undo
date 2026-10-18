@@ -1,15 +1,17 @@
 import { access, lstat, mkdtemp, mkdir, readFile, realpath, rm, unlink, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
 import { GitRunner, type GitRunOptions, type GitRunResult } from "../src/git-runner.ts";
+import { hasDurablePack } from "../src/durable-pack.ts";
 import { MutationJournal } from "../src/mutation-journal.ts";
 import type { ManifestId } from "../src/model.ts";
 import type { NativeMetadataEntry, NativeMetadataPort } from "../src/native-metadata.ts";
 import { nativeExecutable } from "../src/native-restore.ts";
+import { probeNativeCapability } from "../src/native-capabilities.ts";
 import { RestoreEngine } from "../src/restore-engine.ts";
 import { RootDiscovery, type RootDiscoveryReason, type RootTopology } from "../src/root-discovery.ts";
 import { SnapshotStore } from "../src/snapshot-store.ts";
@@ -558,13 +560,13 @@ describe("undo/redo restore performance", () => {
 		}
 	}, 120_000);
 
-	it("五千普通文件 delete-only restore 使用 native batch", async () => {
+	it("一万零一普通文件 delete-only restore 使用 native batch", async () => {
 		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-delete-native-perf-"));
 		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-delete-native-perf-store-"));
 		const journalRoot = await mkdtemp(join(tmpdir(), "pi-undo-delete-native-perf-journal-"));
 		try {
 			const files = Array.from(
-				{ length: 5_000 },
+				{ length: 10_001 },
 				(_, index) => `file-${String(index).padStart(5, "0")}.txt`,
 			);
 			await Promise.all(files.map((path, index) => writeFile(join(workspace, path), `content ${index}\n`)));
@@ -586,9 +588,9 @@ describe("undo/redo restore performance", () => {
 				),
 				deferDurability: true,
 			});
-			expect(plan.deletePaths).toHaveLength(5_000);
+			expect(plan.deletePaths).toHaveLength(10_001);
 			expect(plan.writePaths).toHaveLength(0);
-			expect(result).toMatchObject({ code: "ok", verifiedPaths: 5_000, totalPaths: 5_000 });
+			expect(result).toMatchObject({ code: "ok", verifiedPaths: 10_001, totalPaths: 10_001 });
 		} finally {
 			await rm(workspace, { recursive: true, force: true });
 			await rm(storeRoot, { recursive: true, force: true });
@@ -767,6 +769,51 @@ describe("undo/redo restore performance", () => {
 		} finally {
 			await rm(workspace, { recursive: true, force: true });
 			await rm(storeRoot, { recursive: true, force: true });
+		}
+	}, 120_000);
+
+	it("多个离散父目录超过 128 时仍使用 native restore batch", async (context) => {
+		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-parent-batch-workspace-"));
+		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-parent-batch-store-"));
+		const journalRoot = await mkdtemp(join(tmpdir(), "pi-undo-parent-batch-journal-"));
+		try {
+			const executable = nativeExecutable();
+			if (
+				executable === undefined ||
+				process.env.PI_UNDO_DISABLE_NATIVE === "1" ||
+				!await probeNativeCapability(executable, "restore-files-v3", journalRoot)
+			) return context.skip();
+			const paths = Array.from({ length: 130 }, (_, index) =>
+				`package-${String(index).padStart(3, "0")}/src/value.txt`);
+			for (const path of paths) {
+				const absolute = join(workspace, ...path.split("/"));
+				await mkdir(dirname(absolute), { recursive: true });
+				await writeFile(absolute, "before\n");
+			}
+			const discovery = new RootDiscovery();
+			const store = new SnapshotStore({ storeRoot, discovery });
+			const restore = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+			const topology = await discovery.discover(workspace);
+			const target = await store.capture(topology);
+			for (const path of paths) await writeFile(join(workspace, ...path.split("/")), "after\n");
+			const current = await store.capture(topology);
+			const plan = await restore.plan(current, target, paths);
+			await restore.prepareDurableRestore(current, target, paths);
+			const journal = new MutationJournal(join(journalRoot, "mutations.jsonl"), "op-parent-batches");
+
+			const result = await restore.apply(plan, target, {
+				opId: journal.operationId,
+				mutationJournal: journal,
+				deferDurability: true,
+			});
+
+			expect(result.code).toBe("ok");
+			expect(await hasDurablePack(journal)).toBe(true);
+			expect(await readFile(join(workspace, ...paths[0]!.split("/")), "utf8")).toBe("before\n");
+		} finally {
+			await rm(workspace, { recursive: true, force: true });
+			await rm(storeRoot, { recursive: true, force: true });
+			await rm(journalRoot, { recursive: true, force: true });
 		}
 	}, 120_000);
 

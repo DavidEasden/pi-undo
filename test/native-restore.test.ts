@@ -124,6 +124,49 @@ describe("native restore helper", () => {
 		expect(await readFile(join(value.root, "a.txt"))).toEqual(value.source);
 	});
 
+	it("文件分布超过 128 个父目录时按句柄预算分批恢复", async (context) => {
+		const root = await realpath(await mkdtemp(join(tmpdir(), "pi-undo-native-parent-batches-")));
+		roots.push(root);
+		const transaction = join(root, "transaction");
+		await mkdir(transaction);
+		const source = Buffer.from("source\n");
+		const target = Buffer.from("target\n");
+		const paths = Array.from({ length: 130 }, (_, index) => `dir-${String(index).padStart(3, "0")}/value.txt`);
+		const journal = new MutationJournal(join(transaction, "mutations.jsonl"), "operation-parent-batches");
+		const planDigest = "d".repeat(64);
+		const pack = await createDurablePack(journal, {
+			opId: journal.operationId,
+			planDigest,
+			entries: paths.map((path, index) => ({
+				path,
+				sourceArtifact: `dir-${String(index).padStart(3, "0")}/.pi-undo-q2-${index.toString(16).padStart(32, "0")}-source`,
+				targetArtifact: `dir-${String(index).padStart(3, "0")}/.pi-undo-q2-${index.toString(16).padStart(32, "0")}-target`,
+				sourceFingerprint: fingerprintBytes(path, source, 0o644),
+				targetFingerprint: fingerprintBytes(path, target, 0o644),
+				variants: [
+					{ kind: "file" as const, fingerprint: fingerprintBytes(path, source, 0o644), mode: 0o644, bytes: source },
+					{ kind: "file" as const, fingerprint: fingerprintBytes(path, target, 0o644), mode: 0o644, bytes: target },
+				],
+			})),
+		});
+		for (const [index, path] of paths.entries()) {
+			await mkdir(join(root, `dir-${String(index).padStart(3, "0")}`));
+			await writeFile(join(root, path), source);
+		}
+		expect(nativeRestoreCapability(pack)).toBe("restore-files-v3");
+		const native = await createNativeFileBatch({
+			workspaceRoot: root, planDigest, journal, requiredCapability: "restore-files-v3",
+		});
+		if (native === undefined) return context.skip();
+
+		await native.run(pack);
+		for (const path of paths) expect(await readFile(join(root, path))).toEqual(target);
+		await expect(recoverPackedMutations({
+			workspaceRoot: root, journal, planDigest, decision: "rollback",
+		})).resolves.toEqual({ kind: "clean" });
+		for (const path of paths) expect(await readFile(join(root, path))).toEqual(source);
+	});
+
 	it("verify-only 不修改 workspace 与 artifacts", async () => {
 		const value = await fixture();
 		if (value.native === undefined) return;
@@ -226,6 +269,10 @@ describe("native restore helper", () => {
 		await expect(createNativeFileBatch({
 			workspaceRoot: value.root, journal: value.journal, planDigest: value.planDigest,
 			executable, requiredCapability: "restore-files-v2",
+		})).resolves.toBeUndefined();
+		await expect(createNativeFileBatch({
+			workspaceRoot: value.root, journal: value.journal, planDigest: value.planDigest,
+			executable, requiredCapability: "restore-files-v3",
 		})).resolves.toBeUndefined();
 		await expect(lstat(join(dirname(value.journal.storagePath), "native-request-v1.json"))).rejects.toMatchObject({ code: "ENOENT" });
 	});

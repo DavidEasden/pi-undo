@@ -169,7 +169,7 @@ recovery_required
 
 普通文件原生恢复路径保留 5 次完整拓扑扫描。macOS/Linux 的新版 helper 使用不跟随符号链接的目录句柄扫描，仍会发现 Git 忽略目录中的嵌套仓库。小工作区根据上次扫描规模选择 TypeScript 完整重扫，避免进程启动开销；没有使用 TTL 缓存或默认跳过 `node_modules`。
 
-原生恢复现支持已有父目录中的普通文件删除，以及覆盖、创建、删除混合计划。扩展能力通过 `restore-files-v2` 探测；旧 helper、缺少二进制、目录操作及超出句柄预算的计划继续走 TypeScript 路径。pack 持久化、内容校验、no-clobber 与恢复依据均保留。
+原生恢复可处理已有父目录中的普通文件删除、覆盖、创建及混合计划。`restore-files-v2` 覆盖子目录删除和混合 mutation；`restore-files-v3` 会把分散在大量父目录中的文件拆成多个批次，每批最多打开 128 个非根父目录句柄。旧 helper、缺少二进制、目录操作、类型替换及单条路径深度超过句柄预算时继续走 TypeScript 路径。durable pack、逐项内容校验、no-clobber 与恢复依据均保留。
 
 本机 macOS arm64 的三次 undo 中位数：3,000 包／1 文件从 1,976 ms 降至 924 ms，10,000 包／1 文件从 5,857 ms 降至 2,755 ms；100 文件的子目录撤销从 517 ms 降至 180 ms，混合撤销从 711 ms 降至 186 ms。测量方法和限制见 [原生性能验证记录](docs/native-performance.md)。
 

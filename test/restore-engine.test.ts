@@ -11,6 +11,7 @@ import { MutationJournal } from "../src/mutation-journal.ts";
 import * as nativeRestore from "../src/native-restore.ts";
 import { nativeExecutable } from "../src/native-restore.ts";
 import { checkOperation, createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
+import { probeNativeCapability } from "../src/native-capabilities.ts";
 import { recoverPackedMutations } from "../src/packed-recovery.ts";
 import { RestoreEngine, type RestoreMutation } from "../src/restore-engine.ts";
 import type { ManifestId, RestorePath, SnapshotManifest } from "../src/model.ts";
@@ -615,7 +616,8 @@ describe("RestoreEngine", () => {
 		const current = await store.capture(await discovery.discover(workspace), paths);
 		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
 		await engine.prepareDurableRestore(current, target, paths);
-		expect(await engine.canReuseDurableSource(current, target, paths)).toBe(count === 128);
+		const supportsBatch = await probeNativeCapability(nativeExecutable()!, "restore-files-v3", storeRoot);
+		expect(await engine.canReuseDurableSource(current, target, paths)).toBe(count === 128 || supportsBatch);
 	});
 
 	it("预生成 cache pack 被改写时在 mutation 前回退 TypeScript", async () => {
