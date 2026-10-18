@@ -309,17 +309,22 @@ fn run_restore(request_path: &Path) -> Result<(), String> {
         }
         let operations = Arc::new(batch);
         if request.verify_only {
+            #[cfg(unix)]
             assert_parent_bindings(&workspace_parent, &parents)?;
             parallel(&operations, |entry| verify_source(&pack, entry))?;
             continue;
         }
 
+        #[cfg(unix)]
         assert_parent_bindings(&workspace_parent, &parents)?;
         parallel(&operations, |entry| create_target(&pack, entry))?;
+        #[cfg(unix)]
         assert_parent_bindings(&workspace_parent, &parents)?;
         parallel(&operations, |entry| capture_source(&pack, entry))?;
+        #[cfg(unix)]
         assert_parent_bindings(&workspace_parent, &parents)?;
         parallel_with_limit(&operations, 4, |entry| install_target(&pack, entry))?;
+        #[cfg(unix)]
         assert_parent_bindings(&workspace_parent, &parents)?;
         parallel(&operations, |entry| verify_installed(&pack, entry))?;
     }
