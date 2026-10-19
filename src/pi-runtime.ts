@@ -284,6 +284,12 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 			opId: operation.opId,
 			mutationJournal: journal.mutationJournal(operation.opId),
 			deferDurability: true,
+			onTiming: (phase, durationMs) => {
+				try {
+					phases.push({ phase, elapsedMs: Math.round(performance.now() - operationStarted) });
+					void durationMs;
+				} catch { /* 诊断回调不影响恢复。 */ }
+			},
 		}),
 		recoverPending: async () => {
 			await waitForFinalization();

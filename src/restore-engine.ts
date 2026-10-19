@@ -79,6 +79,8 @@ export interface RestoreApplyOptions {
 	readonly mutationJournal: MutationJournal;
 	readonly forceTargetArtifactSync?: boolean;
 	readonly deferDurability?: boolean;
+	/** 报告 apply 内部阶段耗时；回调异常不影响恢复结果。 */
+	readonly onTiming?: (phase: string, durationMs: number) => void;
 }
 
 export interface RestoreEngineOptions {
@@ -825,6 +827,7 @@ export class RestoreEngine {
 		}
 
 		let topologyBefore: RootTopology;
+		const t0 = performance.now();
 		try {
 			if (await this.assertWorkspaceRootIdentity() !== current.workspaceIdentity) {
 				throw new Error("restore workspace root 必须使用 canonical identity");
@@ -834,6 +837,8 @@ export class RestoreEngine {
 		} catch (error) {
 			rethrowOperationFailure(error);
 			return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
+		} finally {
+			reportRestoreTiming(options.onTiming, "apply.topologyPre", t0);
 		}
 		const [currentPaths, targetPaths] = prepared === undefined
 			? await allCompleted([
@@ -852,6 +857,7 @@ export class RestoreEngine {
 		} else if ((await options.mutationJournal.activeArtifacts()).size > 0) {
 			return { code: "recovery_required", verifiedPaths: 0, totalPaths: currentPaths.size };
 		}
+		const t1 = performance.now();
 		try {
 			// 兼容恢复路径会先在此窗口内补偿 pending mutations，因此只有非补偿路径可以跳过枚举入口的重复发现。
 			await this.assertCompleteVisibleSubset(
@@ -867,6 +873,8 @@ export class RestoreEngine {
 		} catch (error) {
 			rethrowOperationFailure(error);
 			return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
+		} finally {
+			reportRestoreTiming(options.onTiming, "apply.visiblePre", t1);
 		}
 		let durablePack: DurablePack | undefined;
 		if (
@@ -939,35 +947,27 @@ export class RestoreEngine {
 			this.canUseNativeFilePlan(plan, currentPaths, targetPaths)
 		) {
 			const result = await this.applyNativeFilePlan(
-				plan,
-				current,
-				target,
-				currentPaths,
-				targetPaths,
-				topologyBefore,
-				options,
-				durablePack,
-				nativeFileBatch.run,
+				plan, current, target, currentPaths, targetPaths, topologyBefore, options, durablePack, nativeFileBatch.run,
 			);
 			return result;
 		}
+		const t2 = performance.now();
 		try {
 			await this.prefetchCompleteRestoreBlobs(plan, current, target, currentPaths, targetPaths);
 		} catch (error) {
 			rethrowOperationFailure(error);
 			// 预取是性能优化；失败时继续走原有逐文件校验和可恢复 mutation 路径。
+		} finally {
+			reportRestoreTiming(options.onTiming, "apply.prefetch", t2);
 		}
 		const reusableTargetPaths = new Set(
 			[...targetPaths.keys()].filter((path) => !isPathAffectedByMutations(path, plan.deletePaths, plan.writePaths)),
 		);
+		const t3 = performance.now();
 		const preflight = await this.verifyKnownState(
-			current,
-			target,
-			currentPaths,
-			targetPaths,
-			plan.scopePaths,
-			reusableTargetPaths,
+			current, target, currentPaths, targetPaths, plan.scopePaths, reusableTargetPaths,
 		);
+		reportRestoreTiming(options.onTiming, "apply.preflight", t3);
 		if (!preflight.ok) {
 			return {
 				code: "restore_failed_safe",
@@ -994,34 +994,23 @@ export class RestoreEngine {
 			quarantine,
 		};
 		try {
-			await this.deletePlannedPaths(
-				target.manifestId,
-				targetPaths,
-				plan.deletePaths,
-				mutationContext,
-			);
+			const t4 = performance.now();
+			await this.deletePlannedPaths(target.manifestId, targetPaths, plan.deletePaths, mutationContext);
 			await this.writePlannedPaths(target.manifestId, targetPaths, plan.writePaths, mutationContext);
-
+			reportRestoreTiming(options.onTiming, "apply.mutation", t4);
+			const t5 = performance.now();
 			const topologyAfter = await this.discovery.discover(this.workspaceRoot, "restore-post");
 			assertUnchangedTopology(topologyBefore, topologyAfter);
 			await this.assertCompleteVisibleSubset(
-				topologyAfter,
-				[target],
-				options.mutationJournal,
-				{
-					topologyValidated: true,
-					scopePaths: plan.scopePaths,
-					ownedPaths: [targetPaths],
-				},
+				topologyAfter, [target], options.mutationJournal,
+				{ topologyValidated: true, scopePaths: plan.scopePaths, ownedPaths: [targetPaths] },
 			);
+			reportRestoreTiming(options.onTiming, "apply.topologyPost", t5);
+			const t6 = performance.now();
 			const verification = await this.verifyTarget(
-				target,
-				currentPaths,
-				targetPaths,
-				plan.deletePaths,
-				plan.scopePaths,
-				preflight.targetAttestations,
+				target, currentPaths, targetPaths, plan.deletePaths, plan.scopePaths, preflight.targetAttestations,
 			);
+			reportRestoreTiming(options.onTiming, "apply.verify", t6);
 			const result: RestoreResult = {
 				code: "ok",
 				verifiedPaths: verification.verifiedPaths,
@@ -1072,8 +1061,11 @@ export class RestoreEngine {
 		pack: DurablePack,
 		nativeRun: (pack: DurablePack) => Promise<void>,
 	): Promise<RestoreResult> {
+		const t0 = performance.now();
 		try {
 			await nativeRun(pack);
+			reportRestoreTiming(options.onTiming, "apply.nativeRun", t0);
+			const t1 = performance.now();
 			const topologyAfter = await this.discovery.discover(this.workspaceRoot, "restore-post");
 			assertUnchangedTopology(topologyBefore, topologyAfter);
 			await this.assertCompleteVisibleSubset(
@@ -1092,10 +1084,13 @@ export class RestoreEngine {
 					ownedPaths: [targetPaths],
 				},
 			);
+			reportRestoreTiming(options.onTiming, "apply.topologyPost", t1);
+			const t2 = performance.now();
 			const totalPaths = plan.deletePaths.length + plan.writePaths.length;
 			if ((await options.mutationJournal.load()).length !== 0) {
 				return { code: "recovery_required", verifiedPaths: 0, totalPaths };
 			}
+			reportRestoreTiming(options.onTiming, "apply.verifyNative", t2);
 			return { code: "ok", verifiedPaths: totalPaths, totalPaths };
 		} catch (error) {
 			if (isUnconfirmedExit(error)) throw error;
@@ -2163,6 +2158,14 @@ export class RestoreEngine {
 		}
 		return new Set(canonical);
 	}
+}
+
+function reportRestoreTiming(
+	onTiming: ((phase: string, durationMs: number) => void) | undefined,
+	phase: string,
+	startedAt: number,
+): void {
+	try { onTiming?.(phase, performance.now() - startedAt); } catch { /* 诊断回调不影响恢复结果。 */ }
 }
 
 function preparedPlanKey(plan: RestorePlan): string {
