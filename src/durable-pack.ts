@@ -166,8 +166,10 @@ export async function createDurablePack(
 ): Promise<DurablePack> {
 	const validationStarted = performance.now();
 	checkOperation();
-	if (input.opId !== journal.operationId) throw new Error("durable pack opId 与 mutation journal 不匹配");
-	assertDigest(input.planDigest, "planDigest");
+	const opId = input.opId;
+	const planDigest = input.planDigest;
+	if (opId !== journal.operationId) throw new Error("durable pack opId 与 mutation journal 不匹配");
+	assertDigest(planDigest, "planDigest");
 	const entries = canonicalEntries(input.entries);
 	reportDurablePackTiming(options, "pack.validate", validationStarted);
 	const encodingStarted = performance.now();
@@ -182,7 +184,8 @@ export async function createDurablePack(
 		variants: entry.variants.map((variant): PackedVariantHeader => {
 			if (variant.kind === "absent") return variant;
 			if (variant.kind === "symlink") return variant;
-			const bytes = Buffer.from(variant.bytes);
+			// canonicalEntries 已取得私有副本；编码、写入和驻留共享该副本。
+			const bytes = Buffer.from(variant.bytes.buffer, variant.bytes.byteOffset, variant.bytes.byteLength);
 			payloads.push(bytes);
 			const header = {
 				kind: "file" as const,
@@ -198,8 +201,8 @@ export async function createDurablePack(
 	}));
 	const headerPayload: PackHeaderPayload = {
 		schemaVersion: 1,
-		opId: input.opId,
-		planDigest: input.planDigest,
+		opId,
+		planDigest,
 		entries: headerEntries,
 	};
 	const header: PackHeader = {
@@ -245,7 +248,7 @@ export async function createDurablePack(
 	const packChecksum = digest.digest("hex");
 	reportDurablePackTiming(options, "pack.checksum", checksumStarted);
 	const residentStarted = performance.now();
-	const pack = durablePackFromInput(input.opId, input.planDigest, packPath, packChecksum, entries);
+	const pack = durablePackFromOwnedEntries(opId, planDigest, packPath, packChecksum, entries);
 	reportDurablePackTiming(options, "pack.resident", residentStarted);
 	try {
 		options.onDiagnostics?.({
@@ -500,7 +503,10 @@ function canonicalEntries(
 		if (entry.targetArtifact !== null) assertArtifact(entry.path, entry.targetArtifact, "target");
 		assertDigest(entry.sourceFingerprint, "sourceFingerprint");
 		if (entry.targetFingerprint !== null) assertDigest(entry.targetFingerprint, "targetFingerprint");
-		const variants = [...entry.variants].sort((left, right) => left.fingerprint.localeCompare(right.fingerprint));
+		// 在校验及任何回调、await 之前取得所有权；调用方之后改写输入不影响 pack。
+		const variants = entry.variants.map((variant): DurableLeafInput => variant.kind === "file"
+			? { ...variant, bytes: new Uint8Array(variant.bytes) }
+			: { ...variant }).sort((left, right) => left.fingerprint.localeCompare(right.fingerprint));
 		const fingerprints = new Set<string>();
 		for (const variant of variants) {
 			assertDigest(variant.fingerprint, "fingerprint");
@@ -595,7 +601,7 @@ function assertPackHeader(value: unknown): PackHeader {
 	return { ...payload, checksum: record.checksum };
 }
 
-function durablePackFromInput(
+function durablePackFromOwnedEntries(
 	opId: string,
 	planDigest: string,
 	storagePath: string,
@@ -614,12 +620,7 @@ function durablePackFromInput(
 				targetArtifact: entry.targetArtifact,
 				sourceFingerprint: entry.sourceFingerprint,
 				targetFingerprint: entry.targetFingerprint,
-				variants: new Map(entry.variants.map((variant) => [
-					variant.fingerprint,
-					variant.kind === "file"
-						? { ...variant, bytes: new Uint8Array(variant.bytes) }
-						: variant,
-				])),
+				variants: new Map(entry.variants.map((variant) => [variant.fingerprint, variant])),
 			},
 		])),
 	);

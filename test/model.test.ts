@@ -193,6 +193,15 @@ describe("canonicalJson", () => {
 		);
 	});
 
+	it("二进制 checksum 只读取 view 的有效区间，不改写调用方 buffer", () => {
+		for (const bytes of [new Uint8Array([9, 0, 1, 2, 255, 8]), Buffer.from([9, 0, 1, 2, 255, 8])]) {
+			const view = bytes.subarray(1, 5);
+			expect(checksum(view)).toBe("3d1f57c984978ef98a18378c8166c1cb8ede02c03eeb6aee7e2f121dfeee3e56");
+			expect(checksum(view.subarray(0, 0))).toBe("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+			expect([...bytes]).toEqual([9, 0, 1, 2, 255, 8]);
+		}
+	});
+
 	it("拒绝稀疏数组，避免规范编码静默改变数组内容", () => {
 		const sparse = new Array(1);
 

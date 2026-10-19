@@ -40,8 +40,8 @@ export function canonicalJson(value: unknown): string {
 }
 
 export function checksum(value: string | Uint8Array): string {
-	const input = typeof value === "string" ? value : Buffer.from(value);
-	return createHash("sha256").update(input).digest("hex");
+	// update 同步消费 Uint8Array 的有效区间，无需再复制完整 payload。
+	return createHash("sha256").update(value).digest("hex");
 }
 
 export function sameWorkspaceSnapshot(left: SnapshotManifest, right: SnapshotManifest): boolean {

@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 import { canonicalJson, checksum, ignoredPresentClosure } from "../src/encoding.ts";
-import { GitRunner, type GitRunOptions, type GitRunResult } from "../src/git-runner.ts";
+import { GitRunError, GitRunner, type GitRunOptions, type GitRunResult } from "../src/git-runner.ts";
 import type { ManifestId, SnapshotManifest } from "../src/model.ts";
 import { createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
 import { RootDiscovery, type RootDiscoveryReason, type RootTopology } from "../src/root-discovery.ts";
@@ -21,6 +21,7 @@ import {
 } from "./fixtures.ts";
 
 const temporaryRoots: string[] = [];
+const largeTreeScopeCount = process.platform === "win32" ? 512 : 4_096;
 
 afterEach(async () => {
 	await Promise.all(temporaryRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -76,6 +77,54 @@ class RecordingGitRunner extends GitRunner {
 
 	override run(args: readonly string[], options?: GitRunOptions): Promise<GitRunResult> {
 		this.calls.push({ args, options });
+		return super.run(args, options);
+	}
+}
+
+class ConcurrentBlobGitRunner extends RecordingGitRunner {
+	active = 0;
+	maximumActive = 0;
+	batchCalls = 0;
+	failFirst = false;
+	readonly firstFailed = deferred();
+	readonly secondStarted = deferred();
+	readonly releaseSecond = deferred();
+
+	override async run(args: readonly string[], options?: GitRunOptions): Promise<GitRunResult> {
+		if (args[0] !== "cat-file" || args[1] !== "--batch") return super.run(args, options);
+		const index = ++this.batchCalls;
+		this.maximumActive = Math.max(this.maximumActive, ++this.active);
+		try {
+			if (this.failFirst && index === 1) {
+				await this.secondStarted.promise;
+				this.firstFailed.resolve();
+				throw new Error("注入首个 blob 批次失败");
+			}
+			if (this.failFirst && index === 2) {
+				this.secondStarted.resolve();
+				await this.releaseSecond.promise;
+			}
+			return await super.run(args, options);
+		} finally {
+			this.active -= 1;
+		}
+	}
+}
+
+class TreeProbeGitRunner extends RecordingGitRunner {
+	probeResult: "normal" | "limit" | "failed" | "invalid" | "omitted" | "cancel" = "normal";
+
+	override async run(args: readonly string[], options?: GitRunOptions): Promise<GitRunResult> {
+		if (args[0] === "ls-tree" && args.includes("--name-only") && this.probeResult !== "normal") {
+			this.calls.push({ args, options });
+			if (this.probeResult === "limit" || this.probeResult === "failed") {
+				throw new GitRunError(this.probeResult === "limit" ? "git_output_limit" : "git_failed", "注入提示枚举失败");
+			}
+			if (this.probeResult === "cancel") {
+				return { ...successfulGitResult(Buffer.alloc(0)), killed: true, aborted: true };
+			}
+			return successfulGitResult(Buffer.from(this.probeResult === "invalid" ? "不完整" : "dir/a.txt\0"));
+		}
 		return super.run(args, options);
 	}
 }
@@ -1064,6 +1113,128 @@ describe("SnapshotStore", () => {
 		expect(objectChecks).toHaveLength(1);
 		expect(objectChecks[0]?.args).toEqual(["cat-file", "--batch-check"]);
 		expect(String(objectChecks[0]?.options?.stdin).trim().split("\n")).toHaveLength(3);
+	});
+
+	it.each(["完整目录", "部分目录", "整个 tree", "特殊路径"])("大 scope 合并精确覆盖的 %s，保留原 path ownership", async (scenario) => {
+		const workspace = await temporaryRoot("pi-undo-tree-scope-");
+		const storeRoot = await temporaryRoot("pi-undo-tree-scope-store-");
+		const parent = scenario === "特殊路径" ? "中文\t\n[dir]*" : "dir";
+		const a = scenario === "整个 tree" ? "a.txt" : `${parent}/a.txt`;
+		const b = scenario === "整个 tree" ? "b.txt" : `${parent}/b.txt`;
+		await writeFixtureFile(workspace, a, "a\n");
+		await writeFixtureFile(workspace, b, "b\n");
+		if (scenario !== "整个 tree") await writeFixtureFile(workspace, `${parent}-extra/keep.txt`, "keep\n");
+		const git = new RecordingGitRunner();
+		const store = new SnapshotStore({ storeRoot, git });
+		const manifest = await store.capture(await new RootDiscovery().discover(workspace));
+		const selected = scenario === "部分目录" ? [a] : [a, b];
+		const scope = [...selected, ...Array.from({ length: largeTreeScopeCount }, (_, i) => `${parent}/missing-${i}`)];
+		git.calls.length = 0;
+		const entries = await store.listTree(manifest.manifestId, ".", scope);
+		expect(entries.filter((entry) => entry.kind === "file").map((entry) => entry.relativePath)).toEqual(selected);
+		const queries = git.calls.filter((call) => call.args[0] === "ls-tree");
+		expect(queries).toHaveLength(2);
+		expect(queries[0]!.args).toContain("--name-only");
+		expect(queries[0]!.options?.stdoutLimit).toBeLessThanOrEqual(2 * 1024 * 1024);
+		if (scenario === "整个 tree") expect(queries[1]!.args).not.toContain("--");
+		else if (scenario === "部分目录") expect(queries[1]!.args).toContain(`:(top,literal)${a}`);
+		else expect(queries[1]!.args.slice(-2)).toEqual(["--", `:(top,literal)${parent}`]);
+		await store.assertComplete(manifest.manifestId, scope);
+		const blob = entries.find((entry) => entry.relativePath === a)!.blobId!;
+		await expect(store.readBlob(manifest.manifestId, ".", blob, `${parent}/missing-0`))
+			.rejects.toMatchObject({ code: "object_missing" });
+	});
+
+	it("稀疏 scope 不做提示枚举，范围外 blob 缺失不阻止目录合并", async () => {
+		const workspace = await temporaryRoot("pi-undo-tree-sparse-");
+		const storeRoot = await temporaryRoot("pi-undo-tree-sparse-store-");
+		await writeFixtureFile(workspace, "dir/a.txt", "a\n");
+		await writeFixtureFile(workspace, "outside.txt", "outside\n");
+		const git = new RecordingGitRunner();
+		const store = new SnapshotStore({ storeRoot, git });
+		const manifest = await store.capture(await new RootDiscovery().discover(workspace));
+		const outside = (await store.listTree(manifest.manifestId, ".")).find((entry) => entry.relativePath === "outside.txt")!;
+		git.calls.length = 0;
+		await store.listTree(manifest.manifestId, ".", ["dir/a.txt"]);
+		expect(git.calls.filter((call) => call.args[0] === "ls-tree")).toHaveLength(1);
+		expect(git.calls.some((call) => call.args.includes("--name-only"))).toBe(false);
+		const suffix = `/objects/${outside.blobId!.slice(0, 2)}/${outside.blobId!.slice(2)}`;
+		await rm(join(storeRoot, (await filesBelow(storeRoot)).find((path) => path.endsWith(suffix))!));
+		const scope = ["dir/a.txt", ...Array.from({ length: largeTreeScopeCount }, (_, i) => `dir/missing-${i}`)];
+		await expect(store.assertComplete(manifest.manifestId, scope)).resolves.toBeUndefined();
+	});
+
+	it.each(["limit", "failed", "invalid", "omitted", "cancel"] as const)(
+		"大 scope 的 %s 提示不扩大结果，取消不发起回退查询", async (fault) => {
+			const workspace = await temporaryRoot("pi-undo-tree-hint-");
+			const storeRoot = await temporaryRoot("pi-undo-tree-hint-store-");
+			await writeFixtureFile(workspace, "dir/a.txt", "a\n");
+			await writeFixtureFile(workspace, "dir/outside.txt", "outside\n");
+			const git = new TreeProbeGitRunner();
+			const store = new SnapshotStore({ storeRoot, git });
+			const manifest = await store.capture(await new RootDiscovery().discover(workspace));
+			const scope = ["dir/a.txt", ...Array.from({ length: largeTreeScopeCount }, (_, i) => `dir/missing-${i}`)];
+			git.calls.length = 0;
+			git.probeResult = fault;
+			if (fault === "cancel") {
+				await expect(store.listTree(manifest.manifestId, ".", scope)).rejects.toMatchObject({ code: "object_missing" });
+				expect(git.calls.filter((call) => call.args[0] === "ls-tree")).toHaveLength(1);
+			} else {
+				const entries = await store.listTree(manifest.manifestId, ".", scope);
+				expect(entries.filter((entry) => entry.kind === "file").map((entry) => entry.relativePath)).toEqual(["dir/a.txt"]);
+				const query = git.calls.filter((call) => call.args[0] === "ls-tree").at(-1)!;
+				if (fault !== "omitted") expect(query.args).toContain(":(top,literal)dir/a.txt");
+			}
+		},
+	);
+
+	it("小 blob 批次最多两路并行，失败等待在途批次且不启动剩余批次", async () => {
+		const workspace = await temporaryRoot("pi-undo-blob-concurrency-");
+		const storeRoot = await temporaryRoot("pi-undo-blob-concurrency-store-");
+		const paths = Array.from({ length: 4_100 }, (_, i) => `file-${i}.txt`);
+		for (let start = 0; start < paths.length; start += 32) {
+			await Promise.all(paths.slice(start, start + 32).map((path) => writeFixtureFile(workspace, path, path)));
+		}
+		const git = new ConcurrentBlobGitRunner();
+		const store = new SnapshotStore({ storeRoot, git });
+		const manifest = await store.capture(await new RootDiscovery().discover(workspace));
+		git.failFirst = true;
+		let settled = false;
+		const outcome = store.assertComplete(manifest.manifestId, paths).then(
+			() => { settled = true; return undefined; },
+			(error: unknown) => { settled = true; return error; },
+		);
+		try {
+			await git.firstFailed.promise;
+			expect(settled).toBe(false);
+			expect(git.maximumActive).toBe(2);
+		} finally {
+			git.releaseSecond.resolve();
+		}
+		expect(await outcome).toMatchObject({ code: "object_missing" });
+		expect(git.active).toBe(0);
+		expect(git.batchCalls).toBe(2);
+		git.failFirst = false;
+		await store.assertComplete(manifest.manifestId, paths);
+		expect(git.maximumActive).toBe(2);
+		expect(git.active).toBe(0);
+		const [entry] = await store.listTree(manifest.manifestId, ".", [paths[0]!]);
+		expect(await store.readBlob(manifest.manifestId, ".", entry!.blobId!, paths[0]))
+			.toEqual(new Uint8Array(Buffer.from(paths[0]!)));
+	}, 30_000);
+
+	it("包含大 payload 的 blob 批次保持串行，不提高在途字节预算", async () => {
+		const workspace = await temporaryRoot("pi-undo-blob-budget-");
+		const storeRoot = await temporaryRoot("pi-undo-blob-budget-store-");
+		const paths = ["a.bin", "b.bin", "c.bin"];
+		for (const [index, path] of paths.entries()) await writeFixtureFile(workspace, path, Buffer.alloc(9 * 1024 * 1024, index));
+		const git = new ConcurrentBlobGitRunner();
+		const store = new SnapshotStore({ storeRoot, git });
+		const manifest = await store.capture(await new RootDiscovery().discover(workspace));
+		await store.assertComplete(manifest.manifestId, paths);
+		expect(git.batchCalls).toBe(3);
+		expect(git.maximumActive).toBe(1);
+		expect(git.active).toBe(0);
 	});
 
 	it("scoped 完整性检查只预取冷 blob，缓存命中仍检查磁盘对象", async () => {

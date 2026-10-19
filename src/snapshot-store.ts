@@ -11,7 +11,7 @@ import {
 	ignoredPresentClosure,
 	topologyFingerprint,
 } from "./encoding.ts";
-import { GitRunner, type GitRunOptions } from "./git-runner.ts";
+import { GitRunError, GitRunner, type GitRunOptions } from "./git-runner.ts";
 import type {
 	DiscoveryRoot,
 	ManifestId,
@@ -35,6 +35,8 @@ const GC_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 const IGNORE_POLICY = "git-check-ignore-v1";
 const NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
 const TREE_CACHE_LIMIT = 256;
+const TREE_SCOPE_COMPACT_MIN_PATHS = process.platform === "win32" ? 512 : 4_096;
+const TREE_SCOPE_PROBE_MAX_BYTES = 2 * 1024 * 1024;
 const TREE_BLOB_MEMBERSHIP_LIMIT = 65_536;
 const HASH_BATCH_MAX_PATHS = process.platform === "win32" ? 128 : 2_048;
 const HASH_BATCH_MAX_ARGUMENT_BYTES = process.platform === "win32" ? 24 * 1024 : 128 * 1024;
@@ -1797,15 +1799,18 @@ export class SnapshotStore {
 		const key = `${gitDirectory}\0${treeId}\0${scope === undefined ? "*" : checksum(canonicalJson(scope))}`;
 		const cached = this.treeEntriesCache.get(key);
 		if (cached !== undefined) return cached;
-		const pending = this.runPrivateGitBytes(gitDirectory, [
-			"ls-tree",
-			"-r",
-			"-l",
-			"-z",
-			treeId,
-			...(scope === undefined ? [] : ["--", ...scope.map(literalPathspec)]),
-		]).then((output) => {
-			const entries = parseTreeEntries(output);
+		const pending = (async () => {
+			const queryScope = scope === undefined || scope.length < TREE_SCOPE_COMPACT_MIN_PATHS
+				? scope
+				: await this.compactTreeQueryScope(gitDirectory, treeId, scope);
+			const output = await this.runPrivateGitBytes(gitDirectory, [
+				"ls-tree", "-r", "-l", "-z", treeId,
+				...(queryScope === undefined ? [] : ["--", ...queryScope.map(literalPathspec)]),
+			]);
+			const scopeSet = queryScope === scope ? undefined : new Set(scope);
+			// 查询范围合并只是优化提示；缓存和 path ownership 仍受原始 scope 约束。
+			const entries = parseTreeEntries(output).filter((entry) =>
+				scopeSet === undefined || treeScopeContains(scopeSet, entry.relativePath));
 			for (const entry of entries) {
 				const membershipKey = treeBlobMembershipKey(gitDirectory, treeId, entry.relativePath);
 				this.treeBlobMembership.delete(membershipKey);
@@ -1817,7 +1822,7 @@ export class SnapshotStore {
 				this.treeBlobMembership.delete(oldest);
 			}
 			return entries;
-		});
+		})();
 		this.treeEntriesCache.set(key, pending);
 		while (this.treeEntriesCache.size > TREE_CACHE_LIMIT) {
 			const oldest = this.treeEntriesCache.keys().next().value as string | undefined;
@@ -1830,6 +1835,69 @@ export class SnapshotStore {
 			if (this.treeEntriesCache.get(key) === pending) this.treeEntriesCache.delete(key);
 			throw error;
 		}
+	}
+
+	private async compactTreeQueryScope(
+		gitDirectory: string,
+		treeId: string,
+		scope: readonly string[],
+	): Promise<readonly string[] | undefined> {
+		// 只探测 scope 的公共父目录，避免为合并路径而遍历无关子树。
+		let parent = scope[0]!.slice(0, Math.max(0, scope[0]!.lastIndexOf("/")));
+		for (const path of scope) {
+			while (parent !== "" && !path.startsWith(`${parent}/`)) {
+				parent = parent.slice(0, Math.max(0, parent.lastIndexOf("/")));
+			}
+		}
+		let output: Uint8Array;
+		try {
+			output = await this.runGitBytes([
+				"ls-tree", "-r", "--name-only", "-z", treeId,
+				...(parent === "" ? [] : ["--", literalPathspec(parent)]),
+			], {
+				env: privateObjectEnvironment(gitDirectory),
+				// 稀疏 scope 不应为优化提示枚举无界 tree；超限后使用原始精确查询。
+				stdoutLimit: Math.min(TREE_SCOPE_PROBE_MAX_BYTES,
+					Math.max(64 * 1024, scope.reduce((bytes, path) => bytes + Buffer.byteLength(path) + 1, 0) * 4)),
+			});
+		} catch (error) {
+			if (error instanceof GitRunError && (error.code === "git_output_limit" || error.code === "git_failed")) return scope;
+			throw error;
+		}
+		let paths: string[];
+		try {
+			paths = splitNulRecords(output).map((record) => relativeSafePath("/", decodeUtf8(record)));
+		} catch {
+			// 提示不能扩大校验范围：范围外的非法路径仍由原始精确查询处理。
+			return scope;
+		}
+		const included = new Set(scope);
+		const blocked = new Set<string>();
+		// 未探测的祖先不能用作合并目标。
+		if (parent !== "") {
+			blocked.add(".");
+			for (let end = parent.indexOf("/"); end >= 0; end = parent.indexOf("/", end + 1)) {
+				blocked.add(parent.slice(0, end));
+			}
+		}
+		for (const path of paths) {
+			if (treeScopeContains(included, path)) continue;
+			blocked.add(".");
+			for (let end = path.indexOf("/"); end >= 0; end = path.indexOf("/", end + 1)) {
+				blocked.add(path.slice(0, end));
+			}
+		}
+		if (!blocked.has(".")) return undefined;
+		const compacted = new Set<string>();
+		for (const path of scope) {
+			let candidate = path;
+			for (let end = path.indexOf("/"); end >= 0; end = path.indexOf("/", end + 1)) {
+				const parent = path.slice(0, end);
+				if (!blocked.has(parent)) { candidate = parent; break; }
+			}
+			compacted.add(candidate);
+		}
+		return [...compacted].sort(comparePaths);
 	}
 
 	private async assertObjectsComplete(
@@ -1888,7 +1956,12 @@ export class SnapshotStore {
 	}
 
 	private async readBlobBatches(gitDirectory: string, entries: readonly CapturedTreeEntry[]): Promise<void> {
-		for (const batch of blobReadBatches(entries)) {
+		const batches = blobReadBatches(entries);
+		// 只并行小批次：两个在途 payload 合计不超过原来的单批字节预算。
+		// 存在大批次或超限单文件时保持串行，失败后等待所有在途任务退出。
+		const concurrency = batches.every((batch) =>
+			batch.reduce((bytes, entry) => bytes + entry.size, 0) <= BLOB_BATCH_MAX_BYTES / 2) ? 2 : 1;
+		await mapConcurrentOrdered(batches, concurrency, async (batch) => {
 			const loaded = parseBatchBlobOutput(
 				await this.runGitBytes(["cat-file", "--batch"], {
 					env: privateObjectEnvironment(gitDirectory),
@@ -1897,7 +1970,7 @@ export class SnapshotStore {
 				batch,
 			);
 			for (const [objectId, bytes] of loaded) this.rememberBlobBytes(gitDirectory, objectId, bytes);
-		}
+		});
 	}
 
 	private async readBlobText(gitDirectory: string, objectId: string): Promise<string> {
@@ -2688,6 +2761,14 @@ function treeDirectoryPaths(entries: readonly CapturedTreeEntry[]): string[] {
 		previousPrefixes.length = Math.max(0, parts.length - 1);
 	}
 	return directories;
+}
+
+function treeScopeContains(scope: ReadonlySet<string>, path: string): boolean {
+	if (scope.has(".") || scope.has(path)) return true;
+	for (let end = path.indexOf("/"); end >= 0; end = path.indexOf("/", end + 1)) {
+		if (scope.has(path.slice(0, end))) return true;
+	}
+	return false;
 }
 
 function parseTreeEntries(output: Uint8Array): CapturedTreeEntry[] {

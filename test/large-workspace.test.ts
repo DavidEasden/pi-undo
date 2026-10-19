@@ -39,6 +39,7 @@ describe.skipIf(process.env.PI_UNDO_LARGE_WORKSPACE !== "1")("大型工作区真
 			]);
 			await harness.session.prompt("更新测试文件");
 			const timings: number[] = [];
+			const redoTimings: number[] = [];
 			const scans: number[] = [];
 			let peakRss = process.memoryUsage().rss;
 			const loopDelay = monitorEventLoopDelay({ resolution: 10 });
@@ -58,7 +59,11 @@ describe.skipIf(process.env.PI_UNDO_LARGE_WORKSPACE !== "1")("大型工作区真
 					for (const path of paths) expect(await readFile(join(temp.workspace, path), "utf8")).toBe("before\n");
 					expect(harness.runtime().controller.history()).toEqual({ undoCount: 0, redoCount: 1, locked: false });
 					await waitForRecoveryDrain(temp.sessionDir);
+					const redoStarted = performance.now();
 					await harness.session.prompt("/redo");
+					redoTimings.push(Math.round(performance.now() - redoStarted));
+					for (const path of paths) expect(await readFile(join(temp.workspace, path), "utf8")).toBe("after\n");
+					expect(harness.runtime().controller.history()).toEqual({ undoCount: 1, redoCount: 0, locked: false });
 					await waitForRecoveryDrain(temp.sessionDir);
 				}
 			} finally {
@@ -69,7 +74,7 @@ describe.skipIf(process.env.PI_UNDO_LARGE_WORKSPACE !== "1")("大型工作区真
 			const expectedScans = process.env.PI_UNDO_DISABLE_NATIVE === "1" ? 6 : 5;
 			expect(scans).toEqual([expectedScans, expectedScans, expectedScans]);
 			const report = JSON.stringify({
-				packages, changedFiles, timingsMs: timings, scans,
+				packages, changedFiles, timingsMs: timings, redoTimingsMs: redoTimings, scans,
 				nativeDisabled: process.env.PI_UNDO_DISABLE_NATIVE === "1",
 				medianMs: [...timings].sort((a, b) => a - b)[1],
 				peakRssMiB: Math.round(peakRss / 1024 / 1024),

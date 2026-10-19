@@ -93,6 +93,37 @@ describe("durable pack 批量写入", () => {
 		expect(pack.packChecksum).toBe(loaded.packChecksum);
 	});
 
+	it.each(["pack.validate", "pack.write"])("%s 后改写输入不影响磁盘、驻留与返回副本", async (phase) => {
+		const journal = await fixture();
+		const input = legacyInput();
+		const expected = legacyInput();
+		const pack = await createDurablePack(journal, input, {
+			onTiming: (label) => {
+				if (label !== phase) return;
+				for (const entry of input.entries) {
+					for (const variant of entry.variants) {
+						if (variant.kind === "file") variant.bytes.fill(0xff);
+						if (variant.kind === "symlink") Object.assign(variant, { linkText: "changed" });
+					}
+				}
+				Object.assign(input, { opId: "changed", planDigest: "f".repeat(64) });
+			},
+		});
+		expect(await readFile(pack.storagePath)).toEqual(await readFile(legacyUrl));
+		const loaded = await loadDurablePack(journal, expected.planDigest);
+		expect(pack.opId).toBe(expected.opId);
+		expect(pack.planDigest).toBe(expected.planDigest);
+		expect(pack.packChecksum).toBe(loaded.packChecksum);
+		for (const entry of expected.entries) {
+			for (const variant of entry.variants) {
+				const leaf = pack.leaf(entry.path, variant.fingerprint);
+				expect(leaf).toEqual(loaded.leaf(entry.path, variant.fingerprint));
+				if (leaf?.kind === "file") leaf.bytes.fill(0x7f);
+				expect(pack.leaf(entry.path, variant.fingerprint)).toEqual(loaded.leaf(entry.path, variant.fingerprint));
+			}
+		}
+	});
+
 	it("跨 buffer、buffer 内与边界短写均重试到完整 pack", async () => {
 		const journal = await fixture();
 		let calls = 0;
