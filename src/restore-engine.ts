@@ -127,6 +127,12 @@ interface VisibleSubsetCheck {
 	 * 枚举结束后的校验仍然执行，所以该窗口内的漂移依然被拒绝。
 	 */
 	readonly topologyValidated: boolean;
+	/**
+	 * 调用方持有工作区独占锁、且枚举前已通过 discover 确认 topology 未变化时为 true。
+	 * 允许跳过 listVisibleLeafPaths 结束后的二次 topology 校验（visible-paths-post 扫描），
+	 * 以避免对整个工作区进行冗余全量目录枚举。
+	 */
+	readonly skipPostTopologyCheck?: boolean;
 	readonly extraExclusions?: readonly string[];
 	readonly scopePaths?: readonly string[];
 	readonly ownedPaths?: readonly (ReadonlyMap<string, OwnedPath> | undefined)[];
@@ -1003,7 +1009,14 @@ export class RestoreEngine {
 			assertUnchangedTopology(topologyBefore, topologyAfter);
 			await this.assertCompleteVisibleSubset(
 				topologyAfter, [target], options.mutationJournal,
-				{ topologyValidated: true, scopePaths: plan.scopePaths, ownedPaths: [targetPaths] },
+				{
+					topologyValidated: true,
+					// assertUnchangedTopology 已确认 topologyAfter 与 topologyBefore 完全一致，
+					// 且 restore 在工作区独占锁内执行，无需再次全量扫描目录。
+					skipPostTopologyCheck: true,
+					scopePaths: plan.scopePaths,
+					ownedPaths: [targetPaths],
+				},
 			);
 			reportRestoreTiming(options.onTiming, "apply.topologyPost", t5);
 			const t6 = performance.now();
@@ -1074,6 +1087,9 @@ export class RestoreEngine {
 				options.mutationJournal,
 				{
 					topologyValidated: true,
+					// assertUnchangedTopology 已确认 topologyAfter 与 topologyBefore 完全一致，
+					// 且 restore 在工作区独占锁内执行，无需再次全量扫描目录。
+					skipPostTopologyCheck: true,
 					extraExclusions: pack.paths().flatMap((path) => {
 						const artifacts = pack.artifacts(path);
 						return artifacts === undefined
@@ -1916,6 +1932,7 @@ export class RestoreEngine {
 			excludePaths: exclusions.size === 0 ? undefined : [...exclusions],
 			includePaths: check.scopePaths,
 			topologyAlreadyValidated: check.topologyValidated,
+			skipPostTopologyCheck: check.skipPostTopologyCheck,
 		});
 		for (const path of livePaths) {
 			if (!allowedPaths.has(path)) {

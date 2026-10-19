@@ -243,6 +243,11 @@ export interface CaptureOptions {
 export interface VisibleLeafOptions extends CaptureOptions {
 	/** 未传时枚举整个工作区；空数组不枚举，目录路径包含其子树。 */
 	readonly includePaths?: readonly string[];
+	/**
+	 * 跳过枚举结束后的 topology 二次校验（visible-paths-post 扫描）。
+	 * 仅在调用方已持有工作区独占锁、且已在枚举前完成 discover 并确认 topology 未变化时传 true。
+	 */
+	readonly skipPostTopologyCheck?: boolean;
 }
 
 export interface SnapshotBlobRequest {
@@ -760,7 +765,9 @@ export class SnapshotStore {
 					result.add(workspaceRelativePath(root.relativeRoot, relativePath));
 				}
 			}
-			await this.assertTopology(topology, "可见路径枚举期间 topology 已变化", "visible-paths-post");
+			if (options.skipPostTopologyCheck !== true) {
+				await this.assertTopology(topology, "可见路径枚举期间 topology 已变化", "visible-paths-post");
+			}
 			return [...result].sort(comparePaths);
 		} catch (error) {
 			if (error instanceof SnapshotStoreError) throw error;

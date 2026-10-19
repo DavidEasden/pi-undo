@@ -886,14 +886,14 @@ describe("undo/redo restore performance", () => {
 
 			expect(result.code).toBe("ok");
 			expect(await readFile(join(workspace, "value.txt"), "utf8")).toBe("before\n");
-			expect(discovery.reasons.length).toBeLessThanOrEqual(5);
-			// 安全快照 1 次、恢复前 1 次，两次可见路径枚举各只保留枚举后的复核。
+			expect(discovery.reasons.length).toBeLessThanOrEqual(4);
+			// 安全快照 1 次、恢复前 1 次、恢复后 1 次。恢复后的 visible-paths-post 复核已被跳过：
+			// assertUnchangedTopology 已确认 topologyAfter 与 topologyBefore 一致，且 restore 在独占锁内执行。
 			expect(discovery.reasons).toEqual([
 				"safety-snapshot",
 				"restore-pre",
 				"visible-paths-post",
 				"restore-post",
-				"visible-paths-post",
 			]);
 		} finally {
 			await rm(workspace, { recursive: true, force: true });
