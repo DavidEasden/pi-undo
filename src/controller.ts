@@ -250,6 +250,8 @@ export class UndoControllerImpl implements UndoController {
 	private lastSettlementDiagnostic: SettlementDiagnostic | undefined;
 	private promptDeferralInFlight = false;
 	private lastSafetyManifestId: ManifestId | null = null;
+	/** restore 成功后记录的 target manifest；settled capture 可用它替代 warmUpManifest 作为 baseline。 */
+	private lastAppliedTargetManifest: SnapshotManifest | undefined;
 	private lastCaptureFailed = false;
 	private lastCaptureFailureMessage: string | undefined;
 	private warmUpInFlight: Promise<void> | undefined;
@@ -611,7 +613,7 @@ export class UndoControllerImpl implements UndoController {
 			// 撕裂捕获（并发写撞上断言窗口）是暂态的：短暂退避后重试一次，成功则不清空历史。
 			const after = await measure("settled.capture", () =>
 				this.captureSettledBaselineWithRetry(
-					staged.before,
+					this.lastAppliedTargetManifest ?? staged.before,
 					(diagnostic) => captureDiagnostics.push(diagnostic),
 					recordCaptureTiming,
 				));
@@ -1023,6 +1025,7 @@ export class UndoControllerImpl implements UndoController {
 				await this.dependencies.journal.markCommitted(descriptor.opId);
 			});
 			this.lastSafetyManifestId = rollback.manifestId;
+			this.lastAppliedTargetManifest = target;
 			return done(this.advanceHistory(action, checkpoint, { code: "ok", changedFiles: applied.verifiedPaths }));
 		} catch (error) {
 			if (this.recordUnsafeExit(error)) return done(this.recoveryResult());
