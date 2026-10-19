@@ -252,6 +252,8 @@ export class UndoControllerImpl implements UndoController {
 	private lastSafetyManifestId: ManifestId | null = null;
 	/** restore 成功后记录的 target manifest；settled capture 可用它替代 warmUpManifest 作为 baseline。 */
 	private lastAppliedTargetManifest: SnapshotManifest | undefined;
+	/** restore 完成时的 performance.now()（ms）；2s racy-clean 窗口内不使用 lastAppliedTargetManifest。 */
+	private lastAppliedTargetAt: number | undefined;
 	private lastCaptureFailed = false;
 	private lastCaptureFailureMessage: string | undefined;
 	private warmUpInFlight: Promise<void> | undefined;
@@ -575,8 +577,10 @@ export class UndoControllerImpl implements UndoController {
 	private async settleRun(run?: RunCompletion): Promise<void> {
 		const staged = this.staged;
 		const appliedTargetManifest = this.lastAppliedTargetManifest;
+		const appliedTargetAt = this.lastAppliedTargetAt;
 		this.staged = undefined;
 		this.lastAppliedTargetManifest = undefined;
+		this.lastAppliedTargetAt = undefined;
 		if (this.disposed || this.locked || staged === undefined) return;
 		if (staged.startEntryId === undefined || staged.startEntryId === null) {
 			// Pi 没有提供已落盘的 start entry ID，不能把后续 assistant 输出归属到该 checkpoint。
@@ -615,7 +619,12 @@ export class UndoControllerImpl implements UndoController {
 			// 撕裂捕获（并发写撞上断言窗口）是暂态的：短暂退避后重试一次，成功则不清空历史。
 			const after = await measure("settled.capture", () =>
 				this.captureSettledBaselineWithRetry(
-					appliedTargetManifest ?? staged.before,
+					// racy-clean 窗口（2s）内文件 ctime 未稳定，isBaselineFresh 必然失败且会多跑一轮
+					// collectVisibleLeaves；只有超过 2s 后才能从 target manifest 受益。
+					(appliedTargetManifest !== undefined && appliedTargetAt !== undefined &&
+						performance.now() - appliedTargetAt >= 2_000)
+						? appliedTargetManifest
+						: staged.before,
 					(diagnostic) => captureDiagnostics.push(diagnostic),
 					recordCaptureTiming,
 				));
@@ -1028,6 +1037,7 @@ export class UndoControllerImpl implements UndoController {
 			});
 			this.lastSafetyManifestId = rollback.manifestId;
 			this.lastAppliedTargetManifest = target;
+			this.lastAppliedTargetAt = performance.now();
 			return done(this.advanceHistory(action, checkpoint, { code: "ok", changedFiles: applied.verifiedPaths }));
 		} catch (error) {
 			if (this.recordUnsafeExit(error)) return done(this.recoveryResult());
