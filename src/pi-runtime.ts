@@ -80,6 +80,9 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 		}
 		return store.captureBaseline(topology, baseline, undefined, {
 			topologyAlreadyValidated: true,
+			// captureBaselineWithWorkspaceLock 已持有工作区独占锁，且此处刚完成 discover；
+			// post-capture topology 校验在锁内是冗余的，跳过以节省一次全量目录扫描。
+			skipPostTopologyCheck: true,
 			onDiagnostics,
 			onTiming,
 		});

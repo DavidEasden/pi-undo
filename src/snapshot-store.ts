@@ -234,6 +234,11 @@ export interface CaptureOptions {
 	 * 因此校验窗口内出现的漂移依然会被拒绝。仅限调用方与本次枚举之间没有文件变更时使用。
 	 */
 	readonly topologyAlreadyValidated?: boolean;
+	/**
+	 * 跳过捕获或枚举结束后的 topology 二次校验（safety-snapshot post 扫描）。
+	 * 仅在调用方已持有工作区独占锁、且刚刚完成 discover 并确认 topology 未变化时传 true。
+	 */
+	readonly skipPostTopologyCheck?: boolean;
 	/** 只报告数量和错误类型，不包含路径、文件内容或异常消息。 */
 	readonly onDiagnostics?: (diagnostic: CaptureDiagnostic) => void;
 	/** 报告 capture 内部 wall-time 阶段；回调失败不影响捕获。 */
@@ -243,11 +248,6 @@ export interface CaptureOptions {
 export interface VisibleLeafOptions extends CaptureOptions {
 	/** 未传时枚举整个工作区；空数组不枚举，目录路径包含其子树。 */
 	readonly includePaths?: readonly string[];
-	/**
-	 * 跳过枚举结束后的 topology 二次校验（visible-paths-post 扫描）。
-	 * 仅在调用方已持有工作区独占锁、且已在枚举前完成 discover 并确认 topology 未变化时传 true。
-	 */
-	readonly skipPostTopologyCheck?: boolean;
 }
 
 export interface SnapshotBlobRequest {
@@ -440,7 +440,9 @@ export class SnapshotStore {
 			const cacheUpdates = capturedRoots.flatMap((captured) =>
 				captured.cacheUpdate === undefined ? [] : [captured.cacheUpdate]);
 
-			await this.assertTopology(topology, "捕获期间 topology 已变化", "safety-snapshot");
+			if (options.skipPostTopologyCheck !== true) {
+				await this.assertTopology(topology, "捕获期间 topology 已变化", "safety-snapshot");
+			}
 			const content = {
 				schemaVersion: SCHEMA_VERSION as 1,
 				workspaceIdentity: topology.workspaceIdentity,
@@ -525,7 +527,9 @@ export class SnapshotStore {
 			}
 			if (baselineFresh) {
 				if (diagnostic !== undefined) diagnostic.strategy = "baseline-reused";
-				await this.assertTopology(topology, "捕获期间 topology 已变化", "safety-snapshot");
+				if (options.skipPostTopologyCheck !== true) {
+					await this.assertTopology(topology, "捕获期间 topology 已变化", "safety-snapshot");
+				}
 				await this.touchStore(this.storeDirectory(topology));
 				return baseline;
 			}
@@ -533,7 +537,7 @@ export class SnapshotStore {
 			if (diagnostic !== undefined) diagnostic.strategy = "baseline-fallback";
 			const fullCaptureStartedAt = performance.now();
 			try {
-				return await this.captureLocked(topology, scope, { ...options, topologyAlreadyValidated: true }, diagnostic);
+				return await this.captureLocked(topology, scope, { ...options, topologyAlreadyValidated: true, skipPostTopologyCheck: options.skipPostTopologyCheck }, diagnostic);
 			} finally {
 				publishCaptureTiming(options.onTiming, "settled.fullCapture", fullCaptureStartedAt);
 			}
