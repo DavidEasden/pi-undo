@@ -70,7 +70,7 @@ export interface RestoreResult {
 }
 
 export interface RestoreEngine {
-	plan(current: SnapshotManifest, target: SnapshotManifest, scopePaths?: readonly string[]): Promise<RestorePlan>;
+	plan(current: SnapshotManifest, target: SnapshotManifest, scopePaths?: readonly string[], options?: DurablePackPreparationOptions): Promise<RestorePlan>;
 	apply(plan: RestorePlan, target: SnapshotManifest, options?: RestoreApplyOptions): Promise<RestoreResult>;
 }
 
@@ -234,22 +234,30 @@ export class RestoreEngine {
 		current: SnapshotManifest,
 		target: SnapshotManifest,
 		scopePaths?: readonly string[],
+		options: DurablePackPreparationOptions = {},
 	): Promise<RestorePlan> {
+		const validationStarted = performance.now();
 		assertManifest(current);
 		assertManifest(target);
 		const scope = scopePaths === undefined ? undefined : this.canonicalScope(scopePaths);
 		const canonicalScopePaths = scope === undefined ? undefined : [...scope];
 		assertCompatibleManifests(current, target, scope);
 		const isScopedPath = (path: string): boolean => scope === undefined || scope.has(path);
+		reportDurablePackTiming(options, "plan.validate", validationStarted);
+		const completeStarted = performance.now();
 		await allCompleted([
 			this.store.assertComplete(current.manifestId, canonicalScopePaths),
 			this.store.assertComplete(target.manifestId, canonicalScopePaths),
 		]);
+		reportDurablePackTiming(options, "plan.complete", completeStarted);
 
+		const pathsStarted = performance.now();
 		const [currentPaths, targetPaths] = await allCompleted([
 			this.readOwnedPaths(current, canonicalScopePaths),
 			this.readOwnedPaths(target, canonicalScopePaths),
 		]);
+		reportDurablePackTiming(options, "plan.paths", pathsStarted);
+		const diffStarted = performance.now();
 		const targetIgnoredProof = new IgnoredProofIndex(ignoredWorkspacePaths(target));
 		const deleteByRoot = new Map<string, string[]>();
 		const writeByRoot = new Map<string, string[]>();
@@ -298,6 +306,7 @@ export class RestoreEngine {
 			planDigest: checksum(canonicalJson(semanticPlan)),
 		};
 		this.rememberPreparedPlan(plan, currentPaths, targetPaths);
+		reportDurablePackTiming(options, "plan.diff", diffStarted);
 		return plan;
 	}
 
@@ -362,7 +371,7 @@ export class RestoreEngine {
 		options: DurablePackPreparationOptions = {},
 	): Promise<void> {
 		const started = performance.now();
-		const plan = await this.plan(current, target, scopePaths);
+		const plan = await this.plan(current, target, scopePaths, options);
 		const prepared = this.takePreparedPlan(plan);
 		reportDurablePackTiming(options, "prepare.plan", started);
 		if (prepared === undefined || !this.canUseNativeFilePlan(plan, prepared.currentPaths, prepared.targetPaths)) return;

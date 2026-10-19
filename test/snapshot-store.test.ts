@@ -80,6 +80,24 @@ class RecordingGitRunner extends GitRunner {
 	}
 }
 
+class ScopedObjectGitRunner extends RecordingGitRunner {
+	afterCheck: (() => Promise<void>) | undefined;
+	transformBatch: ((output: Buffer) => Buffer) | undefined;
+
+	override async run(args: readonly string[], options?: GitRunOptions): Promise<GitRunResult> {
+		const result = await super.run(args, options);
+		if (args[0] === "cat-file" && args[1] === "--batch-check" && this.afterCheck !== undefined) {
+			const callback = this.afterCheck;
+			this.afterCheck = undefined;
+			await callback();
+		}
+		if (args[0] === "cat-file" && args[1] === "--batch" && this.transformBatch !== undefined) {
+			return successfulGitResult(this.transformBatch(Buffer.from(result.stdoutBytes)));
+		}
+		return result;
+	}
+}
+
 class MissingOnceBatchCheckGitRunner extends RecordingGitRunner {
 	missing = false;
 
@@ -1047,6 +1065,99 @@ describe("SnapshotStore", () => {
 		expect(objectChecks[0]?.args).toEqual(["cat-file", "--batch-check"]);
 		expect(String(objectChecks[0]?.options?.stdin).trim().split("\n")).toHaveLength(3);
 	});
+
+	it("scoped 完整性检查只预取冷 blob，缓存命中仍检查磁盘对象", async () => {
+		const workspace = await temporaryRoot("pi-undo-scoped-objects-");
+		const storeRoot = await temporaryRoot("pi-undo-scoped-objects-store-");
+		await writeFixtureFile(workspace, "a.txt", "first\n");
+		await writeFixtureFile(workspace, "b.txt", "second\n");
+		await writeFixtureFile(workspace, "same-as-b.txt", "second\n");
+		await writeFixtureFile(workspace, "outside.txt", "outside\n");
+		const git = new RecordingGitRunner();
+		const store = new SnapshotStore({ storeRoot, git });
+		const manifest = await store.capture(await new RootDiscovery().discover(workspace));
+		const entries = await store.listTree(manifest.manifestId, ".");
+		const a = entries.find((entry) => entry.relativePath === "a.txt")!;
+		const b = entries.find((entry) => entry.relativePath === "b.txt")!;
+		await store.readBlob(manifest.manifestId, ".", a.blobId!, "a.txt");
+		git.calls.length = 0;
+		const scope = ["a.txt", "b.txt", "same-as-b.txt"];
+		await store.assertComplete(manifest.manifestId, scope);
+		const check = git.calls.find((call) => call.args[1] === "--batch-check")!;
+		const read = git.calls.filter((call) => call.args[1] === "--batch");
+		expect(String(check.options?.stdin).trim().split("\n")).toEqual([manifest.roots[0]!.treeId, a.blobId]);
+		expect(read).toHaveLength(1);
+		expect(String(read[0]!.options?.stdin).trim().split("\n")).toEqual([b.blobId]);
+		expect(await store.readBlob(manifest.manifestId, ".", b.blobId!, "same-as-b.txt"))
+			.toEqual(new Uint8Array(Buffer.from("second\n")));
+		await expect(store.readBlob(manifest.manifestId, ".", b.blobId!, "a.txt"))
+			.rejects.toMatchObject({ code: "object_missing" });
+		git.calls.length = 0;
+		await store.assertComplete(manifest.manifestId, scope);
+		expect(git.calls.filter((call) => call.args[1] === "--batch")).toHaveLength(0);
+		const warmCheck = git.calls.find((call) => call.args[1] === "--batch-check")!;
+		expect(String(warmCheck.options?.stdin).trim().split("\n")).toEqual([manifest.roots[0]!.treeId, a.blobId, b.blobId]);
+	});
+
+	it.each([false, true])("scoped 检查不让内存 tree/blob 掩盖磁盘 blob 缺失，热缓存：%s", async (warm) => {
+		const workspace = await temporaryRoot("pi-undo-scoped-missing-");
+		const storeRoot = await temporaryRoot("pi-undo-scoped-missing-store-");
+		await writeFixtureFile(workspace, "a.txt", "first\n");
+		const store = new SnapshotStore({ storeRoot });
+		const manifest = await store.capture(await new RootDiscovery().discover(workspace));
+		const [entry] = await store.listTree(manifest.manifestId, ".", ["a.txt"]);
+		if (warm) await store.assertComplete(manifest.manifestId, ["a.txt"]);
+		const suffix = `/objects/${entry!.blobId!.slice(0, 2)}/${entry!.blobId!.slice(2)}`;
+		const object = (await filesBelow(storeRoot)).find((path) => path.endsWith(suffix));
+		expect(object).toBeDefined();
+		await rm(join(storeRoot, object!));
+		await expect(store.assertComplete(manifest.manifestId, ["a.txt"]))
+			.rejects.toMatchObject({ code: "object_missing" });
+	});
+
+	it("scoped 分组后即使并行读取填入缓存也不跳过本次冷 blob 校验", async () => {
+		const workspace = await temporaryRoot("pi-undo-scoped-race-");
+		const storeRoot = await temporaryRoot("pi-undo-scoped-race-store-");
+		await writeFixtureFile(workspace, "a.txt", "first\n");
+		const git = new ScopedObjectGitRunner();
+		const store = new SnapshotStore({ storeRoot, git });
+		const manifest = await store.capture(await new RootDiscovery().discover(workspace));
+		const [entry] = await store.listTree(manifest.manifestId, ".", ["a.txt"]);
+		const suffix = `/objects/${entry!.blobId!.slice(0, 2)}/${entry!.blobId!.slice(2)}`;
+		const object = (await filesBelow(storeRoot)).find((path) => path.endsWith(suffix))!;
+		git.afterCheck = async () => {
+			await store.readBlob(manifest.manifestId, ".", entry!.blobId!, "a.txt");
+			await rm(join(storeRoot, object));
+		};
+		await expect(store.assertComplete(manifest.manifestId, ["a.txt"]))
+			.rejects.toMatchObject({ code: "object_missing" });
+	});
+
+	it.each(["missing", "type", "id", "size", "truncated", "extra"] as const)(
+		"scoped 冷 blob 的 %s 响应被拒绝，失败后可重新校验", async (fault) => {
+			const workspace = await temporaryRoot("pi-undo-scoped-invalid-");
+			const storeRoot = await temporaryRoot("pi-undo-scoped-invalid-store-");
+			await writeFixtureFile(workspace, "a.txt", "first\n");
+			const git = new ScopedObjectGitRunner();
+			const store = new SnapshotStore({ storeRoot, git });
+			const manifest = await store.capture(await new RootDiscovery().discover(workspace));
+			git.transformBatch = (output) => {
+				const newline = output.indexOf(0x0a);
+				const [id, type, size] = output.subarray(0, newline).toString("utf8").split(" ");
+				if (fault === "missing") return Buffer.from(`${id} missing\n`);
+				if (fault === "truncated") return output.subarray(0, -2);
+				if (fault === "extra") return Buffer.concat([output, Buffer.from("unexpected\n")]);
+				const header = `${fault === "id" ? "0".repeat(id!.length) : id} ${fault === "type" ? "tree" : type} ${fault === "size" ? Number(size) + 1 : size}\n`;
+				return Buffer.concat([Buffer.from(header), output.subarray(newline + 1)]);
+			};
+			await expect(store.assertComplete(manifest.manifestId, ["a.txt"]))
+				.rejects.toMatchObject({ code: "object_missing" });
+			git.transformBatch = undefined;
+			git.calls.length = 0;
+			await store.assertComplete(manifest.manifestId, ["a.txt"]);
+			expect(git.calls.filter((call) => call.args[1] === "--batch")).toHaveLength(1);
+		},
+	);
 
 	it("batch-check 报告对象缺失时 assertComplete fail closed", async () => {
 		const workspace = await temporaryRoot("pi-undo-snapshot-");

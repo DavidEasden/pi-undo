@@ -5,9 +5,25 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import type { DurablePackWriteDiagnostic } from "../src/durable-pack.ts";
+import { GitRunner, type GitRunOptions, type GitRunResult } from "../src/git-runner.ts";
 import { RestoreEngine } from "../src/restore-engine.ts";
 import { RootDiscovery } from "../src/root-discovery.ts";
 import { SnapshotStore } from "../src/snapshot-store.ts";
+
+class MeasuredGitRunner extends GitRunner {
+	readonly stages = new Map<string, { calls: number; summedDurationMs: number }>();
+
+	override async run(args: readonly string[], options?: GitRunOptions): Promise<GitRunResult> {
+		const label = args[0] === "cat-file" ? `cat-file ${args[1]}` : args[0]!;
+		const started = performance.now();
+		try {
+			return await super.run(args, options);
+		} finally {
+			const previous = this.stages.get(label) ?? { calls: 0, summedDurationMs: 0 };
+			this.stages.set(label, { calls: previous.calls + 1, summedDurationMs: previous.summedDurationMs + performance.now() - started });
+		}
+	}
+}
 
 // 按需基准：准备时间不包含造数、capture、apply 和清理；不设墙钟断言。
 describe.skipIf(process.env.PI_UNDO_PACK_BENCHMARK !== "1")("durable pack 准备基准", () => {
@@ -37,9 +53,11 @@ describe.skipIf(process.env.PI_UNDO_PACK_BENCHMARK !== "1")("durable pack 准备
 			const after = await captureStore.capture(topology, paths);
 			for (let sample = 1; sample <= 3; sample += 1) {
 				// 冷缓存指新 SnapshotStore 的进程内缓存，不清除操作系统页缓存。
-				const store = new SnapshotStore({ storeRoot, discovery });
+				const git = new MeasuredGitRunner();
+				const store = new SnapshotStore({ storeRoot, discovery, git });
 				const restore = new RestoreEngine({ workspaceRoot: root, store, discovery });
 				for (const cache of ["cold", "warm"] as const) {
+					git.stages.clear();
 					const timings: Record<string, number> = {};
 					let diagnostic: DurablePackWriteDiagnostic | undefined;
 					const started = performance.now();
@@ -54,6 +72,8 @@ describe.skipIf(process.env.PI_UNDO_PACK_BENCHMARK !== "1")("durable pack 准备
 					console.log(JSON.stringify({
 						benchmark: "durable-pack-prepare", name, cache, sample, durationMs,
 						timings, ...diagnostic,
+						// 两侧对象库的 Git 命令会并行；累计耗时不能与 prepare wall-time 相加。
+						git: Object.fromEntries(git.stages),
 						rssMiB: process.memoryUsage().rss / 1024 / 1024,
 						// 这是整个测试进程的高水位，包含造数与 capture，不能归因于单次 prepare。
 						processPeakRssMiB: process.resourceUsage().maxRSS / 1024,

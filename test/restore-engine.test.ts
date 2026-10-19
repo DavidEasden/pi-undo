@@ -638,6 +638,7 @@ describe("RestoreEngine", () => {
 			entries: 1, fileVariants: 2, payloadBytes: 15, writeCalls: 1,
 		}));
 		expect(onTiming.mock.calls.map(([phase]) => phase)).toEqual([
+			"plan.validate", "plan.complete", "plan.paths", "plan.diff",
 			"prepare.plan", "prepare.blobs", "prepare.entries",
 			"pack.validate", "pack.encode", "pack.write", "pack.sync", "pack.publish", "pack.checksum", "pack.resident",
 			"prepare.pin", "prepare.index", "prepare.total",

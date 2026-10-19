@@ -30,6 +30,26 @@ PI_UNDO_PACK_BENCHMARK=1 npx vitest run test/durable-pack-benchmark.test.ts --re
 npx vitest run test/durable-pack.test.ts test/durable-pack-write.test.ts test/packed-recovery.test.ts test/native-restore.test.ts
 ```
 
+### Scoped plan 的冷 blob 校验复用
+
+plan 额外报告 `plan.validate`、`plan.complete`、`plan.paths`、`plan.diff` 四段计时，分别对应入口校验、对象完整性与预取、路径展开、差异与计划生成。它们属于 `prepare.plan` 内部阶段，不能重复累加。按需基准同时记录 Git 子命令的次数与累计耗时；新旧两侧查询可能并行，Git 累计耗时也不能直接当作 plan wall-time。
+
+带 scope 的完整性检查现在一次性将去重后的 blob 分为两组：缓存命中的 blob 与根 tree 继续用 `cat-file --batch-check` 检查磁盘；冷 blob 用原有按字节和数量分批的 `cat-file --batch` 同时完成校验与预取。每个读取响应仍验证 object ID、blob 类型、tree 中记录的长度、内容边界、条目顺序和无多余字节。冷 blob 不再先做一次仅查询类型/大小的检查，然后再读取相同对象。没有 scope 的完整性检查保持原来的完整 batch-check。
+
+分组后不再按缓存状态重新过滤读取列表，防止其他请求在窗口内填入缓存后跳过本次磁盘校验。热缓存中的内容不能掩盖磁盘 blob 丢失；失败仍抛出 `object_missing`。测试覆盖冷热缓存对象缺失、并发填充、重复 blob 去重、scope 与路径归属，以及 missing、错误类型/ID/长度、截断和额外输出。
+
+后续独立对比以 `29bdc0c7` 加相同分阶段诊断为基线，在两个 worktree 顺序运行相同基准，每组各三次。这里只比较本轮 scoped 校验变化，不与上面的批量写入收益累加：
+
+| 场景 | 本轮基线 | 校验复用后 |
+| --- | ---: | ---: |
+| 10,001 个小文件，冷缓存完整准备 | 2,386 ms | 2,079 ms（减少约 12.9%） |
+| 同上，仅 plan | 1,763 ms | 1,456 ms（减少约 17.4%） |
+| 10,001 个小文件，热缓存完整准备 | 1,160 ms | 1,168 ms |
+| 8 个大文件，冷缓存完整准备 | 281 ms | 281 ms |
+| 8 个大文件，热缓存完整准备 | 201 ms | 201 ms |
+
+小文件冷缓存三次完整准备耗时分别为基线 `[2370, 2386, 2401]`、优化后 `[2144, 2079, 2061]`。冷缓存仍有两次根 tree batch-check 和十次分块 blob 读取；减少的是两份检查请求中重复查询的 20,002 个 blob，不是省掉这些 blob 的读取与验证。热缓存仍完整检查全部所需对象，没有证明提速。测试进程整体峰值 RSS 约为基线 897 MiB、优化后 904 MiB，未证明内存改善；这仍包含造数、capture 和前序样本。
+
 ## 性能诊断与批次调优
 
 metadata inspect 默认每批最多处理 2,048 条路径，并受 1 MiB 路径请求字节上限约束。可使用 `PI_UNDO_METADATA_BATCH_MAX_PATHS=4096` 或 `8192` 做受控基准测试；有效范围为 1 到 8,192，超出范围会拒绝本次 capture。路径字节上限不会被环境变量覆盖，用于限制长路径工作区的单批请求规模。

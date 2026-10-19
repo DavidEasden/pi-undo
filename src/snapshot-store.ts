@@ -820,8 +820,7 @@ export class SnapshotStore {
 				)) {
 					throw new SnapshotStoreError("object_missing", "ignored-present proof 与 root tree 冲突");
 				}
-				await this.assertObjectsComplete(gitDirectory, root.treeId, entries);
-				if (scopePaths !== undefined) await this.preloadBlobBytes(gitDirectory, entries);
+				await this.assertObjectsComplete(gitDirectory, root.treeId, entries, scopePaths !== undefined);
 				if (rootScope === undefined && root.objectClosure !== treeObjectClosure(root.treeId, entries)) {
 					throw new SnapshotStoreError("object_missing", "root tree 对象闭包校验失败");
 				}
@@ -1837,10 +1836,23 @@ export class SnapshotStore {
 		gitDirectory: string,
 		treeId: string,
 		entries: readonly CapturedTreeEntry[],
+		preloadBlobs = false,
 	): Promise<void> {
+		const unique = new Map(entries.map((entry) => [entry.objectId, entry]));
+		const toRead: CapturedTreeEntry[] = [];
+		const toCheck: string[] = [];
+		for (const entry of unique.values()) {
+			if (preloadBlobs && !this.blobCache.has(blobCacheKey(gitDirectory, entry.objectId))) {
+				toRead.push(entry);
+			} else {
+				toCheck.push(entry.objectId);
+			}
+		}
+		// 冷 blob 由 --batch 的 ID、类型、长度和完整响应校验建立证据；
+		// 缓存命中的 blob 仍查磁盘，避免内存内容掩盖对象缺失。分组只做一次。
 		const expected = [
 			{ objectId: treeId, type: "tree" },
-			...[...new Set(entries.map((entry) => entry.objectId))].map((objectId) => ({ objectId, type: "blob" })),
+			...toCheck.map((objectId) => ({ objectId, type: "blob" })),
 		];
 		const output = await this.runGit(["cat-file", "--batch-check"], {
 			env: privateObjectEnvironment(gitDirectory),
@@ -1860,6 +1872,8 @@ export class SnapshotStore {
 				throw new Error(`Git object batch-check 校验失败：${object.objectId}`);
 			}
 		}
+		// 不重新按 cache 过滤：并行请求可能在分组后填入缓存，仍须完成本次读取校验。
+		await this.readBlobBatches(gitDirectory, toRead);
 	}
 
 	private async preloadBlobBytes(
@@ -1870,7 +1884,11 @@ export class SnapshotStore {
 		for (const entry of entries) {
 			if (!this.blobCache.has(blobCacheKey(gitDirectory, entry.objectId))) unique.set(entry.objectId, entry);
 		}
-		for (const batch of blobReadBatches([...unique.values()])) {
+		await this.readBlobBatches(gitDirectory, [...unique.values()]);
+	}
+
+	private async readBlobBatches(gitDirectory: string, entries: readonly CapturedTreeEntry[]): Promise<void> {
+		for (const batch of blobReadBatches(entries)) {
 			const loaded = parseBatchBlobOutput(
 				await this.runGitBytes(["cat-file", "--batch"], {
 					env: privateObjectEnvironment(gitDirectory),
