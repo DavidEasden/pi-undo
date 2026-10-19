@@ -72,8 +72,14 @@ describe.skipIf(process.env.PI_UNDO_LARGE_WORKSPACE !== "1")("大型工作区真
 			}
 			// 禁用原生时无法复用 durable source，重新捕获 safety snapshot 会多一次拓扑发现。
 			// Path1 优化：跳过独占锁内 restore 后的冗余 visible-paths-post 扫描，native 路径减少 1 次 discover。
-			const expectedScans = process.env.PI_UNDO_DISABLE_NATIVE === "1" ? 6 : 4;
-			expect(scans).toEqual([expectedScans, expectedScans, expectedScans]);
+			// Path2 优化：restore 成功后用 target manifest 作为 settled baseline，isBaselineFresh
+			// 命中时再减少 1 次 post-capture discover，因此每次扫描次数可能是 3 或 4。
+			const maxScans = process.env.PI_UNDO_DISABLE_NATIVE === "1" ? 6 : 4;
+			const minScans = process.env.PI_UNDO_DISABLE_NATIVE === "1" ? 6 : 3;
+			for (const scan of scans) {
+				expect(scan).toBeGreaterThanOrEqual(minScans);
+				expect(scan).toBeLessThanOrEqual(maxScans);
+			}
 			const report = JSON.stringify({
 				packages, changedFiles, timingsMs: timings, redoTimingsMs: redoTimings, scans,
 				nativeDisabled: process.env.PI_UNDO_DISABLE_NATIVE === "1",
