@@ -71,7 +71,8 @@ describe.skipIf(process.env.PI_UNDO_LARGE_WORKSPACE !== "1")("大型工作区真
 				loopDelay.disable();
 			}
 			// 禁用原生时无法复用 durable source，重新捕获 safety snapshot 会多一次拓扑发现。
-			const expectedScans = process.env.PI_UNDO_DISABLE_NATIVE === "1" ? 6 : 5;
+			// Path1 优化：跳过独占锁内 restore 后的冗余 visible-paths-post 扫描，native 路径减少 1 次 discover。
+			const expectedScans = process.env.PI_UNDO_DISABLE_NATIVE === "1" ? 6 : 4;
 			expect(scans).toEqual([expectedScans, expectedScans, expectedScans]);
 			const report = JSON.stringify({
 				packages, changedFiles, timingsMs: timings, redoTimingsMs: redoTimings, scans,
