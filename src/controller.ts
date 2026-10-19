@@ -574,7 +574,9 @@ export class UndoControllerImpl implements UndoController {
 
 	private async settleRun(run?: RunCompletion): Promise<void> {
 		const staged = this.staged;
+		const appliedTargetManifest = this.lastAppliedTargetManifest;
 		this.staged = undefined;
+		this.lastAppliedTargetManifest = undefined;
 		if (this.disposed || this.locked || staged === undefined) return;
 		if (staged.startEntryId === undefined || staged.startEntryId === null) {
 			// Pi 没有提供已落盘的 start entry ID，不能把后续 assistant 输出归属到该 checkpoint。
@@ -613,7 +615,7 @@ export class UndoControllerImpl implements UndoController {
 			// 撕裂捕获（并发写撞上断言窗口）是暂态的：短暂退避后重试一次，成功则不清空历史。
 			const after = await measure("settled.capture", () =>
 				this.captureSettledBaselineWithRetry(
-					this.lastAppliedTargetManifest ?? staged.before,
+					appliedTargetManifest ?? staged.before,
 					(diagnostic) => captureDiagnostics.push(diagnostic),
 					recordCaptureTiming,
 				));
