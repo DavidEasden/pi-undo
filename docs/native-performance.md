@@ -2,6 +2,34 @@
 
 本轮实现目录项缓存与 scoped restore 的可见路径检查，保留恢复前后的拓扑校验。目录扫描仍会逐个打开、核验工作区内的目录；缓存减少 `readdir`，没有把整次检查变成只访问 changedPaths 的增量操作。
 
+## Durable pack 准备与批量写入
+
+`createDurablePack` 的第三个参数和 `prepareDurableRestore` 的第四个参数支持可选的 `onTiming(phase, durationMs)` 与 `onDiagnostics(diagnostic)`。阶段标签包括 `prepare.plan`、`prepare.blobs`、`prepare.entries`、`pack.validate`、`pack.encode`、`pack.write`、`pack.sync`、`pack.publish`、`pack.checksum`、`pack.resident`、`prepare.pin`、`prepare.index` 和 `prepare.total`。其中 `prepare.total` 是完整准备时间，不能与各分阶段时间相加。默认 SnapshotStore 的 `prepare.plan` 包含对象完整性检查和 blob 预取；自定义 store 的兼容逐文件读取会计入 `prepare.entries`。计时在相应阶段成功结束时报告；没有可预制计划或发生异常时，不报告完整准备成功时间。
+
+数量诊断报告 entries、fileVariants、payloadBytes、packBytes 和 writeCalls，不包含路径、内容或 operation ID。writeCalls 统计实际发起的 FileHandle 写入调用，包含短写重试，不代表操作系统内部 syscall 数量。诊断回调异常不会改变生成结果；这些回调可供基准或调用方采集，默认不另行写入运行时诊断文件。
+
+写入使用最多 256 个 buffer、最多 4 MiB 的 `writev` 批次。单个大 header 或 payload 会切成视图分批写入，不拼接整包；空 payload 不发起写入。短写按实际写入字节数推进，覆盖 buffer 内、边界和跨 buffer 的情况；零进展、无效长度和 I/O 错误会失败。批次之间及发布前检查操作取消。持久化顺序仍为临时文件写完、文件同步并关闭、rename、父目录同步；发布前失败清理临时文件并保留已有 pack。
+
+v1 格式不变。`test/fixtures/durable-pack-v1.bin` 由本轮批量写入之前的串行写入器生成，SHA-256 为 `d11a4364cee3b347116cf8c3f6cc598baddc593b778f3ee81f24568546f57b4e`；测试验证旧文件可加载，并且新写入器对同一输入产生逐字节一致的文件。原有损坏 pack 拒绝加载、native restore 和 packed recovery 测试继续覆盖恢复流程。
+
+本机 macOS arm64 基准以 `a02dd580` 加入相同计时后的串行写入为基线，再只替换写入策略进行对比。每个场景冷、热缓存各三次，下面为完整 `prepareDurableRestore` 的中位数，单位毫秒；不包含造数、capture、apply 和清理。冷缓存指新 SnapshotStore/RestoreEngine 的进程内缓存，不清空操作系统页缓存；热缓存指同实例再次准备相同 pack。
+
+| 场景 | 串行写入 | 批量写入 | 变化 |
+| --- | ---: | ---: | ---: |
+| 10,001 个文件，每版本 64 字节，冷缓存 | 2,503 | 2,267 | 降低约 9.4% |
+| 同上，热缓存 | 1,310 | 1,075 | 降低约 17.9% |
+| 8 个文件，每版本 4 MiB，冷缓存 | 265 | 275 | 增加约 10 ms |
+| 同上，热缓存 | 187 | 196 | 增加约 9 ms |
+
+小文件的串行写入调用为 20,005 次，批量写入为 81 次；写入阶段从约 233–239 ms 降到约 6–11.5 ms。大文件从 19 次变为 17 次，没有证明性能改善。小文件三次完整准备耗时分别为：基线冷 `[2517, 2503, 2488]`、热 `[1311, 1278, 1310]`；批量冷 `[2321, 2196, 2267]`、热 `[1075, 1094, 1052]`。这些是本机合成基准，不设 CI 墙钟门槛，不等同于完整 undo/redo 的收益。
+
+基准还输出结束时 RSS 和整个测试进程的峰值 RSS；后者包含造数、capture 和所有前序样本，不能当作单次 prepare 的峰值。本批次整体高水位约为基线 824 MiB、批量 932 MiB，未证明内存改善。本轮只限制单次写入规模，仍保留原有的整批 payload 持有和复制策略，未实现流式 pack 构建。
+
+```bash
+PI_UNDO_PACK_BENCHMARK=1 npx vitest run test/durable-pack-benchmark.test.ts --reporter=verbose
+npx vitest run test/durable-pack.test.ts test/durable-pack-write.test.ts test/packed-recovery.test.ts test/native-restore.test.ts
+```
+
 ## 性能诊断与批次调优
 
 metadata inspect 默认每批最多处理 2,048 条路径，并受 1 MiB 路径请求字节上限约束。可使用 `PI_UNDO_METADATA_BATCH_MAX_PATHS=4096` 或 `8192` 做受控基准测试；有效范围为 1 到 8,192，超出范围会拒绝本次 capture。路径字节上限不会被环境变量覆盖，用于限制长路径工作区的单批请求规模。

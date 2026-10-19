@@ -13,6 +13,8 @@ import {
 	publishCachedDurablePack,
 	publishResidentDurablePack,
 	removeDurablePack,
+	reportDurablePackTiming,
+	type DurablePackPreparationOptions,
 	type DurableLeafInput,
 	type DurablePack,
 	type DurablePackEntryInput,
@@ -357,9 +359,12 @@ export class RestoreEngine {
 		current: SnapshotManifest,
 		target: SnapshotManifest,
 		scopePaths: readonly string[],
+		options: DurablePackPreparationOptions = {},
 	): Promise<void> {
+		const started = performance.now();
 		const plan = await this.plan(current, target, scopePaths);
 		const prepared = this.takePreparedPlan(plan);
+		reportDurablePackTiming(options, "prepare.plan", started);
 		if (prepared === undefined || !this.canUseNativeFilePlan(plan, prepared.currentPaths, prepared.targetPaths)) return;
 		const cacheRoot = await this.store.durableCacheDirectory();
 		const cacheOpId = `cache-${plan.planDigest}`;
@@ -378,8 +383,10 @@ export class RestoreEngine {
 				prepared.targetPaths,
 				plan,
 				cacheOpId,
+				options,
 			),
-		});
+		}, options);
+		const pinStarted = performance.now();
 		const pinReason = `durable-cache:${plan.planDigest}`;
 		const pinned: ManifestId[] = [];
 		try {
@@ -392,6 +399,8 @@ export class RestoreEngine {
 			await rm(dirname(pack.storagePath), { recursive: true, force: true }).catch(() => {});
 			throw error;
 		}
+		reportDurablePackTiming(options, "prepare.pin", pinStarted);
+		const indexStarted = performance.now();
 		await this.rememberDurablePack(
 			plan.planDigest,
 			current,
@@ -401,6 +410,8 @@ export class RestoreEngine {
 			pinReason,
 		);
 		this.rememberPreparedPlan(plan, prepared.currentPaths, prepared.targetPaths);
+		reportDurablePackTiming(options, "prepare.index", indexStarted);
+		reportDurablePackTiming(options, "prepare.total", started);
 	}
 
 	private async rememberDurablePack(
@@ -1104,7 +1115,9 @@ export class RestoreEngine {
 		targetPaths: ReadonlyMap<string, OwnedPath>,
 		plan: RestorePlan,
 		opId: string,
+		options: DurablePackPreparationOptions = {},
 	): Promise<DurablePackEntryInput[]> {
+		const blobsStarted = performance.now();
 		const paths = [...new Set([...plan.deletePaths, ...plan.writePaths])].sort(comparePaths);
 		const useValidatedBatch = SnapshotStore.supportsValidatedBlobBatch(this.store);
 		const [currentBlobBytes, targetBlobBytes] = useValidatedBatch
@@ -1113,6 +1126,8 @@ export class RestoreEngine {
 				this.readDurableBlobBytes(target.manifestId, paths, targetPaths),
 			])
 			: [new Map<string, Uint8Array>(), new Map<string, Uint8Array>()];
+		reportDurablePackTiming(options, "prepare.blobs", blobsStarted);
+		const entriesStarted = performance.now();
 		const result: DurablePackEntryInput[] = [];
 		for (const path of paths) {
 			const variants = new Map<string, DurableLeafInput>();
@@ -1141,6 +1156,7 @@ export class RestoreEngine {
 				variants: [...variants.values()],
 			});
 		}
+		reportDurablePackTiming(options, "prepare.entries", entriesStarted);
 		return result;
 	}
 

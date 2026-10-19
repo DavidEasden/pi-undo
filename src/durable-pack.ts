@@ -5,12 +5,15 @@ import { dirname, join, resolve } from "node:path";
 import { fsyncDirectory, fsyncFile } from "./atomic-fs.ts";
 import { canonicalJson, checksum } from "./encoding.ts";
 import type { MutationJournal } from "./mutation-journal.ts";
+import { checkOperation } from "./operation-context.ts";
 import { assertNoSymlinkEscape, relativeSafePath } from "./path-safety.ts";
 import { fingerprintAbsent, fingerprintBytes, fingerprintFile, fingerprintLeaf, fingerprintSymlink } from "./quarantine.ts";
 
 const PACK_FILE = "durable-pack-v1.bin";
 const MAGIC = Buffer.from("PIUNDO-PACK-V1\0", "ascii");
 const MAX_HEADER_BYTES = 16 * 1024 * 1024;
+const WRITE_BATCH_MAX_BYTES = 4 * 1024 * 1024;
+const WRITE_BATCH_MAX_BUFFERS = 256;
 const FINALIZE_CONCURRENCY = 32;
 
 export type DurableLeafInput =
@@ -31,6 +34,29 @@ export interface DurablePackInput {
 	readonly opId: string;
 	readonly planDigest: string;
 	readonly entries: readonly DurablePackEntryInput[];
+}
+
+export interface DurablePackPreparationOptions {
+	/** 阶段计时不包含路径或内容；回调异常不影响 pack 生成。 */
+	readonly onTiming?: (phase: string, durationMs: number) => void;
+	/** 成功生成 pack 后报告数量；writeCalls 是实际发起的写入调用次数（含短写重试）。 */
+	readonly onDiagnostics?: (diagnostic: DurablePackWriteDiagnostic) => void;
+}
+
+export interface DurablePackWriteDiagnostic {
+	readonly entries: number;
+	readonly fileVariants: number;
+	readonly payloadBytes: number;
+	readonly packBytes: number;
+	readonly writeCalls: number;
+}
+
+export function reportDurablePackTiming(
+	options: DurablePackPreparationOptions,
+	phase: string,
+	startedAt: number,
+): void {
+	try { options.onTiming?.(phase, performance.now() - startedAt); } catch { /* 诊断失败不能改变事务结果。 */ }
 }
 
 interface PackedVariantHeader {
@@ -136,10 +162,15 @@ export function durablePackPath(journal: MutationJournal): string {
 export async function createDurablePack(
 	journal: MutationJournal,
 	input: DurablePackInput,
+	options: DurablePackPreparationOptions = {},
 ): Promise<DurablePack> {
+	const validationStarted = performance.now();
+	checkOperation();
 	if (input.opId !== journal.operationId) throw new Error("durable pack opId 与 mutation journal 不匹配");
 	assertDigest(input.planDigest, "planDigest");
 	const entries = canonicalEntries(input.entries);
+	reportDurablePackTiming(options, "pack.validate", validationStarted);
+	const encodingStarted = performance.now();
 	const payloads: Buffer[] = [];
 	let offset = 0;
 	const headerEntries: PackedEntryHeader[] = entries.map((entry) => ({
@@ -181,30 +212,51 @@ export async function createDurablePack(
 	lengthBytes.writeUInt32BE(headerBytes.length);
 	const packPath = durablePackPath(journal);
 	const temporary = join(dirname(packPath), `.${PACK_FILE}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`);
+	reportDurablePackTiming(options, "pack.encode", encodingStarted);
+	let writeCalls = 0;
 	let handle;
 	try {
+		const writeStarted = performance.now();
 		handle = await open(temporary, "wx", 0o600);
-		await writeAll(handle, MAGIC);
-		await writeAll(handle, lengthBytes);
-		await writeAll(handle, headerBytes);
-		for (const payload of payloads) await writeAll(handle, payload);
+		writeCalls = await writeAll(handle, [MAGIC, lengthBytes, headerBytes, ...payloads]);
+		reportDurablePackTiming(options, "pack.write", writeStarted);
+		checkOperation();
+		const syncStarted = performance.now();
 		await handle.sync();
 		await handle.close();
 		handle = undefined;
+		reportDurablePackTiming(options, "pack.sync", syncStarted);
+		const publishStarted = performance.now();
+		checkOperation();
 		await rename(temporary, packPath);
 		await fsyncDirectory(dirname(packPath));
+		reportDurablePackTiming(options, "pack.publish", publishStarted);
 	} catch (error) {
 		await handle?.close().catch(() => {});
 		await rm(temporary, { force: true }).catch(() => {});
 		throw error;
 	}
+	const checksumStarted = performance.now();
 	const digest = createHash("sha256");
 	digest.update(MAGIC);
 	digest.update(lengthBytes);
 	digest.update(headerBytes);
 	for (const payload of payloads) digest.update(payload);
 	const packChecksum = digest.digest("hex");
-	return durablePackFromInput(input.opId, input.planDigest, packPath, packChecksum, entries);
+	reportDurablePackTiming(options, "pack.checksum", checksumStarted);
+	const residentStarted = performance.now();
+	const pack = durablePackFromInput(input.opId, input.planDigest, packPath, packChecksum, entries);
+	reportDurablePackTiming(options, "pack.resident", residentStarted);
+	try {
+		options.onDiagnostics?.({
+			entries: entries.length,
+			fileVariants: payloads.length,
+			payloadBytes: offset,
+			packBytes: MAGIC.length + lengthBytes.length + headerBytes.length + offset,
+			writeCalls,
+		});
+	} catch { /* 诊断失败不能改变事务结果。 */ }
+	return pack;
 }
 
 export async function loadDurablePack(
@@ -573,13 +625,48 @@ function durablePackFromInput(
 	);
 }
 
-async function writeAll(handle: FileHandle, bytes: Uint8Array): Promise<void> {
-	let offset = 0;
-	while (offset < bytes.byteLength) {
-		const { bytesWritten } = await handle.write(bytes, offset, bytes.byteLength - offset);
-		if (bytesWritten <= 0) throw new Error("durable pack 写入未推进");
-		offset += bytesWritten;
+async function writeAll(handle: FileHandle, buffers: readonly Uint8Array[]): Promise<number> {
+	let calls = 0;
+	let batch: Uint8Array[] = [];
+	let batchBytes = 0;
+	const flush = async (): Promise<void> => {
+		let remaining = batch;
+		let remainingBytes = batchBytes;
+		while (remaining.length > 0) {
+			checkOperation();
+			calls += 1;
+			const { bytesWritten } = await handle.writev(remaining);
+			if (!Number.isSafeInteger(bytesWritten) || bytesWritten <= 0 || bytesWritten > remainingBytes) {
+				throw new Error("durable pack 写入未推进或返回无效长度");
+			}
+			remainingBytes -= bytesWritten;
+			// 短写可能停在任意 buffer 内，也可能跨过多个 buffer。
+			let consumed = bytesWritten;
+			let index = 0;
+			while (index < remaining.length && consumed >= remaining[index]!.byteLength) {
+				consumed -= remaining[index]!.byteLength;
+				index += 1;
+			}
+			remaining = remaining.slice(index);
+			if (consumed > 0) remaining[0] = remaining[0]!.subarray(consumed);
+		}
+		batch = [];
+		batchBytes = 0;
+	};
+	for (const bytes of buffers) {
+		let offset = 0;
+		while (offset < bytes.byteLength) {
+			const length = Math.min(bytes.byteLength - offset, WRITE_BATCH_MAX_BYTES - batchBytes);
+			batch.push(bytes.subarray(offset, offset + length));
+			batchBytes += length;
+			offset += length;
+			if (batchBytes === WRITE_BATCH_MAX_BYTES || batch.length === WRITE_BATCH_MAX_BUFFERS) {
+				await flush();
+			}
+		}
 	}
+	await flush();
+	return calls;
 }
 
 function assertArtifact(path: string, artifact: string, role: "source" | "target"): void {

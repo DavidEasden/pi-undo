@@ -620,6 +620,36 @@ describe("RestoreEngine", () => {
 		expect(await engine.canReuseDurableSource(current, target, paths)).toBe(count === 128 || supportsBatch);
 	});
 
+	it("durable pack 准备报告分阶段计时与写入数量", async () => {
+		const workspace = await temporaryRoot("pi-undo-pack-diagnostics-");
+		const storeRoot = await temporaryRoot("pi-undo-pack-diagnostics-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		await writeFile(workspace, "a.txt", "target\n");
+		const topology = await discovery.discover(workspace);
+		const target = await store.capture(topology);
+		await writeFile(workspace, "a.txt", "current\n");
+		const current = await store.capture(topology, ["a.txt"]);
+		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+		const onTiming = vi.fn<(phase: string, durationMs: number) => void>();
+		const onDiagnostics = vi.fn();
+		await engine.prepareDurableRestore(current, target, ["a.txt"], { onTiming, onDiagnostics });
+		expect(onDiagnostics).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+			entries: 1, fileVariants: 2, payloadBytes: 15, writeCalls: 1,
+		}));
+		expect(onTiming.mock.calls.map(([phase]) => phase)).toEqual([
+			"prepare.plan", "prepare.blobs", "prepare.entries",
+			"pack.validate", "pack.encode", "pack.write", "pack.sync", "pack.publish", "pack.checksum", "pack.resident",
+			"prepare.pin", "prepare.index", "prepare.total",
+		]);
+		expect(onTiming.mock.calls.every(([, ms]) => Number.isFinite(ms) && ms >= 0)).toBe(true);
+		// 诊断不改变计划与已发布 cache pack。
+		const plan = await engine.plan(current, target, ["a.txt"]);
+		expect(await hasDurablePack(new MutationJournal(
+			join(storeRoot, "durable-cache", plan.planDigest, "mutations.jsonl"), `cache-${plan.planDigest}`,
+		))).toBe(true);
+	});
+
 	it("预生成 cache pack 被改写时在 mutation 前回退 TypeScript", async () => {
 		const workspace = await temporaryRoot("pi-undo-cache-tamper-workspace-");
 		await writeFile(workspace, "a.txt", "target\n");
