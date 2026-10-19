@@ -54,6 +54,7 @@ export type RootDiscoveryReason =
 	| "visible-paths-post"
 	| "restore-post"
 	| "compensation"
+	| "settled-capture"
 	| "unspecified";
 
 export type RootDiscoveryErrorCode = "workspace_not_found" | "discovery_failed";

@@ -119,11 +119,9 @@ describe("真实 pi 1.2.0 SDK", () => {
 		const gate = new Promise<void>((resolve) => { releaseGate = resolve; });
 		let markPreparing: () => void = () => {};
 		const preparing = new Promise<void>((resolve) => { markPreparing = resolve; });
-		let discoverCalls = 0;
 		RootDiscovery.prototype.discover = async function (...args: Parameters<typeof originalDiscover>) {
-			discoverCalls += 1;
-			// 前两次是两轮的输入前 capture，第三次是第二轮的 settled capture。
-			if (discoverCalls === 3) {
+			// settled capture 入口用专属 reason "settled-capture"，与输入前 capture 区分。
+			if (args[1] === "settled-capture") {
 				markPreparing();
 				await gate;
 			}
@@ -265,15 +263,11 @@ describe("真实 pi 1.2.0 SDK", () => {
 			const gate = new Promise<void>((resolve) => { releaseGate = resolve; });
 			const gated = new Promise<void>((resolve) => { markGated = resolve; });
 			let secondRunStarted = false;
-			let secondDiscoverCalls = 0;
 			RootDiscovery.prototype.discover = async function (...args: Parameters<typeof originalDiscover>) {
-				if (secondRunStarted && args[1] === undefined) {
-					secondDiscoverCalls += 1;
-					// 输入前 capture 后，第二次 discovery 是 settled capture。
-					if (secondDiscoverCalls === 2) {
-						markGated();
-						await gate;
-					}
+				// settled capture 入口用专属 reason "settled-capture"，与输入前 capture 区分。
+				if (secondRunStarted && args[1] === "settled-capture") {
+					markGated();
+					await gate;
 				}
 				return originalDiscover.apply(this, args);
 			};
@@ -294,7 +288,6 @@ describe("真实 pi 1.2.0 SDK", () => {
 
 				// 等到第二轮 settled capture 被阻塞，此时用户立即输入 undo。
 				await Promise.race([gated, delay(5_000)]);
-				expect(secondDiscoverCalls).toBe(2);
 				expect(await readValue(temp.workspace)).toBe("intermediate\n");
 
 				// 放开 gate，允许第二轮检查点入栈；undo 应等待并撤回第二轮（intermediate → after）。

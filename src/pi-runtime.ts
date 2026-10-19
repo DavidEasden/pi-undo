@@ -61,7 +61,12 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 		if (topology.workspaceIdentity !== initialTopology.workspaceIdentity) {
 			throw new Error("workspace_identity_changed: workspace root canonical path changed; run /undo-recover");
 		}
-		return store.capture(topology, scopePaths, { topologyAlreadyValidated: true });
+		return store.capture(topology, scopePaths, {
+			topologyAlreadyValidated: true,
+			// captureWithWorkspaceLock 已持有工作区独占锁，且此处刚完成 discover；
+			// post-capture topology 校验在锁内是冗余的，跳过以节省一次全量目录扫描。
+			skipPostTopologyCheck: true,
+		});
 	};
 	const captureBaseline = async (
 		baseline: SnapshotManifest,
@@ -71,7 +76,7 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 		const discoveryStartedAt = performance.now();
 		let topology: RootTopology;
 		try {
-			topology = await discovery.discover(context.cwd);
+			topology = await discovery.discover(context.cwd, "settled-capture");
 		} finally {
 			try { onTiming?.("settled.rootDiscovery", performance.now() - discoveryStartedAt); } catch { /* diagnostics must not affect capture */ }
 		}
