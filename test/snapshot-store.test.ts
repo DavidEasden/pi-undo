@@ -227,7 +227,9 @@ class MutatingManifestAfterBlobReadGitRunner extends GitRunner {
 
 	override async run(args: readonly string[], options?: GitRunOptions): Promise<GitRunResult> {
 		const result = await super.run(args, options);
-		if (!this.mutated && this.manifestPath !== undefined && args[0] === "cat-file" && args[1] === "blob") {
+		// 单个 blob 与批量 --batch 读取都属于 blob 读取；两种形式都要复现并发篡改窗口。
+		const readsBlob = args[0] === "cat-file" && (args[1] === "blob" || args[1] === "--batch");
+		if (!this.mutated && this.manifestPath !== undefined && readsBlob) {
 			this.mutated = true;
 			await writeFile(this.manifestPath, "{}\n");
 		}

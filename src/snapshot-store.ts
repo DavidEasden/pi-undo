@@ -308,6 +308,8 @@ export class SnapshotStore {
 	private readonly treeBlobMembership = new Map<string, string>();
 	private readonly blobCache = new Map<string, CachedBlob>();
 	private readonly visibleLeafCache = new Map<string, Map<string, CachedVisibleLeaf>>();
+	/** check-ignore 探针结果缓存；同一进程内同一 cwd 只验证一次，失败不缓存。 */
+	private readonly validatedIgnoreQueries = new Set<string>();
 	private readonly leafCacheDirectoriesLoaded = new Set<string>();
 	private readonly configuredPrivateRepositories = new Set<string>();
 	private readonly leafCacheDirtyDirectories = new Set<string>();
@@ -988,7 +990,9 @@ export class SnapshotStore {
 		const roots = new Map(manifest.roots.map((root) => [root.relativeRoot, root]));
 		const storeDirectory = dirname(dirname(manifestPath));
 		try {
-			const result: Uint8Array[] = [];
+			// 先完成全部 membership 校验，再按 gitDirectory 分组；同一个私有 ODB 的多个 blob
+			// 合并成一次 cat-file --batch，省掉每次进程启动的固定开销。
+			const pending: { readonly gitDirectory: string; readonly objectId: string }[] = [];
 			for (const request of requests) {
 				const root = roots.get(request.rootPath);
 				if (root === undefined) {
@@ -1017,8 +1021,41 @@ export class SnapshotStore {
 						throw new SnapshotStoreError("object_missing", "blob 不属于指定 root tree path");
 					}
 				}
-				result.push(new Uint8Array(await this.readBlobBytes(gitDirectory, request.blobId)));
+				pending.push({ gitDirectory, objectId: request.blobId });
 			}
+			const bytesById = new Map<string, Uint8Array>();
+			const byGitDirectory = new Map<string, string[]>();
+			for (const { gitDirectory, objectId } of pending) {
+				const ids = byGitDirectory.get(gitDirectory) ?? [];
+				if (!ids.includes(objectId)) ids.push(objectId);
+				byGitDirectory.set(gitDirectory, ids);
+			}
+			for (const [gitDirectory, objectIds] of byGitDirectory) {
+				for (const objectId of objectIds) {
+					const cached = this.blobCache.get(blobCacheKey(gitDirectory, objectId));
+					if (cached === undefined) continue;
+					bytesById.set(objectId, await cached.promise);
+				}
+				const missing = objectIds.filter((objectId) => !bytesById.has(objectId));
+				if (missing.length === 0) continue;
+				// batch 头部自带长度，无需预先知道 size；按响应自身长度解析后逐条校验。
+				const loaded = parseBatchBlobOutputByOrder(
+					await this.runGitBytes(["cat-file", "--batch"], {
+						env: privateObjectEnvironment(gitDirectory),
+						stdin: `${missing.join("\n")}\n`,
+					}),
+					missing,
+				);
+				for (const [objectId, bytes] of loaded) {
+					this.rememberBlobBytes(gitDirectory, objectId, bytes);
+					bytesById.set(objectId, bytes);
+				}
+			}
+			const result = pending.map(({ objectId }) => {
+				const bytes = bytesById.get(objectId);
+				if (bytes === undefined) throw new SnapshotStoreError("object_missing", "blob 无法读取");
+				return new Uint8Array(bytes);
+			});
 			if (revalidateManifest) await this.loadManifestFromPath(id, manifestPath);
 			return result;
 		} catch (error) {
@@ -1746,6 +1783,11 @@ export class SnapshotStore {
 		environment: Readonly<Record<string, string | undefined>>,
 		gitBacked: boolean,
 	): Promise<void> {
+		// check-ignore 是探针：只验证忽略查询机制在当前 cwd 可用，不产生数据。
+		// 同一进程内同一 cwd 的 git 环境不会变，重复启动进程没有任何信息价值；
+		// 小工作区里这个固定开销占比很高。失败不缓存，仍会在下次重试。
+		const cacheKey = `${cwd}\0${gitBacked ? "1" : "0"}`;
+		if (this.validatedIgnoreQueries.has(cacheKey)) return;
 		try {
 			await this.runGit([
 				...(gitBacked ? ["-c", "core.fsmonitor=false"] : []),
@@ -1760,6 +1802,7 @@ export class SnapshotStore {
 				throw error;
 			}
 		}
+		this.validatedIgnoreQueries.add(cacheKey);
 	}
 
 	private async ensurePrivateRepository(gitDirectory: string): Promise<void> {
@@ -2512,6 +2555,38 @@ function parseBatchBlobOutput(
 			throw new SnapshotStoreError("object_missing", `Git blob batch 内容不完整：${entry.objectId}`);
 		}
 		result.set(entry.objectId, output.slice(contentStart, contentEnd));
+		offset = contentEnd + 1;
+	}
+	if (offset !== output.length) {
+		throw new SnapshotStoreError("object_missing", "Git blob batch 输出包含多余内容");
+	}
+	return result;
+}
+
+function parseBatchBlobOutputByOrder(
+	output: Uint8Array,
+	expected: readonly string[],
+): Map<string, Uint8Array> {
+	const result = new Map<string, Uint8Array>();
+	let offset = 0;
+	for (const objectId of expected) {
+		const lineEnd = output.indexOf(0x0a, offset);
+		if (lineEnd < 0) throw new SnapshotStoreError("object_missing", "Git blob batch header 不完整");
+		const header = decodeUtf8(output.subarray(offset, lineEnd));
+		const match = header.match(/^([0-9a-f]{40,64}) blob ([0-9]+)$/);
+		if (match === null || match[1] !== objectId) {
+			throw new SnapshotStoreError("object_missing", `Git blob batch header 无效：${objectId}`);
+		}
+		const size = Number(match[2]);
+		if (!Number.isSafeInteger(size) || size < 0) {
+			throw new SnapshotStoreError("object_missing", `Git blob batch 长度无效：${objectId}`);
+		}
+		const contentStart = lineEnd + 1;
+		const contentEnd = contentStart + size;
+		if (contentEnd >= output.length || output[contentEnd] !== 0x0a) {
+			throw new SnapshotStoreError("object_missing", `Git blob batch 内容不完整：${objectId}`);
+		}
+		result.set(objectId, output.slice(contentStart, contentEnd));
 		offset = contentEnd + 1;
 	}
 	if (offset !== output.length) {
