@@ -31,4 +31,4 @@ pi-undo 使用的扩展生命周期、命令、会话树和编辑器 API 在 Pi 
 
 ## 剩余限制
 
-未在 Windows 和 Linux 上重复完整测试。`mutation_conflict` 的自动解除仍然被禁止，这是为了避免在外部写入与 pi-undo 操作无法确定先后时造成不可逆覆盖。
+未在 Windows 和 Linux 上重复完整测试。`mutation_conflict` 的自动解除仍然被禁止，这是为了避免在外部写入与 pi-undo 操作无法确定先后时造成不可逆覆盖。Pi 1.4.0 的记录见 [pi-1.4.0-validation.md](pi-1.4.0-validation.md)。
