@@ -5,7 +5,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Deserialize)]
@@ -18,7 +18,6 @@ struct Request {
 }
 
 pub(crate) const CACHE_SCHEMA_VERSION: u32 = 2;
-pub(crate) const WATCH_TREE_MAX_DEPTH: usize = 128;
 const RACY_DIRECTORY_WINDOW_NS: u128 = 2_000_000_000;
 static NEXT_CACHE_WRITE: AtomicU64 = AtomicU64::new(0);
 
@@ -47,9 +46,27 @@ pub(crate) struct CachedDirectory {
 }
 
 pub(crate) struct ScanState<'a> {
-    pub(crate) previous: Option<&'a DirectoryCache>,
+    pub(crate) previous: Option<&'a BTreeMap<String, CachedDirectory>>,
     pub(crate) next: BTreeMap<String, CachedDirectory>,
     pub(crate) reused_directories: usize,
+}
+
+const MAX_SCAN_WORKERS: usize = 16;
+
+struct ScanWorkerPermit<'a>(&'a AtomicUsize);
+
+impl Drop for ScanWorkerPermit<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn acquire_scan_worker(workers: &AtomicUsize) -> bool {
+    workers
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
+            (active < MAX_SCAN_WORKERS).then_some(active + 1)
+        })
+        .is_ok()
 }
 
 #[derive(Serialize)]
@@ -91,7 +108,7 @@ pub(crate) fn run(request_path: &Path) -> Result<(), String> {
         None
     };
     let mut scan_state = ScanState {
-        previous: previous_cache.as_ref(),
+        previous: previous_cache.as_ref().map(|cache| &cache.directories),
         next: BTreeMap::new(),
         reused_directories: 0,
     };
@@ -144,6 +161,18 @@ pub(crate) fn scan(
     response: &mut Response,
     state: &mut ScanState<'_>,
 ) -> std::io::Result<()> {
+    let workers = AtomicUsize::new(0);
+    scan_inner(directory, path, depth, response, state, &workers)
+}
+
+fn scan_inner(
+    directory: &Directory,
+    path: &str,
+    depth: usize,
+    response: &mut Response,
+    state: &mut ScanState<'_>,
+    workers: &AtomicUsize,
+) -> std::io::Result<()> {
     if depth > 128 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -152,11 +181,7 @@ pub(crate) fn scan(
     }
     let observed_at = SystemTime::now();
     let before = directory.file.metadata()?;
-    if let Some(cached) = state
-        .previous
-        .and_then(|cache| cache.directories.get(path))
-        .cloned()
-    {
+    if let Some(cached) = state.previous.and_then(|cache| cache.get(path)).cloned() {
         let mut reusable = metadata_matches(&cached, &before) && !cached.racy;
         // 复用路径只打开每个子目录一次：校验存在性时得到的句柄直接用于递归。
         let mut opened = Vec::with_capacity(if reusable { cached.children.len() } else { 0 });
@@ -186,15 +211,20 @@ pub(crate) fn scan(
                 });
             }
             state.next.insert(path.into(), cached.clone());
-            for (name, child) in cached.children.into_iter().zip(opened) {
-                let child_path = if path.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{path}/{name}")
-                };
-                scan(&child, &child_path, depth + 1, response, state)?;
-                directory.assert_child(OsStr::new(&name), &child)?;
-            }
+            let children = cached
+                .children
+                .into_iter()
+                .zip(opened)
+                .map(|(name, child)| {
+                    let child_path = if path.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{path}/{name}")
+                    };
+                    (name, child, child_path)
+                })
+                .collect();
+            scan_children(directory, depth, children, response, state, workers)?;
             let after = directory.file.metadata()?;
             assert_unchanged(path, &before, &after)?;
             return Ok(());
@@ -226,23 +256,384 @@ pub(crate) fn scan(
         if !is_directory {
             continue;
         }
-        children.push(name.clone());
         let child = directory.open_child(name_os)?;
         let child_path = if path.is_empty() {
             name.clone()
         } else {
             format!("{path}/{name}")
         };
-        scan(&child, &child_path, depth + 1, response, state)?;
-        directory.assert_child(name_os, &child)?;
+        children.push((name, child, child_path));
     }
+    let child_names = children
+        .iter()
+        .map(|(name, _, _)| name.clone())
+        .collect::<Vec<_>>();
+    scan_children(directory, depth, children, response, state, workers)?;
     let after = directory.file.metadata()?;
     assert_unchanged(path, &before, &after)?;
     state.next.insert(
         path.into(),
+        cached_directory(&after, has_git, child_names, observed_at),
+    );
+    Ok(())
+}
+
+fn scan_children(
+    parent: &Directory,
+    depth: usize,
+    children: Vec<(String, Directory, String)>,
+    response: &mut Response,
+    state: &mut ScanState<'_>,
+    workers: &AtomicUsize,
+) -> std::io::Result<()> {
+    const MIN_PARALLEL_FANOUT: usize = 8;
+    let previous = state.previous;
+    if children.len() < MIN_PARALLEL_FANOUT {
+        for (name, child, child_path) in children {
+            scan_child_into(
+                parent, name, child, child_path, depth, response, state, workers,
+            )?;
+        }
+        return Ok(());
+    }
+
+    let batch_size = children.len().div_ceil(MAX_SCAN_WORKERS);
+    let mut batches = Vec::new();
+    let mut batch = Vec::with_capacity(batch_size);
+    for child in children {
+        batch.push(child);
+        if batch.len() == batch_size {
+            batches.push(std::mem::replace(
+                &mut batch,
+                Vec::with_capacity(batch_size),
+            ));
+        }
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for batch in batches {
+            if acquire_scan_worker(workers) {
+                handles.push(scope.spawn(move || {
+                    let _permit = ScanWorkerPermit(workers);
+                    scan_child_batch(parent, batch, depth, previous, workers)
+                }));
+            } else {
+                let (child_response, child_state) =
+                    scan_child_batch(parent, batch, depth, previous, workers)?;
+                merge_scan_result(response, state, child_response, child_state);
+            }
+        }
+        for handle in handles {
+            let result = handle
+                .join()
+                .map_err(|_| std::io::Error::other("目录扫描 worker 异常退出"))??;
+            merge_scan_result(response, state, result.0, result.1);
+        }
+        Ok(())
+    })
+}
+
+fn scan_child_batch<'a>(
+    parent: &Directory,
+    children: Vec<(String, Directory, String)>,
+    depth: usize,
+    previous: Option<&'a BTreeMap<String, CachedDirectory>>,
+    workers: &AtomicUsize,
+) -> std::io::Result<(Response, ScanState<'a>)> {
+    let mut response = Response {
+        ok: true,
+        directories: 0,
+        repositories: Vec::new(),
+    };
+    let mut state = ScanState {
+        previous,
+        next: BTreeMap::new(),
+        reused_directories: 0,
+    };
+    for (name, child, child_path) in children {
+        scan_child_into(
+            parent,
+            name,
+            child,
+            child_path,
+            depth,
+            &mut response,
+            &mut state,
+            workers,
+        )?;
+    }
+    Ok((response, state))
+}
+
+fn scan_child_into(
+    parent: &Directory,
+    name: String,
+    child: Directory,
+    child_path: String,
+    depth: usize,
+    response: &mut Response,
+    state: &mut ScanState<'_>,
+    workers: &AtomicUsize,
+) -> std::io::Result<()> {
+    scan_inner(&child, &child_path, depth + 1, response, state, workers)?;
+    parent.assert_child(OsStr::new(&name), &child)?;
+    Ok(())
+}
+
+fn merge_scan_result(
+    response: &mut Response,
+    state: &mut ScanState<'_>,
+    child_response: Response,
+    child_state: ScanState<'_>,
+) {
+    response.directories += child_response.directories;
+    response.repositories.extend(child_response.repositories);
+    state.reused_directories += child_state.reused_directories;
+    state.next.extend(child_state.next);
+}
+
+pub(crate) fn scan_changed(
+    root: &Directory,
+    changed: &HashSet<String>,
+    previous: &BTreeMap<String, CachedDirectory>,
+) -> std::io::Result<(
+    Response,
+    BTreeMap<String, CachedDirectory>,
+    HashSet<String>,
+    usize,
+)> {
+    let mut response = Response {
+        ok: true,
+        directories: 0,
+        repositories: Vec::new(),
+    };
+    let mut next = BTreeMap::new();
+    let mut removed = HashSet::new();
+    let mut reused = 0;
+    scan_changed_inner(
+        root,
+        "",
+        0,
+        changed,
+        previous,
+        &mut response,
+        &mut next,
+        &mut removed,
+        &mut reused,
+    )?;
+    Ok((response, next, removed, reused))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalScanRelation {
+    Unchanged,
+    Ancestor,
+    Changed,
+}
+
+fn local_scan_relation(path: &str, changed: &HashSet<String>) -> LocalScanRelation {
+    if changed.contains(path) {
+        return LocalScanRelation::Changed;
+    }
+    let prefix = if path.is_empty() {
+        String::new()
+    } else {
+        format!("{path}/")
+    };
+    if changed
+        .iter()
+        .any(|candidate| candidate.starts_with(&prefix))
+    {
+        LocalScanRelation::Ancestor
+    } else {
+        LocalScanRelation::Unchanged
+    }
+}
+
+fn scan_changed_inner(
+    directory: &Directory,
+    path: &str,
+    depth: usize,
+    changed: &HashSet<String>,
+    previous: &BTreeMap<String, CachedDirectory>,
+    response: &mut Response,
+    next: &mut BTreeMap<String, CachedDirectory>,
+    removed: &mut HashSet<String>,
+    reused: &mut usize,
+) -> std::io::Result<()> {
+    if depth > 128 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "目录扫描深度超过限制",
+        ));
+    }
+    let cached = previous.get(path);
+    match local_scan_relation(path, changed) {
+        LocalScanRelation::Unchanged => {
+            if let Some(count) = validate_cached_subtree(path, previous)? {
+                *reused += count;
+                return Ok(());
+            }
+        }
+        LocalScanRelation::Ancestor => {
+            if let Some(cached) = cached.filter(|entry| !entry.racy) {
+                return scan_cached_ancestor(
+                    directory, path, depth, cached, changed, previous, response, next, removed,
+                    reused,
+                );
+            }
+        }
+        LocalScanRelation::Changed => {}
+    }
+
+    let observed_at = SystemTime::now();
+    let before = directory.file.metadata()?;
+    let entries = directory.entries()?;
+    response.directories += 1;
+    let has_git = !path.is_empty()
+        && entries
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(".git"));
+    if has_git {
+        response.repositories.push(Repository {
+            path: path.into(),
+            dev: before.dev().to_string(),
+            ino: before.ino().to_string(),
+        });
+    }
+    let mut children = Vec::new();
+    for (name, kind) in entries {
+        if name == ".git" {
+            continue;
+        }
+        let name_os = OsStr::new(&name);
+        let is_directory = kind == libc::DT_DIR
+            || (kind == libc::DT_UNKNOWN
+                && directory.stat(name_os)?.st_mode & libc::S_IFMT == libc::S_IFDIR);
+        if !is_directory {
+            continue;
+        }
+        let child_path = if path.is_empty() {
+            name.clone()
+        } else {
+            format!("{path}/{name}")
+        };
+        if local_scan_relation(&child_path, changed) == LocalScanRelation::Unchanged {
+            if let Some(count) = validate_cached_subtree(&child_path, previous)? {
+                *reused += count;
+                children.push(name);
+                continue;
+            }
+        }
+        let child = directory.open_child(name_os)?;
+        scan_changed_inner(
+            &child,
+            &child_path,
+            depth + 1,
+            changed,
+            previous,
+            response,
+            next,
+            removed,
+            reused,
+        )?;
+        directory.assert_child(name_os, &child)?;
+        children.push(name);
+    }
+    if let Some(cached) = cached {
+        let current_children = children.iter().cloned().collect::<HashSet<_>>();
+        for name in &cached.children {
+            if !current_children.contains(name) {
+                removed.insert(if path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{path}/{name}")
+                });
+            }
+        }
+    }
+    let after = directory.file.metadata()?;
+    assert_unchanged(path, &before, &after)?;
+    next.insert(
+        path.into(),
         cached_directory(&after, has_git, children, observed_at),
     );
     Ok(())
+}
+
+fn scan_cached_ancestor(
+    directory: &Directory,
+    path: &str,
+    depth: usize,
+    cached: &CachedDirectory,
+    changed: &HashSet<String>,
+    previous: &BTreeMap<String, CachedDirectory>,
+    response: &mut Response,
+    next: &mut BTreeMap<String, CachedDirectory>,
+    removed: &mut HashSet<String>,
+    reused: &mut usize,
+) -> std::io::Result<()> {
+    let observed_at = SystemTime::now();
+    let before = directory.file.metadata()?;
+    response.directories += 1;
+    if !path.is_empty() && cached.has_git {
+        response.repositories.push(Repository {
+            path: path.into(),
+            dev: before.dev().to_string(),
+            ino: before.ino().to_string(),
+        });
+    }
+    for name in &cached.children {
+        if !valid_child_name(name) {
+            return Err(std::io::Error::other("目录 cache 子目录名无效"));
+        }
+        let child_path = if path.is_empty() {
+            name.clone()
+        } else {
+            format!("{path}/{name}")
+        };
+        if local_scan_relation(&child_path, changed) == LocalScanRelation::Unchanged {
+            if let Some(count) = validate_cached_subtree(&child_path, previous)? {
+                *reused += count;
+                continue;
+            }
+        }
+        let child = directory.open_child(OsStr::new(name))?;
+        scan_changed_inner(
+            &child,
+            &child_path,
+            depth + 1,
+            changed,
+            previous,
+            response,
+            next,
+            removed,
+            reused,
+        )?;
+        directory.assert_child(OsStr::new(name), &child)?;
+    }
+    let after = directory.file.metadata()?;
+    assert_unchanged(path, &before, &after)?;
+    next.insert(
+        path.into(),
+        cached_directory(&after, cached.has_git, cached.children.clone(), observed_at),
+    );
+    Ok(())
+}
+
+fn validate_cached_subtree(
+    path: &str,
+    previous: &BTreeMap<String, CachedDirectory>,
+) -> std::io::Result<Option<usize>> {
+    let Some(root) = previous.get(path) else {
+        return Ok(None);
+    };
+    // 直接命中的 racy 目录重新枚举；无事件子树依赖 FSEvents 完整性并按整体复用。
+    if root.racy { Ok(None) } else { Ok(Some(1)) }
 }
 
 pub(crate) fn assert_unchanged(
@@ -461,6 +852,88 @@ mod tests {
     }
 
     #[test]
+    fn scans_wide_tree_with_parallel_workers_and_keeps_complete_cache() {
+        let root = crate::tests::fixture();
+        for index in 0..48 {
+            fs::create_dir_all(root.join(format!("repo-{index}/.git"))).unwrap();
+        }
+        let mut response = Response {
+            ok: true,
+            directories: 0,
+            repositories: Vec::new(),
+        };
+        let mut state = ScanState {
+            previous: None,
+            next: BTreeMap::new(),
+            reused_directories: 0,
+        };
+        scan(
+            &Directory::open(&root).unwrap(),
+            "",
+            0,
+            &mut response,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(response.directories, 49);
+        assert_eq!(response.repositories.len(), 48);
+        assert_eq!(state.next.len(), 49);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changed_scan_reenumerates_only_event_ancestors_and_reuses_siblings() {
+        let root = crate::tests::fixture();
+        fs::create_dir_all(root.join("repo/old/.git")).unwrap();
+        fs::create_dir_all(root.join("other/deep")).unwrap();
+        let cache = verified_cache(&root);
+        fs::create_dir_all(root.join("repo/new/.git")).unwrap();
+        let changed = HashSet::from([String::from("repo")]);
+        let (response, next, removed, reused) = scan_changed(
+            &Directory::open(&root).unwrap(),
+            &changed,
+            &cache.directories,
+        )
+        .unwrap();
+        assert!(
+            response
+                .repositories
+                .iter()
+                .any(|repository| repository.path == "repo/new")
+        );
+        assert!(next.contains_key("repo"));
+        assert!(!next.contains_key("other/deep"));
+        assert!(removed.is_empty());
+        assert_eq!(response.directories, 3);
+        assert_eq!(reused, 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changed_scan_detects_deleted_directory_in_event_parent() {
+        let root = crate::tests::fixture();
+        fs::create_dir_all(root.join("repo/old/.git")).unwrap();
+        let cache = verified_cache(&root);
+        fs::remove_dir_all(root.join("repo/old")).unwrap();
+        let changed = HashSet::from([String::from("repo")]);
+        let (response, next, removed, _) = scan_changed(
+            &Directory::open(&root).unwrap(),
+            &changed,
+            &cache.directories,
+        )
+        .unwrap();
+        assert!(
+            !response
+                .repositories
+                .iter()
+                .any(|repository| repository.path == "repo/old")
+        );
+        assert!(!next.contains_key("repo/old"));
+        assert_eq!(removed, HashSet::from([String::from("repo/old")]));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn reuses_verified_directories_and_falls_back_when_structure_changes() {
         let root = crate::tests::fixture();
         fs::create_dir_all(root.join("repo/nested")).unwrap();
@@ -473,7 +946,7 @@ mod tests {
             repositories: Vec::new(),
         };
         let mut state = ScanState {
-            previous: Some(&cache),
+            previous: Some(&cache.directories),
             next: BTreeMap::new(),
             reused_directories: 0,
         };
@@ -495,7 +968,7 @@ mod tests {
             repositories: Vec::new(),
         };
         let mut state = ScanState {
-            previous: Some(&cache),
+            previous: Some(&cache.directories),
             next: BTreeMap::new(),
             reused_directories: 0,
         };
@@ -524,7 +997,7 @@ mod tests {
             repositories: Vec::new(),
         };
         let mut state = ScanState {
-            previous: Some(&cache),
+            previous: Some(&cache.directories),
             next: BTreeMap::new(),
             reused_directories: 0,
         };
@@ -555,7 +1028,7 @@ mod tests {
             repositories: Vec::new(),
         };
         let mut state = ScanState {
-            previous: Some(&cache),
+            previous: Some(&cache.directories),
             next: BTreeMap::new(),
             reused_directories: 0,
         };
