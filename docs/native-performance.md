@@ -1,6 +1,6 @@
 # 原生目录扫描与普通文件恢复性能验证
 
-本轮实现目录项缓存与 scoped restore 的可见路径检查，保留恢复前后的拓扑校验。目录扫描仍会逐个打开、核验工作区内的目录；缓存减少 `readdir`，没有把整次检查变成只访问 changedPaths 的增量操作。
+本轮实现目录项缓存与 scoped restore 的可见路径检查；普通一次性扫描仍会逐个打开、核验工作区内的目录。常驻 `--serve` 在 macOS 上使用 FSEvents 收集变更父目录，只重新枚举受影响祖先并合并局部 cache；无变化请求复用驻留 cache，事件丢失、监听停止或扫描竞争时回退完整校验。
 
 ## Durable pack 准备与批量写入
 
@@ -105,13 +105,13 @@ metadata inspect 默认每批最多处理 2,048 条路径，并受 1 MiB 路径�
 
 GitRunner 会对单次 Git stdout 应用 256 MiB 硬上限；超过上限时终止整个 Git 进程组并抛出 `git_output_limit`，避免在 `Buffer.concat(...).toString()` 阶段触发 Node.js `ERR_STRING_TOO_LONG` 或无界内存增长。正常的 blob batch 读取仍按 16 MiB 分批，不受该上限影响。
 
-- `scan-directories-v2` 在 macOS/Linux 上缓存每个目录的 `dev/ino/mtime/ctime`、Git 标记和直接子目录。每次检查仍核验全部目录的身份与时间戳，匹配时才复用目录项。检查点之间发生变化的目录重新枚举；扫描期间发生变化则显式失败，不接受部分结果。
+- `scan-directories-v2` 在 macOS/Linux 上缓存每个目录的 `dev/ino/mtime/ctime`、Git 标记和直接子目录。一次性 helper 及常驻服务的完整回退路径仍核验全部目录；常驻 macOS 服务收到可靠 FSEvents 后只重新枚举变更父目录和祖先，其他未受影响子树按 cache 整体复用。直接命中的 racy 目录不会被局部路径直接复用，而是重新枚举。
 - 缓存把 racy 标记固化到记录中，以开始枚举目录前的观察时刻计算两秒窗口。长子树扫描或之后的时间流逝不会让旧的 racy 记录自动变成可信记录。时间戳纳秒部分为零、无效或处于未来时采取保守重扫。
 - 扫描继续进入 ignored 目录，以发现其中的嵌套仓库；不进入名称恰为 `.git` 的元数据目录，不跟随 symlink。目录句柄、父子绑定和工作区身份检查保留。超过 128 层时丢弃原生部分结果，由 TypeScript 从根重扫。
 - v2 cache 绑定工作区路径与身份，结构解析失败或不匹配时不复用。它位于工作区外的私有临时目录，位置检查会解析 `TMPDIR` 的符号链接；无法安全放置请求时使用 TypeScript。cache 创建失败时使用本次请求目录，cache 写入失败不使成功扫描失败。正常进程退出时尽力清理，强制终止仍可能留下系统临时文件。
 - 能力探测一次取得 capability 集合；旧 `scan-directories-v1` helper 继续完整扫描，缺少 helper 时使用 TypeScript。扫描仍受操作剩余时间和 `PI_UNDO_OPERATION_TIMEOUT_MS` 限制，取消或未确认退出保持原有处理契约。
 - `listVisibleLeafPaths` 支持 `includePaths`。带 scope 的 complete restore 只枚举 scope 内的可见叶子；scope 外新增文件保留，scope 内新增可见路径仍会在修改前阻止恢复。未指定 scope 的完整恢复继续枚举整个工作区。嵌套仓库边界、内容、mode、symlink、mutation journal 和 quarantine 检查保留。
-- 本轮没有引入 FSEvents/inotify 变更索引，也没有消除 settled 阶段完整 baseline 的枚举成本。因此，目录很多或 baseline 捕获很慢的工作区仍可能有明显等待，不能据此保证用户的 50GB 项目达到秒级响应。
+- 常驻 `--serve` 在 macOS 上使用带 file events 的 FSEvents stream，按事件路径归并到父目录；事件 dropped、路径无法解析、监听线程停止或扫描前后仍有新事件时回退完整扫描。事件取样有短暂 settle 窗口，以覆盖文件操作刚完成但系统尚未投递事件的情况；Linux/Windows 仍使用现有回退路径。
 
 缓存信任应用进程创建的私有文件及操作系统提供的目录元数据，不提供跨整个工作区的原子快照，也不提供抵抗同用户篡改 cache 的完整性保证。
 
