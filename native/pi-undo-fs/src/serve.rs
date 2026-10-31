@@ -803,6 +803,8 @@ mod watch_impl {
 
 #[cfg(not(target_os = "macos"))]
 mod watch_impl {
+    use super::EventBatch;
+
     // 非 macOS 平台暂不提供常驻模式：--serve 直接返回不支持。
     pub(super) struct Watch;
     impl Watch {
