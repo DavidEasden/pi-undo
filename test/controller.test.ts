@@ -882,6 +882,23 @@ describe("UndoController", () => {
 		expect(deps.calls).toContain("entry:pi-undo:start");
 	});
 
+	it("beginInput 返回前不启动捕获，避免输入事件同步占用事件循环", async () => {
+		let captureStarted = false;
+		const controller = new UndoControllerImpl(dependencies({
+			capture: async () => {
+				captureStarted = true;
+				return manifest("a");
+			},
+		}));
+
+		expect(controller.beginInput!("先响应按键", { streaming: false })).toEqual({ action: "continue" });
+		expect(captureStarted).toBe(false);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(captureStarted).toBe(false);
+		await controller.commitInput!();
+		expect(captureStarted).toBe(true);
+	});
+
 	it("输入前快照遇到暂态捕获失败时重试一次", async () => {
 		let captures = 0;
 		const deps = dependencies({

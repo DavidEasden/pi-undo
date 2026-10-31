@@ -167,6 +167,7 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 			opId: operation.opId,
 			mutationJournal: journal.mutationJournal(operation.opId),
 			forceTargetArtifactSync: true,
+			workspaceLockHeld: true,
 		}),
 		settle: (opId, phase) => journal.settleRecovery(opId, phase),
 	});
@@ -276,6 +277,9 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 				store.loadManifest(targetManifestId),
 			]);
 			if (await restore.canReuseDurableSource(reference, target, scopePaths)) return reference;
+			// durable pack 可能仍在后台预制；若当前 scope 已经与 reference manifest 一致，
+			// 不必为 rollback 再做一次全量目录扫描。apply 仍会在 mutation 前复核 topology。
+			if (await restore.canReuseManifestSource(reference, target, scopePaths)) return reference;
 			return capture(scopePaths);
 		},
 		changedPaths: async (before, after) => {
@@ -292,6 +296,7 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 			opId: operation.opId,
 			mutationJournal: journal.mutationJournal(operation.opId),
 			deferDurability: true,
+			workspaceLockHeld: true,
 			onTiming: (phase, durationMs) => {
 				try {
 					phases.push({ phase, elapsedMs: Math.round(performance.now() - operationStarted) });

@@ -70,12 +70,10 @@ describe.skipIf(process.env.PI_UNDO_LARGE_WORKSPACE !== "1")("大型工作区真
 				clearInterval(sampler);
 				loopDelay.disable();
 			}
-			// 禁用原生时无法复用 durable source，重新捕获 safety snapshot 会多一次拓扑发现。
-			// Path1 优化：跳过独占锁内 restore 后的冗余 visible-paths-post 扫描，native 路径减少 1 次 discover。
-			// Path2 优化：restore 成功后用 target manifest 作为 settled baseline，isBaselineFresh
-			// 命中时再减少 1 次 post-capture discover，因此每次扫描次数可能是 3 或 4。
-			const maxScans = process.env.PI_UNDO_DISABLE_NATIVE === "1" ? 6 : 4;
-			const minScans = process.env.PI_UNDO_DISABLE_NATIVE === "1" ? 6 : 3;
+			// 直接 source 核验跳过 safety capture；原生保留 restore-pre/restore-post，
+			// TypeScript 回退的异步 settled baseline 至多再做一次完整发现。
+			const maxScans = process.env.PI_UNDO_DISABLE_NATIVE === "1" ? 3 : 2;
+			const minScans = 2;
 			for (const scan of scans) {
 				expect(scan).toBeGreaterThanOrEqual(minScans);
 				expect(scan).toBeLessThanOrEqual(maxScans);

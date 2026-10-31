@@ -322,16 +322,23 @@ export class UndoControllerImpl implements UndoController {
 		return true;
 	}
 
-	private runBackground<T>(body: () => Promise<T>): Promise<T> {
+	private runBackground<T>(body: () => Promise<T>, deferStart = false): Promise<T> {
 		const scope = createOperationScope({ timeoutMs: this.operationTimeout() });
 		this.backgroundScopes.add(scope);
-		const task = runWithOperationContext(scope.context, async () => {
+		const start = (): Promise<T> => runWithOperationContext(scope.context, async () => {
 			try {
 				return await body();
 			} finally {
 				if (operationHasUnconfirmedExit()) this.recordUnsafeExit({ code: "process_exit_unconfirmed" });
 			}
-		}).finally(() => {
+		});
+		let task!: Promise<T>;
+		const execution = deferStart
+			? new Promise<T>((resolve, reject) => {
+				setImmediate(() => start().then(resolve, reject));
+			})
+			: start();
+		task = execution.finally(() => {
 			scope.dispose();
 			this.backgroundScopes.delete(scope);
 			this.backgroundTasks.delete(task);
@@ -387,12 +394,12 @@ export class UndoControllerImpl implements UndoController {
 		if (this.disposed || this.locked || this.warmUpInFlight !== undefined) return;
 		const warmUp = this.runBackground(async () => {
 			try {
-				this.warmUpManifest = await this.captureWithWorkspaceLock();
+				this.warmUpManifest = await this.captureWithWorkspaceLock(true);
 			} catch (error) {
 				this.recordUnsafeExit(error);
 				// 预热是 best-effort：失败静默，正式 capture 会再次尝试并上报。
 			}
-		});
+		}, true);
 		this.warmUpInFlight = warmUp;
 		void warmUp.finally(() => {
 			if (this.warmUpInFlight === warmUp && this.warmUpManifest === undefined) {
@@ -439,7 +446,7 @@ export class UndoControllerImpl implements UndoController {
 		this.lastCaptureFailureMessage = undefined;
 		this.deferAgentStartUntilMessageEnd = true;
 		const token = Symbol("input-capture");
-		const promise = this.runBackground(() => this.captureInputForToken(text, token));
+		const promise = this.runBackground(() => this.captureInputForToken(text, token), true);
 		this.pendingInputCapture = { token, promise };
 		void promise.then(() => {
 			if (this.pendingInputCapture?.token === token) this.pendingInputCapture = undefined;
@@ -519,6 +526,8 @@ export class UndoControllerImpl implements UndoController {
 		// warm-up 仍在进行时先等待，确保随后可以消费已完成的 baseline，而不是再次完整 capture。
 		const warmUp = this.warmUpInFlight;
 		if (warmUp !== undefined) await warmUp;
+		// 输入事件已经返回后再进入实际捕获，优先让终端处理 Esc、命令和重绘。
+		await yieldToEventLoop();
 		const warmUpManifest = this.warmUpManifest;
 		this.warmUpManifest = undefined;
 		if (this.warmUpInFlight === warmUp) this.warmUpInFlight = undefined;
@@ -565,7 +574,7 @@ export class UndoControllerImpl implements UndoController {
 		if (this.disposed) return Promise.resolve();
 		if (this.settling !== undefined) return this.settling;
 		const run = this.runCompletion;
-		const settled = this.runBackground(() => this.settleRun(run));
+		const settled = this.runBackground(() => this.settleRun(run), true);
 		this.settling = settled.finally(() => {
 			this.settling = undefined;
 			// settleRun 成功或失败后都结束本轮等待凭据。
@@ -1216,10 +1225,9 @@ export class UndoControllerImpl implements UndoController {
 		}
 	}
 
-	private async captureWithWorkspaceLock(): Promise<SnapshotManifest> {
-		// 预热可能仍持有 workspace lock：先等它完成再 acquire，避免排队超时；
-		// 此时进程内缓存已暖，本次 capture 只需指纹校验。
-		const warmUp = this.warmUpInFlight;
+	private async captureWithWorkspaceLock(skipWarmUpWait = false): Promise<SnapshotManifest> {
+		// 预热任务本身不能等待 warmUpInFlight，否则会等待自己的 Promise。
+		const warmUp = skipWarmUpWait ? undefined : this.warmUpInFlight;
 		if (warmUp !== undefined) await warmUp;
 		const lease = await this.dependencies.acquireWorkspaceLock();
 		try {
@@ -1538,6 +1546,10 @@ function isTransientCaptureFailure(error: unknown): boolean {
 	const { name, code } = error as { name?: unknown; code?: unknown };
 	return (name === "SnapshotStoreError" && code === "capture_failed") ||
 		(name === "WorkspaceLockError" && code === "lock_timeout");
+}
+
+function yieldToEventLoop(): Promise<void> {
+	return new Promise((resolve) => setImmediate(resolve));
 }
 
 function sleep(ms: number): Promise<void> {

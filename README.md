@@ -167,7 +167,7 @@ recovery_required
 
 ### Performance Notes
 
-普通文件原生恢复路径保留 5 次完整拓扑扫描。macOS/Linux 的新版 helper 使用不跟随符号链接的目录句柄扫描，仍会发现 Git 忽略目录中的嵌套仓库。小工作区根据上次扫描规模选择 TypeScript 完整重扫，避免进程启动开销；没有使用 TTL 缓存或默认跳过 `node_modules`。
+普通文件恢复在持有 workspace 独占锁时，先逐项核验 changedPaths 中的叶子文件；若与 checkpoint source 一致，就直接复用 manifest，避免额外 scoped capture 和全目录扫描。目录 scope、内容不匹配或 source 无法证明时仍走 scoped safety capture。成功路径保留 `restore-pre` 与 `restore-post` 两次 topology 检查，并继续执行 scope 内可见路径校验；锁内省略其后的重复 topology 扫描。native helper 仍不跟随符号链接地扫描 ignored 目录中的嵌套仓库；没有默认跳过 `node_modules`，也没有使用 TTL 缓存。
 
 原生恢复可处理已有父目录中的普通文件删除、覆盖、创建及混合计划。`restore-files-v2` 覆盖子目录删除和混合 mutation；`restore-files-v3` 会把分散在大量父目录中的文件拆成多个批次，每批最多打开 128 个非根父目录句柄。旧 helper、缺少二进制、目录操作、类型替换及单条路径深度超过句柄预算时继续走 TypeScript 路径。durable pack、逐项内容校验、no-clobber 与恢复依据均保留。
 

@@ -854,8 +854,8 @@ describe("undo/redo restore performance", () => {
 		}
 	}, 120_000);
 
-	// 对应计划的验收目标：单文件原生正常 undo 的完整 RootDiscovery 从 7 次降到不超过 5 次。
-	it("单文件原生 undo 只做不超过 5 次完整拓扑发现", async () => {
+	// 对应计划的验收目标：runtime 在持有 workspace lock 时，单文件原生 undo 的 RootDiscovery 不超过 2 次。
+	it("单文件原生 undo 只做不超过 2 次完整拓扑发现", async () => {
 		if (!await nativeRestoreAvailable()) return;
 		const workspace = await mkdtemp(join(tmpdir(), "pi-undo-scan-count-"));
 		const storeRoot = await mkdtemp(join(tmpdir(), "pi-undo-scan-count-store-"));
@@ -882,17 +882,16 @@ describe("undo/redo restore performance", () => {
 				opId: journal.operationId,
 				mutationJournal: journal,
 				deferDurability: true,
+				workspaceLockHeld: true,
 			});
 
 			expect(result.code).toBe("ok");
 			expect(await readFile(join(workspace, "value.txt"), "utf8")).toBe("before\n");
-			expect(discovery.reasons.length).toBeLessThanOrEqual(4);
-			// 安全快照 1 次、恢复前 1 次、恢复后 1 次。恢复后的 visible-paths-post 复核已被跳过：
-			// assertUnchangedTopology 已确认 topologyAfter 与 topologyBefore 一致，且 restore 在独占锁内执行。
+			expect(discovery.reasons.length).toBeLessThanOrEqual(2);
+			// runtime 已持有 workspace lock；restore-pre 前置核验与 restore-post 复核保留，
+			// 省略 capture 和 visible-pre 枚举后的重复 topology 扫描。
 			expect(discovery.reasons).toEqual([
-				"safety-snapshot",
 				"restore-pre",
-				"visible-paths-post",
 				"restore-post",
 			]);
 		} finally {

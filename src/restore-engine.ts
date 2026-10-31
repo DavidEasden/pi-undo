@@ -79,6 +79,8 @@ export interface RestoreApplyOptions {
 	readonly mutationJournal: MutationJournal;
 	readonly forceTargetArtifactSync?: boolean;
 	readonly deferDurability?: boolean;
+	/** 调用方已持有 workspace 独占锁时，可略过 visible-pre 枚举后的重复 topology 扫描。 */
+	readonly workspaceLockHeld?: boolean;
 	/** 报告 apply 内部阶段耗时；回调异常不影响恢复结果。 */
 	readonly onTiming?: (phase: string, durationMs: number) => void;
 }
@@ -250,7 +252,6 @@ export class RestoreEngine {
 		const scope = scopePaths === undefined ? undefined : this.canonicalScope(scopePaths);
 		const canonicalScopePaths = scope === undefined ? undefined : [...scope];
 		assertCompatibleManifests(current, target, scope);
-		const isScopedPath = (path: string): boolean => scope === undefined || scope.has(path);
 		reportDurablePackTiming(options, "plan.validate", validationStarted);
 		const completeStarted = performance.now();
 		await allCompleted([
@@ -258,6 +259,29 @@ export class RestoreEngine {
 			this.store.assertComplete(target.manifestId, canonicalScopePaths),
 		]);
 		reportDurablePackTiming(options, "plan.complete", completeStarted);
+		return this.computePlan(current, target, scope, canonicalScopePaths, options);
+	}
+
+	private async computePlan(
+		current: SnapshotManifest,
+		target: SnapshotManifest,
+		scope: ReadonlySet<string> | undefined,
+		canonicalScopePaths: readonly string[] | undefined,
+		options: DurablePackPreparationOptions = {},
+	): Promise<RestorePlan> {
+		const isScopedPath = (path: string): boolean => scope === undefined || scope.has(path);
+		const prepared = canonicalScopePaths === undefined
+			? undefined
+			: this.findPreparedPlan(current.manifestId, target.manifestId, canonicalScopePaths);
+		if (prepared !== undefined) {
+			// 后台 durable prepare 已读取并验证过同一对 immutable manifest；复用路径表，
+			// 避免 undo 前再执行一轮 listTree 与 diff。
+			const pathsStarted = performance.now();
+			reportDurablePackTiming(options, "plan.paths", pathsStarted);
+			const diffStarted = performance.now();
+			reportDurablePackTiming(options, "plan.diff", diffStarted);
+			return cloneRestorePlan(prepared.plan);
+		}
 
 		const pathsStarted = performance.now();
 		const [currentPaths, targetPaths] = await allCompleted([
@@ -318,6 +342,11 @@ export class RestoreEngine {
 		return plan;
 	}
 
+	/**
+	 * 仅验证缓存 durable pack 对应 scope 的 source 文件。
+	 * topology 的权威检查在 apply 的 restore-pre 阶段执行，避免同一 undo
+	 * 在 safety reuse 与真正 mutation 前重复扫描整个工作区。
+	 */
 	async canReuseDurableSource(
 		current: SnapshotManifest,
 		target: SnapshotManifest,
@@ -341,11 +370,16 @@ export class RestoreEngine {
 		try {
 			if (await this.assertWorkspaceRootIdentity() !== current.workspaceIdentity) return false;
 			if (fromPersistentIndex) {
-				const expected = await this.plan(current, target, scopePaths);
+				assertManifest(current);
+				assertManifest(target);
+				const scope = this.canonicalScope(scopePaths);
+				assertCompatibleManifests(current, target, scope);
+				const expected = await this.computePlan(current, target, scope, [...scope]);
 				if (expected.planDigest !== cached.planDigest) return false;
 			}
-			const topology = await this.discovery.discover(this.workspaceRoot, "safety-snapshot");
-			this.assertCurrentTopology(current, target, topology);
+			// 这里只验证 durable pack 对应的 scope 源文件；完整 topology 校验由 apply
+			// 的 restore-pre 阶段负责。若在这里再次 discover，成功路径会为同一个操作
+			// 做两次全量目录扫描，而 apply 仍必须在真正 mutation 前重新确认 topology。
 			const native = await createNativeFileBatch({
 				workspaceRoot: this.workspaceRoot,
 				planDigest: cached.planDigest,
@@ -372,6 +406,48 @@ export class RestoreEngine {
 		}
 	}
 
+	/**
+	 * durable pack 尚未完成时，尝试直接证明当前 workspace 就是 rollback source。
+	 * 只核验本次 restore scope 的叶子，不扫描整个 workspace；完整 topology 与可见路径
+	 * 仍由 apply 的 restore-pre/visible-pre 在真正 mutation 前复核。
+	 */
+	async canReuseManifestSource(
+		current: SnapshotManifest,
+		target: SnapshotManifest,
+		scopePaths: readonly string[],
+	): Promise<boolean> {
+		try {
+			assertManifest(current);
+			assertManifest(target);
+			if (await this.assertWorkspaceRootIdentity() !== current.workspaceIdentity) return false;
+			const scope = [...this.canonicalScope(scopePaths)];
+			assertCompatibleManifests(current, target, new Set(scope));
+			const prepared = this.findPreparedPlan(current.manifestId, target.manifestId, scope);
+			const currentPaths = prepared === undefined
+				? await this.readOwnedPaths(current, scope)
+				: prepared.currentPaths;
+			for (const path of scope) {
+				if (path === "." || currentPaths.get(path)?.entry.kind === "directory") {
+					// 目录 scope 不能由单个 lstat 证明全部 rollback 内容，继续走 scoped capture。
+					return false;
+				}
+			}
+			const matches = await mapConcurrentOrdered(scope, RESTORE_FILE_VERIFY_CONCURRENCY, async (path) => {
+				const owned = currentPaths.get(path);
+				if (owned === undefined) {
+					await assertNoSymlinkEscape(this.workspaceRoot, path);
+					return this.pathIsAbsent(path);
+				}
+				await this.verifyEntry(current.manifestId, owned);
+				return true;
+			});
+			return matches.every(Boolean);
+		} catch (error) {
+			rethrowOperationFailure(error);
+			return false;
+		}
+	}
+
 	async prepareDurableRestore(
 		current: SnapshotManifest,
 		target: SnapshotManifest,
@@ -382,7 +458,11 @@ export class RestoreEngine {
 		const plan = await this.plan(current, target, scopePaths, options);
 		const prepared = this.takePreparedPlan(plan);
 		reportDurablePackTiming(options, "prepare.plan", started);
-		if (prepared === undefined || !this.canUseNativeFilePlan(plan, prepared.currentPaths, prepared.targetPaths)) return;
+		if (prepared === undefined) return;
+		// durable pack 的 blob 读取和编码可能持续一段时间；保留已完成的 plan/path 表，
+		// 让用户在此窗口触发 undo 时复用前序准备结果，而不是重新 listTree。
+		this.rememberPreparedPlan(plan, prepared.currentPaths, prepared.targetPaths);
+		if (!this.canUseNativeFilePlan(plan, prepared.currentPaths, prepared.targetPaths)) return;
 		const cacheRoot = await this.store.durableCacheDirectory();
 		const cacheOpId = `cache-${plan.planDigest}`;
 		const cacheJournal = new MutationJournal(
@@ -672,6 +752,26 @@ export class RestoreEngine {
 		return this.durablePackCacheMaxBytes + 1;
 	}
 
+	private findPreparedPlan(
+		currentManifestId: ManifestId,
+		targetManifestId: ManifestId,
+		scopePaths: readonly string[],
+	): PreparedRestorePlan | undefined {
+		const canonicalScope = [...new Set(scopePaths)].sort(comparePaths);
+		for (const prepared of this.preparedPlans.values()) {
+			const candidate = prepared.plan;
+			if (
+				candidate.currentManifestId !== currentManifestId ||
+				candidate.targetManifestId !== targetManifestId ||
+				candidate.scopePaths === undefined ||
+				candidate.scopePaths.length !== canonicalScope.length ||
+				candidate.scopePaths.some((path, index) => path !== canonicalScope[index])
+			) continue;
+			return prepared;
+		}
+		return undefined;
+	}
+
 	private rememberPreparedPlan(
 		plan: RestorePlan,
 		currentPaths: ReadonlyMap<string, OwnedPath>,
@@ -864,24 +964,24 @@ export class RestoreEngine {
 			return { code: "recovery_required", verifiedPaths: 0, totalPaths: currentPaths.size };
 		}
 		const t1 = performance.now();
-		try {
-			// 兼容恢复路径会先在此窗口内补偿 pending mutations，因此只有非补偿路径可以跳过枚举入口的重复发现。
-			await this.assertCompleteVisibleSubset(
-				topologyBefore,
-				[current, target],
-				options.mutationJournal,
-				{
-					topologyValidated: !compatibilityMode,
-					scopePaths: plan.scopePaths,
-					ownedPaths: [currentPaths, targetPaths],
-				},
-			);
-		} catch (error) {
-			rethrowOperationFailure(error);
-			return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
-		} finally {
-			reportRestoreTiming(options.onTiming, "apply.visiblePre", t1);
-		}
+		const visiblePreflight = this.assertCompleteVisibleSubset(
+			topologyBefore,
+			[current, target],
+			options.mutationJournal,
+			{
+				topologyValidated: !compatibilityMode,
+				// Pi runtime 持有 workspace 独占锁；restore-post 仍会复核 topology。
+				skipPostTopologyCheck: options.workspaceLockHeld === true,
+				scopePaths: plan.scopePaths,
+				ownedPaths: [currentPaths, targetPaths],
+			},
+		).then(
+			() => true,
+			(error: unknown) => {
+				rethrowOperationFailure(error);
+				return false;
+			},
+		).finally(() => reportRestoreTiming(options.onTiming, "apply.visiblePre", t1));
 		let durablePack: DurablePack | undefined;
 		if (
 			!compatibilityMode &&
@@ -940,6 +1040,9 @@ export class RestoreEngine {
 			durablePack = undefined;
 		}
 		if (pinsDeferred && durablePack === undefined) {
+			if (!await visiblePreflight) {
+				return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
+			}
 			return this.applyWithOptions(
 				plan,
 				target,
@@ -952,6 +1055,9 @@ export class RestoreEngine {
 			nativeFileBatch !== undefined && durablePack !== undefined &&
 			this.canUseNativeFilePlan(plan, currentPaths, targetPaths)
 		) {
+			if (!await visiblePreflight) {
+				return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
+			}
 			const result = await this.applyNativeFilePlan(
 				plan, current, target, currentPaths, targetPaths, topologyBefore, options, durablePack, nativeFileBatch.run,
 			);
@@ -970,10 +1076,13 @@ export class RestoreEngine {
 			[...targetPaths.keys()].filter((path) => !isPathAffectedByMutations(path, plan.deletePaths, plan.writePaths)),
 		);
 		const t3 = performance.now();
-		const preflight = await this.verifyKnownState(
+		const preflightPromise = this.verifyKnownState(
 			current, target, currentPaths, targetPaths, plan.scopePaths, reusableTargetPaths,
-		);
-		reportRestoreTiming(options.onTiming, "apply.preflight", t3);
+		).finally(() => reportRestoreTiming(options.onTiming, "apply.preflight", t3));
+		const [visiblePathsValid, preflight] = await allCompleted([visiblePreflight, preflightPromise]);
+		if (!visiblePathsValid) {
+			return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
+		}
 		if (!preflight.ok) {
 			return {
 				code: "restore_failed_safe",

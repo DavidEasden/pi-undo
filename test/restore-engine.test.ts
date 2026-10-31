@@ -682,6 +682,83 @@ describe("RestoreEngine", () => {
 		expect(await hasDurablePack(journal)).toBe(false);
 	});
 
+	it("durable prepare 后的 undo plan 复用已读取的 scoped path map", async () => {
+		const workspace = await temporaryRoot("pi-undo-prepared-plan-workspace-");
+		await writeFile(workspace, "a.txt", "target\n");
+		const storeRoot = await temporaryRoot("pi-undo-prepared-plan-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "a.txt", "source\n");
+		const current = await store.capture(await discovery.discover(workspace), ["a.txt"]);
+		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+		await engine.prepareDurableRestore(current, target, ["a.txt"]);
+		const listTree = vi.spyOn(store, "listTree");
+
+		const plan = await engine.plan(current, target, ["a.txt"]);
+
+		expect(plan.deletePaths).toEqual([]);
+		expect(plan.writePaths).toEqual(["a.txt"]);
+		expect(listTree).not.toHaveBeenCalled();
+	});
+
+	it("direct safety-source reuse 核验叶子且不扫描整个 workspace", async () => {
+		const repository = await createGitRepo();
+		temporaryRoots.push(repository.root);
+		await writeFile(repository.root, "value.txt", "before\n");
+		await writeFile(repository.root, "nested/item.txt", "before\n");
+		const storeRoot = await temporaryRoot("pi-undo-manifest-source-store-");
+		const discovery = new DriftInjectingDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		const target = await store.capture(await discovery.discover(repository.root));
+		await writeFile(repository.root, "value.txt", "after\n");
+		await writeFile(repository.root, "nested/item.txt", "after\n");
+		const current = await store.capture(await discovery.discover(repository.root));
+		const engine = new RestoreEngine({ workspaceRoot: repository.root, store, discovery });
+		discovery.reasons.length = 0;
+
+		expect(await engine.canReuseManifestSource(current, target, ["value.txt"])).toBe(true);
+		expect(discovery.reasons).toEqual([]);
+		// Directory scopes and externally modified source files retain the scoped-capture fallback.
+		expect(await engine.canReuseManifestSource(current, target, ["nested"])).toBe(false);
+		await writeFile(repository.root, "value.txt", "external\n");
+		expect(await engine.canReuseManifestSource(current, target, ["value.txt"])).toBe(false);
+	});
+
+	it("durable source reuse 省略重复拓扑扫描，但 restore-pre 仍拒绝拓扑漂移", async (context) => {
+		if (!await nativeRestoreAvailable()) return context.skip();
+		const outer = await createGitRepo();
+		temporaryRoots.push(outer.root);
+		await writeFile(outer.root, "LICENSE", "target\n");
+		const storeRoot = await temporaryRoot("pi-undo-reuse-topology-store-");
+		const transactionRoot = await temporaryRoot("pi-undo-reuse-topology-journal-");
+		const discovery = new DriftInjectingDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		const target = await store.capture(await discovery.discover(outer.root));
+		await writeFile(outer.root, "LICENSE", "current\n");
+		const scope = ["LICENSE"];
+		const current = await store.capture(await discovery.discover(outer.root), scope);
+		const engine = new RestoreEngine({ workspaceRoot: outer.root, store, discovery });
+		const plan = await engine.plan(current, target, scope);
+		await engine.prepareDurableRestore(current, target, scope);
+		await createNestedRepo(outer.root, "new-repository");
+		discovery.reasons.length = 0;
+
+		expect(await engine.canReuseDurableSource(current, target, scope)).toBe(true);
+		expect(discovery.reasons).toEqual([]);
+
+		const journal = new MutationJournal(join(transactionRoot, "mutations.jsonl"), "op-reuse-topology");
+		const result = await engine.apply(plan, target, {
+			opId: journal.operationId,
+			mutationJournal: journal,
+			deferDurability: true,
+		});
+
+		expect(result.code).toBe("restore_failed_safe");
+		expect(discovery.reasons).toEqual(["restore-pre"]);
+		expect(await readFile(join(outer.root, "LICENSE"), "utf8")).toBe("current\n");
+	});
+
 	it("git remote origin 变更导致 root identity 漂移后 restore 双向仍可用", async () => {
 		const repository = await createGitRepo();
 		temporaryRoots.push(repository.root);
@@ -760,6 +837,27 @@ describe("RestoreEngine", () => {
 		expect(result.code).toBe("ok");
 		expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("target\n");
 		expect(await hasDurablePack(journal)).toBe(true);
+	});
+
+	it("持久化索引的 source 复用不跳过正式 plan 的对象完整性校验", async () => {
+		if (!await nativeRestoreAvailable()) return;
+		const workspace = await temporaryRoot("pi-undo-cache-index-completeness-workspace-");
+		await writeFile(workspace, "a.txt", "target\n");
+		const storeRoot = await temporaryRoot("pi-undo-cache-index-completeness-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "a.txt", "source\n");
+		const current = await store.capture(await discovery.discover(workspace), ["a.txt"]);
+		const engine1 = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+		await engine1.prepareDurableRestore(current, target, ["a.txt"]);
+
+		const incompleteStore = new ToggleIncompleteSnapshotStore({ storeRoot, discovery });
+		incompleteStore.failCompleteness = true;
+		const engine2 = new RestoreEngine({ workspaceRoot: workspace, store: incompleteStore, discovery });
+		expect(await engine2.canReuseDurableSource(current, target, ["a.txt"])).toBe(true);
+		await expect(engine2.plan(current, target, ["a.txt"]))
+			.rejects.toMatchObject({ code: "object_missing" });
 	});
 
 	it("索引损坏或 pack 被篡改时跨会话复用失败并回退", async () => {
