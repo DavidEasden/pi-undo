@@ -27,7 +27,7 @@ jobs:
             output: pi-undo-fs-darwin-arm64
           - target: x86_64-apple-darwin
             output: pi-undo-fs-darwin-x64
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
