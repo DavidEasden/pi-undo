@@ -137,11 +137,27 @@ GitRunner 会对单次 Git stdout 应用 256 MiB 硬上限；超过上限时终�
 
 ### 私有 ODB 定期合并 loose object
 
-私有仓库显式关闭了 `gc.auto` 与 `maintenance.auto`，此前没有任何 repack 路径，capture 写入的 blob/tree 会一直以 loose object 保留。`cat-file --batch-check` 与 `cat-file --batch` 因此需要逐个打开 loose 文件。现在 `captureBaselineLocked` 在完整 capture 结束后检查 `git count-objects -v`：loose 对象达到 4,096 个或 256 MiB 时，用磁盘上的 loose object 列表调用 `git pack-objects`，再执行 `git prune-packed`。私有仓库没有 refs，`git repack -a` 不会把 manifest 引用的对象视为可达，因此不能直接使用 repack。
+私有仓库显式关闭了 `gc.auto` 与 `maintenance.auto`，此前没有任何 repack 路径，capture 写入的 blob/tree 会一直以 loose object 保留。`cat-file --batch-check` 与 `cat-file --batch` 因此需要逐个打开 loose 文件。
 
-维护窗口与 capture 共用 store 锁，调用方（settled capture）同时持有 workspace 独占锁；维护失败不影响已经完成的 capture，未合并的对象会在下一次阈值检查时重试。维护耗时单独报告为 `settled.compact` 阶段，不计入 `settled.fullCapture`。默认阈值可通过 `SnapshotStoreOptions.compactMinLooseObjects` 调整，0 表示禁用。
+现在 `captureBaselineLocked` 在完整 capture 结束后检查 `git count-objects -v`，满足以下条件才合并：
 
-本机 macOS arm64、Node 23.11.1，10,000 个内容各异的文件，使用真实 `SnapshotStore`：
+- loose 对象达到 4,096 个或 256 MiB；
+- 该状态已持续至少 5 分钟（首次越阈值只写 `pi-undo-compact.json` 观察时间，不立即 repack）；
+- 距离上次检查至少 60 秒（`count-objects` 在 2 万对象库上约 80–100 ms，不能每次 settle 都付）。
+
+真正执行时按磁盘上的 loose object 列表调用 `git pack-objects`，再 `git prune-packed`。私有仓库没有 refs，`git repack -a` 不会把 manifest 引用的对象视为可达，因此不能直接使用 repack。维护窗口与 capture 共用 store 锁，调用方（settled capture）同时持有 workspace 独占锁；维护失败不影响已经完成的 capture。维护耗时单独报告为 `settled.compact`，不计入 `settled.fullCapture`。默认阈值可通过 `SnapshotStoreOptions.compactMinLooseObjects` / `compactMinAgeMs` 调整，`compactMinLooseObjects: 0` 表示禁用。
+
+**为什么延迟 5 分钟**：A/B 复测发现“立即合并”会让大改动后的第一次 undo 变慢。10,000 个文件全部修改、settle 完整 capture 后再 `prepareDurableRestore` 的本机结果：
+
+| 方案 | settle（含维护） | prepare（含 plan + pack） | 合计 |
+| --- | ---: | ---: | ---: |
+| 基线（不合并） | 3,997 ms | 2,490 ms | 6,487 ms |
+| 立即合并（旧版本轮实现） | 6,074 ms（其中 repack 2,666 ms） | 1,140 ms | 7,214 ms |
+| 延迟合并（当前实现） | 3,651–3,684 ms（检查约 134 ms） | 1,728–1,775 ms | 5,379–5,459 ms |
+
+立即合并虽然把 `plan.complete` 从约 930 ms 降到约 299 ms，但 repack 成本（20,403 个对象约 2.7 s，其中 `prune-packed` 约 1 s）被提前到刚写完这批对象的时候，单次流程反而更慢。延迟到 5 分钟后，repack 摊销到后续多次 plan/verify：每次 undo 约省 600 ms，约 4–5 次后收回成本。
+
+合并前后（10,000 个内容各异的文件，真实 `SnapshotStore`）：
 
 | 指标 | 合并前（loose） | 合并后（packed） |
 | --- | ---: | ---: |
@@ -149,7 +165,36 @@ GitRunner 会对单次 Git stdout 应用 256 MiB 硬上限；超过上限时终�
 | `readBlobs`（10k blob，含 manifest 复验） | 443–966 ms | 158 ms |
 | `count-objects` | `count: 10202, in-pack: 0` | `count: 0, in-pack: 10205` |
 
-一次 10k 对象的 pack 生成在本机约 1.2 s，计入触发阈值的那次 settled capture；阈值越大维护越少、但 loose 查询窗口越长。该收益取决于对象被重复校验/读取的次数：每个 plan 会对 current 与 target 各做一次 `assertComplete`，durable pack 预取还会批量读取 blob，因此大改动后的 undo/redo 受益最明显。
+### 本轮端到端 A/B 复核
+
+基线为合并前的 `ce0b71e5`；两侧在隔离 worktree 中顺序运行同一用例。
+
+**大型工作区（10,000 个依赖包，修改 1 个文件）**：每次调用 3 次 undo/redo，三次调用结果：
+
+| 指标 | 基线 | 本轮 |
+| --- | ---: | ---: |
+| undo 中位数 | 345 / 343 / 335 ms | 367 / 337 / 328 ms |
+| redo 中位数 | 565 / 563 / 567 ms | 636 / 569 / 561 ms |
+| 扫描次数 | 2 / 2 / 2 | 2 / 2 / 2 |
+
+差异在运行波动内，**没有证明该场景的端到端提速**。该场景的可见文件只有 2 个，扫描已是常驻 13–20 ms 稳态，本轮改动主要作用在 10k 文件的捕获/校验路径，不改变这条主耗时。
+
+**durable pack 准备（10,001 个文件全部修改，冷/热各三次）**：
+
+| 场景 | 基线 | 本轮 | 变化 |
+| --- | ---: | ---: | ---: |
+| 冷缓存完整准备 | 2,598 / 2,449 / 2,431 ms | 1,697 / 1,666 / 1,666 ms | 约 -32% |
+| 热缓存完整准备 | 1,852 / 1,852 / 1,808 ms | 1,039 / 1,060 / 1,060 ms | 约 -43% |
+| `prepare.blobs` | 892–978 ms | 148–173 ms | 约 6× |
+| `plan.complete`（loose） | 约 900 ms | 约 900 ms | 不变 |
+
+主要收益来自 `readBlobs` 的 `Set` 去重（10k 唯一 blob 的 `Array.includes` 约 100 ms）与 `MutationPathIndex`；`plan.complete` 只有在 ODB 合并后才从约 930 ms 降到约 299 ms。
+
+**native metadata inspect**：10,000 个深路径（20,001 个父目录）从 111.5–112.8 ms 降到 68.3–72.3 ms；10 个路径的小请求 4.25–4.27 ms → 4.16–4.32 ms，加入“小于 64 个父目录保持串行”后没有回归。
+
+**常驻扫描**：20,002 个目录的 serve 冷启动 377 ms、带持久缓存 251 ms、稳态 13–20 ms。该收益在进程重启/长空闲后才体现；同一 session 内的连续 discover 本来就是稳态。
+
+**racy 窗口 baseline 探测**：A/B 中强制 `skipBaselineProbe` 时 `settled.baselineValidation` 从 530 ms 降到 0 ms；实际只在 restore 后 2 秒内的下一次 settle 生效，不是每轮都有的收益。
 
 ### 恢复路径的 O(n²)
 

@@ -566,6 +566,26 @@ fn assert_inspect_parents(workspace: &Path, parents: &[&str]) -> Result<(), Stri
     if parents.is_empty() {
         return Ok(());
     }
+    // 小请求保持串行：为几个父目录启动线程池反而比直接 lstat 慢。
+    const PARALLEL_PARENT_MIN: usize = 64;
+    if parents.len() < PARALLEL_PARENT_MIN {
+        for parent in parents {
+            match fs::symlink_metadata(workspace.join(parent)) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(format!("inspect 中间路径是 symlink：{parent}"));
+                }
+                Ok(metadata) if !metadata.file_type().is_dir() => {
+                    return Err(format!("inspect 中间路径不是目录：{parent}"));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("inspect 父目录 metadata 失败：{parent}: {error}"));
+                }
+            }
+        }
+        return Ok(());
+    }
     let workspace = Arc::new(workspace.to_path_buf());
     let targets: Arc<Vec<&str>> = Arc::new(parents.to_vec());
     let next = AtomicUsize::new(0);

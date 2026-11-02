@@ -1,5 +1,5 @@
 import type { BigIntStats } from "node:fs";
-import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, stat } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -60,12 +60,24 @@ const LEAF_CACHE_FILE = "leaf-cache.json";
 // 变成高频 repack，同时让大改动后的 cat-file 查询尽快走 pack 索引。
 const COMPACT_MIN_LOOSE_OBJECTS = 4_096;
 const COMPACT_MIN_LOOSE_KIB = 256 * 1024;
+// 阈值达到后不立即打包：刚写入的大批对象正是下一次 undo 要校验的对象，
+// 立刻 repack 只会把成本提前，单次操作反而更慢。连续 5 分钟维持高压后才合并，
+// 让打包摊销到后续多次 plan/verify 上。
+const COMPACT_MIN_AGE_MS = 5 * 60 * 1_000;
+const COMPACT_PENDING_FILE = "pi-undo-compact.json";
+// `git count-objects -v` 在 2 万 loose object 的库上约 80-100 ms；不需要每次 settle 都付。
+const COMPACT_CHECK_INTERVAL_MS = 60_000;
 
 interface PinRecord {
 	readonly schemaVersion: 1;
 	readonly manifestId: ManifestId;
 	readonly reasons: readonly string[];
 	readonly updatedAt: string;
+}
+
+interface CompactPendingRecord {
+	readonly schemaVersion: 1;
+	readonly observedAt: number;
 }
 
 interface StoreGcRecord {
@@ -231,6 +243,8 @@ export interface SnapshotStoreOptions {
 	readonly nativeMetadata?: NativeMetadataPort;
 	/** 仅供测试或受控调优：0 禁用 loose object 合并。 */
 	readonly compactMinLooseObjects?: number;
+	/** 阈值持续达到多久后才真正合并；默认 5 分钟。 */
+	readonly compactMinAgeMs?: number;
 }
 
 export interface CaptureOptions {
@@ -314,6 +328,8 @@ export class SnapshotStore {
 	private readonly clock: () => number;
 	private readonly nativeMetadata: NativeMetadataPort;
 	private readonly compactMinLooseObjects: number;
+	private readonly compactMinAgeMs: number;
+	private lastCompactCheckAt: number | undefined;
 	private readonly manifestLocations = new Map<string, string>();
 	// Tree 与 blob 都由 object ID 内容寻址；缓存只复用已从私有 ODB 读取的不可变内容。
 	private readonly treeEntriesCache = new Map<string, Promise<CapturedTreeEntry[]>>();
@@ -336,6 +352,7 @@ export class SnapshotStore {
 		this.clock = options.clock ?? Date.now;
 		this.nativeMetadata = options.nativeMetadata ?? new NativeMetadataInspector();
 		this.compactMinLooseObjects = options.compactMinLooseObjects ?? COMPACT_MIN_LOOSE_OBJECTS;
+		this.compactMinAgeMs = options.compactMinAgeMs ?? COMPACT_MIN_AGE_MS;
 	}
 
 	static supportsValidatedBlobBatch(store: SnapshotStore): boolean {
@@ -589,6 +606,9 @@ export class SnapshotStore {
 	 */
 	private async compactLooseObjectsLocked(topology: RootTopology): Promise<void> {
 		if (this.compactMinLooseObjects <= 0) return;
+		const now = this.clock();
+		if (this.lastCompactCheckAt !== undefined && now - this.lastCompactCheckAt < COMPACT_CHECK_INTERVAL_MS) return;
+		this.lastCompactCheckAt = now;
 		const storeDirectory = this.storeDirectory(topology);
 		let roots: string[];
 		try {
@@ -614,14 +634,40 @@ export class SnapshotStore {
 		);
 		const looseCount = parseCountObjectsField(output, "count");
 		const looseKiB = parseCountObjectsField(output, "size");
-		if (looseCount < this.compactMinLooseObjects && looseKiB < COMPACT_MIN_LOOSE_KIB) return;
+		const pendingPath = join(gitDirectory, COMPACT_PENDING_FILE);
+		if (looseCount < this.compactMinLooseObjects && looseKiB < COMPACT_MIN_LOOSE_KIB) {
+			// 已经低于阈值（例如 store 被清理）：撤销待合并状态。
+			await rm(pendingPath, { force: true }).catch(() => {});
+			return;
+		}
+		const pending = await readCompactPending(pendingPath);
+		const now = this.clock();
+		if (pending === undefined) {
+			if (this.compactMinAgeMs <= 0) {
+				// 测试或显式配置：立即合并。
+			} else {
+				// 只是延迟标记；不 fsync，丢失最多让合并再等一个窗口。
+				await writeFile(
+					pendingPath,
+					JSON.stringify({ schemaVersion: 1, observedAt: now } satisfies CompactPendingRecord),
+					{ mode: 0o600 },
+				).catch(() => {});
+				return;
+			}
+		} else if (now - pending.observedAt < this.compactMinAgeMs) {
+			return;
+		}
 		const objects = await this.listLooseObjectIds(gitDirectory);
-		if (objects.length === 0) return;
+		if (objects.length === 0) {
+			await rm(pendingPath, { force: true }).catch(() => {});
+			return;
+		}
 		await this.runGit(
 			["--git-dir", gitDirectory, "pack-objects", "-q", join(gitDirectory, "objects", "pack", "pack")],
 			{ env: environment, stdin: `${objects.join("\n")}\n` },
 		);
 		await this.runGit(["--git-dir", gitDirectory, "prune-packed"], { env: environment });
+		await rm(pendingPath, { force: true }).catch(() => {});
 	}
 
 	private async listLooseObjectIds(gitDirectory: string): Promise<string[]> {
@@ -2930,6 +2976,19 @@ function parseObjectIdLines(output: string, expectedCount: number): string[] {
 		throw new SnapshotStoreError("capture_failed", "git hash-object 批量输出无效");
 	}
 	return lines;
+}
+
+async function readCompactPending(path: string): Promise<CompactPendingRecord | undefined> {
+	try {
+		const value: unknown = JSON.parse(await readFile(path, "utf8"));
+		if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+		const record = value as Record<string, unknown>;
+		if (record.schemaVersion !== 1 || typeof record.observedAt !== "number" ||
+			!Number.isSafeInteger(record.observedAt)) return undefined;
+		return { schemaVersion: 1, observedAt: record.observedAt };
+	} catch {
+		return undefined;
+	}
 }
 
 /** 解析 `git count-objects -v` 的整数字段；缺失或非法值按 0 处理（维护是 best-effort）。 */

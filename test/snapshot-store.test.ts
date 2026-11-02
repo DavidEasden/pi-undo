@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { access, chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -2406,8 +2407,13 @@ describe("私有 ODB loose object 合并", () => {
 			await writeFixtureFile(workspace, `src/file-${index}.txt`, `content-${index}\n`);
 		}
 		const storeRoot = await temporaryRoot("pi-undo-compact-store-");
-		// 阈值设为 1，让本用例不依赖大工作区；生产默认值为 4,096。
-		const store = new SnapshotStore({ storeRoot, compactMinLooseObjects: 1, discovery: new RootDiscovery() });
+		// 阈值设为 1、合并年龄设为 0，让本用例不依赖大工作区；生产默认值为 4,096 / 5 分钟。
+		const store = new SnapshotStore({
+			storeRoot,
+			compactMinLooseObjects: 1,
+			compactMinAgeMs: 0,
+			discovery: new RootDiscovery(),
+		});
 		const topology = await new RootDiscovery().discover(workspace);
 		const baseline = await store.capture(topology);
 		const gitDirectory = await findPrivateGitDirectory(storeRoot);
@@ -2423,6 +2429,39 @@ describe("私有 ODB loose object 合并", () => {
 		const after = readCountObjects(gitDirectory);
 		expect(after.inPack).toBeGreaterThan(0);
 		expect(after.count).toBe(0);
+	}, 60_000);
+
+	it("阈值达到后先记录待合并状态，年龄满足后才真正打包", async () => {
+		const workspace = await temporaryRoot("pi-undo-compact-age-");
+		for (let index = 0; index < 8; index += 1) {
+			await writeFixtureFile(workspace, `file-${index}.txt`, `content-${index}\n`);
+		}
+		const storeRoot = await temporaryRoot("pi-undo-compact-age-store-");
+		let now = Date.UTC(2026, 10, 1);
+		const store = new SnapshotStore({
+			storeRoot,
+			clock: () => now,
+			compactMinLooseObjects: 1,
+			compactMinAgeMs: 5 * 60 * 1_000,
+			discovery: new RootDiscovery(),
+		});
+		const topology = await new RootDiscovery().discover(workspace);
+		const baseline = await store.capture(topology);
+		const gitDirectory = await findPrivateGitDirectory(storeRoot);
+
+		await writeFixtureFile(workspace, "file-0.txt", "changed-1\n");
+		await store.captureBaseline(topology, baseline, undefined, { skipBaselineProbe: true });
+		// 首次越阈值只记录观察时间，不在刚写完大批对象时立即 repack。
+		expect(readCountObjects(gitDirectory).inPack).toBe(0);
+		expect(existsSync(join(gitDirectory, "pi-undo-compact.json"))).toBe(true);
+
+		now += 5 * 60 * 1_000;
+		await writeFixtureFile(workspace, "file-1.txt", "changed-2\n");
+		await store.captureBaseline(topology, baseline, undefined, { skipBaselineProbe: true });
+		const after = readCountObjects(gitDirectory);
+		expect(after.inPack).toBeGreaterThan(0);
+		expect(after.count).toBe(0);
+		expect(existsSync(join(gitDirectory, "pi-undo-compact.json"))).toBe(false);
 	}, 60_000);
 
 	it("未达到阈值时不重写 pack", async () => {
