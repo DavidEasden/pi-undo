@@ -27,8 +27,11 @@ describe.skipIf(process.env.PI_UNDO_PACK_MEMORY_BENCHMARK !== "1")("pack 私有�
 			const before = process.memoryUsage();
 			const phases: Array<{ phase: string; durationMs: number; arrayBuffersDeltaMiB: number; rssDeltaMiB: number }> = [];
 			const started = performance.now();
+			// 与 restore-engine 的生产路径一致：blob 由本次操作独占，可转移所有权。
+			const transfer = process.env.PI_UNDO_PACK_MEMORY_TRANSFER === "1";
 			const pack = await createDurablePack(new MutationJournal(join(root, "mutations.jsonl"), "memory-benchmark"), {
 				opId: "memory-benchmark", planDigest: "a".repeat(64), entries,
+				payloadOwnership: transfer ? "transfer" : "copy",
 			}, {
 				onTiming: (phase, durationMs) => {
 					const current = process.memoryUsage();
@@ -37,7 +40,7 @@ describe.skipIf(process.env.PI_UNDO_PACK_MEMORY_BENCHMARK !== "1")("pack 私有�
 						rssDeltaMiB: (current.rss - before.rss) / 1024 / 1024 });
 				},
 			});
-			console.log(JSON.stringify({ benchmark: "pack-memory", payloadMiB: 64,
+			console.log(JSON.stringify({ benchmark: "pack-memory", payloadMiB: 64, payloadOwnership: transfer ? "transfer" : "copy",
 				durationMs: performance.now() - started, phases,
 				// 阶段边界观测值，不宣称捕获同步计算期间的瞬时峰值。
 				maxObservedArrayBuffersDeltaMiB: Math.max(...phases.map((phase) => phase.arrayBuffersDeltaMiB)),

@@ -797,6 +797,29 @@ describe("UndoController", () => {
 		expect(checkpoint?.changedPaths).toEqual(["file.txt"]);
 	});
 
+	it("restore 后的 racy-clean 窗口内 settled 跳过 baseline 探测", async () => {
+		const seen: Array<boolean | undefined> = [];
+		const deps = dependencies({
+			captureBaseline: async (baseline, _onDiagnostics, _onTiming, options) => {
+				seen.push(options?.skipBaselineProbe);
+				return baseline;
+			},
+		});
+		const controller = new UndoControllerImpl(deps);
+		await controller.prepareInput("修复文件", { streaming: false });
+		await controller.beforeAgentStart();
+		await controller.agentSettled();
+
+		// /undo 命令自身不产生 settled 捕获；紧接着的下一条 prompt 才消费 target baseline。
+		await controller.prepareInput("/undo", { streaming: false });
+		expect((await controller.undo()).code).toBe("ok");
+		await controller.prepareInput("继续修复", { streaming: false });
+		await controller.beforeAgentStart();
+		await controller.agentSettled();
+
+		expect(seen.at(-1)).toBe(true);
+	});
+
 	it("旧适配器没有 captureBaseline 时 settled 回退完整 capture", async () => {
 		const deps = dependencies();
 		expect(deps.captureBaseline).toBeUndefined();

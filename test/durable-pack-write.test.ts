@@ -78,6 +78,24 @@ function prefixBuffers(buffers: readonly NodeJS.ArrayBufferView[], limit: number
 }
 
 describe("durable pack 批量写入", () => {
+	it("transfer 所有权生成与 copy 相同的 pack，且 leaf 仍返回副本", async () => {
+		const copyJournal = await fixture();
+		const transferJournal = await fixture();
+		const copied = await createDurablePack(copyJournal, legacyInput());
+		const transferred = await createDurablePack(transferJournal, { ...legacyInput(), payloadOwnership: "transfer" });
+
+		expect(transferred.packChecksum).toBe(copied.packChecksum);
+		expect(await readFile(durablePackPath(transferJournal))).toEqual(await readFile(durablePackPath(copyJournal)));
+		const entry = legacyInput().entries.find((candidate) => candidate.path === "value.txt")!;
+		const leaf = transferred.leaf(entry.path, entry.sourceFingerprint);
+		expect(leaf?.kind).toBe("file");
+		if (leaf?.kind !== "file") throw new Error("测试 pack 缺少 file leaf");
+		leaf.bytes[0] = 0;
+		const reread = transferred.leaf(entry.path, entry.sourceFingerprint);
+		if (reread?.kind !== "file") throw new Error("测试 pack 缺少 file leaf");
+		expect(reread.bytes[0]).toBe(Buffer.from("旧内容\n")[0]);
+	});
+
 	it("兼容旧 v1 pack，重新生成的文件逐字节一致且诊断异常不影响结果", async () => {
 		const journal = await fixture();
 		const legacy = await readFile(legacyUrl);

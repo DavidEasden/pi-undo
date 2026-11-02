@@ -710,7 +710,7 @@ fn timestamp_nanos(seconds: i64, nanos: i64) -> Option<u128> {
     Some(seconds as u128 * 1_000_000_000 + nanos as u128)
 }
 
-fn load_cache(path: &Path, root: &Directory, workspace: &Path) -> Option<DirectoryCache> {
+pub(crate) fn load_cache(path: &Path, root: &Directory, workspace: &Path) -> Option<DirectoryCache> {
     let cache: DirectoryCache = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
     let root_metadata = root.file.metadata().ok()?;
     if cache.schema_version != CACHE_SCHEMA_VERSION
@@ -745,7 +745,7 @@ fn valid_children(children: &[String]) -> bool {
         .all(|name| valid_child_name(name) && seen.insert(name))
 }
 
-fn write_cache(
+pub(crate) fn write_cache(
     path: &Path,
     workspace: &Path,
     root: &Directory,

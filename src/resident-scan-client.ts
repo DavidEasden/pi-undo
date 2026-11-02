@@ -34,6 +34,8 @@ export class ResidentScanClient {
 		private readonly executable: string,
 		private readonly workspaceRoot: string,
 		private readonly timeoutMs: number,
+		/** 与一次性 helper 共享的持久目录缓存；serve 启动时读取，初始扫描后写回。 */
+		private readonly cachePath?: string,
 	) {}
 
 	/** 建立进程并完成首次全量扫描；失败静默，正式扫描会回退。 */
@@ -93,6 +95,7 @@ export class ResidentScanClient {
 			const handshakeLine = await this.requestLine(child, JSON.stringify({
 				schemaVersion: 1,
 				workspaceRoot: this.workspaceRoot,
+				...(this.cachePath === undefined ? {} : { cachePath: this.cachePath }),
 			}), timeoutMs);
 			const handshake = handshakeLine === undefined ? undefined : parseObjectOrUndefined(handshakeLine);
 			if (handshake?.ok !== true || handshake.ready !== true) {
@@ -211,9 +214,10 @@ export class ResidentScanClient {
 	private scheduleIdle(): void {
 		if (this.idleTimer !== undefined) clearTimeout(this.idleTimer);
 		if (this.closed) return;
+		// 与 Rust 端 600s 看门狗保持同一量级；大工作区冷启动比重启进程更贵。
 		this.idleTimer = setTimeout(() => {
 			void this.close();
-		}, 70_000);
+		}, 610_000);
 		this.idleTimer.unref?.();
 	}
 

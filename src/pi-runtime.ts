@@ -9,6 +9,7 @@ import type {
 
 import {
 	UndoControllerImpl,
+	type CaptureBaselineOptions,
 	type ControllerDependencies,
 	type ControllerInitialState,
 	type SettlementDiagnostic,
@@ -72,6 +73,7 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 		baseline: SnapshotManifest,
 		onDiagnostics?: (diagnostic: CaptureDiagnostic) => void,
 		onTiming?: (phase: string, durationMs: number) => void,
+		options: CaptureBaselineOptions = {},
 	) => {
 		const discoveryStartedAt = performance.now();
 		let topology: RootTopology;
@@ -85,6 +87,7 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 		}
 		return store.captureBaseline(topology, baseline, undefined, {
 			topologyAlreadyValidated: true,
+			...(options.skipBaselineProbe === true ? { skipBaselineProbe: true } : {}),
 			// captureBaselineWithWorkspaceLock 已持有工作区独占锁，且此处刚完成 discover；
 			// post-capture topology 校验在锁内是冗余的，跳过以节省一次全量目录扫描。
 			skipPostTopologyCheck: true,

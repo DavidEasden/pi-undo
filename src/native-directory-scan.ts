@@ -52,7 +52,11 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 	private readonly executable: string | undefined;
 	private capabilities: Promise<ReadonlySet<string>> | undefined;
 	private cacheDirectory: Promise<string> | undefined;
-	private resident: { readonly workspaceRoot: string; readonly client: ResidentScanClient } | undefined;
+	private resident: {
+		readonly workspaceRoot: string;
+		readonly cachePath: string | undefined;
+		readonly client: ResidentScanClient;
+	} | undefined;
 	private prewarmInFlight: { readonly workspaceRoot: string; readonly promise: Promise<void> } | undefined;
 
 	constructor(executable = nativeExecutable()) {
@@ -86,23 +90,29 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 		try {
 			const capabilities = await this.probeCapabilities(requestDirectory);
 			if (!capabilities.has("scan-serve-v1")) return;
-			const client = this.ensureResident(workspaceRoot);
+			const cachePath = capabilities.has("scan-serve-cache-v1")
+				? await this.directoryCachePath(workspaceRoot, temporaryRoot, requestDirectory)
+				: undefined;
+			const client = this.ensureResident(workspaceRoot, cachePath);
 			if (client !== undefined) await client.prewarm();
 		} finally {
 			await rm(requestDirectory, { recursive: true, force: true }).catch(() => {});
 		}
 	}
 
-	private ensureResident(workspaceRoot: string): ResidentScanClient | undefined {
+	private ensureResident(workspaceRoot: string, cachePath: string | undefined): ResidentScanClient | undefined {
 		if (this.executable === undefined) return undefined;
-		if (this.resident?.workspaceRoot === workspaceRoot) return this.resident.client;
+		if (this.resident?.workspaceRoot === workspaceRoot && this.resident.cachePath === cachePath) {
+			return this.resident.client;
+		}
 		if (this.resident !== undefined) void this.resident.client.close();
 		const client = new ResidentScanClient(
 			this.executable,
 			workspaceRoot,
 			configuredTimeout("PI_UNDO_OPERATION_TIMEOUT_MS", 300_000),
+			cachePath,
 		);
-		this.resident = { workspaceRoot, client };
+		this.resident = { workspaceRoot, cachePath, client };
 		return client;
 	}
 
@@ -122,8 +132,11 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 				: capabilities.has("scan-directories-v1") ? "v1" : undefined;
 			if (version === undefined) return undefined;
 
+			// 旧 helper 不认识握手里的 cachePath（deny_unknown_fields）；能力未声明时不发送。
+			const cachePath = version === "v2" && capabilities.has("scan-serve-cache-v1")
+				? await this.directoryCachePath(workspaceRoot, temporaryRoot, requestDirectory) : undefined;
 			if (capabilities.has("scan-serve-v1")) {
-				const client = this.ensureResident(workspaceRoot);
+				const client = this.ensureResident(workspaceRoot, cachePath);
 				if (client !== undefined) {
 					const response = await client.scan();
 					checkOperation();
@@ -138,8 +151,6 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 
 			const budget = operationProcessOptions(configuredTimeout("PI_UNDO_OPERATION_TIMEOUT_MS", 300_000));
 			const requestPath = join(requestDirectory, "request.json");
-			const cachePath = version === "v2"
-				? await this.directoryCachePath(workspaceRoot, temporaryRoot, requestDirectory) : undefined;
 			await writeFile(requestPath, JSON.stringify({
 				schemaVersion: version === "v2" ? 2 : 1,
 				workspaceRoot,

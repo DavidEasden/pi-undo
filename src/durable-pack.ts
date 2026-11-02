@@ -34,6 +34,12 @@ export interface DurablePackInput {
 	readonly opId: string;
 	readonly planDigest: string;
 	readonly entries: readonly DurablePackEntryInput[];
+	/**
+	 * "transfer" 表示调用方放弃 `variants[].bytes` 的所有权（通常是刚从 store 读出的
+	 * 独占 buffer）；pack 直接引用这些 buffer，不再复制一份完整 payload。
+	 * 默认 "copy" 保留对调用方之后改写输入的隔离。
+	 */
+	readonly payloadOwnership?: "copy" | "transfer";
 }
 
 export interface DurablePackPreparationOptions {
@@ -170,7 +176,7 @@ export async function createDurablePack(
 	const planDigest = input.planDigest;
 	if (opId !== journal.operationId) throw new Error("durable pack opId 与 mutation journal 不匹配");
 	assertDigest(planDigest, "planDigest");
-	const entries = canonicalEntries(input.entries);
+	const entries = canonicalEntries(input.entries, true, input.payloadOwnership ?? "copy");
 	reportDurablePackTiming(options, "pack.validate", validationStarted);
 	const encodingStarted = performance.now();
 	const payloads: Buffer[] = [];
@@ -218,10 +224,13 @@ export async function createDurablePack(
 	reportDurablePackTiming(options, "pack.encode", encodingStarted);
 	let writeCalls = 0;
 	let handle;
+	// 写入时同步累积 pack checksum：writeAll 按实际写出的顺序哈希全部 buffer，
+	// 发布后不再完整遍历一遍 payload。
+	const digest = createHash("sha256");
 	try {
 		const writeStarted = performance.now();
 		handle = await open(temporary, "wx", 0o600);
-		writeCalls = await writeAll(handle, [MAGIC, lengthBytes, headerBytes, ...payloads]);
+		writeCalls = await writeAll(handle, [MAGIC, lengthBytes, headerBytes, ...payloads], digest);
 		reportDurablePackTiming(options, "pack.write", writeStarted);
 		checkOperation();
 		const syncStarted = performance.now();
@@ -240,11 +249,6 @@ export async function createDurablePack(
 		throw error;
 	}
 	const checksumStarted = performance.now();
-	const digest = createHash("sha256");
-	digest.update(MAGIC);
-	digest.update(lengthBytes);
-	digest.update(headerBytes);
-	for (const payload of payloads) digest.update(payload);
 	const packChecksum = digest.digest("hex");
 	reportDurablePackTiming(options, "pack.checksum", checksumStarted);
 	const residentStarted = performance.now();
@@ -303,11 +307,13 @@ export async function loadDurablePack(
 				if (start < payloadStart || end > bytes.length) throw new Error("durable pack payload 越界");
 				const content = bytes.subarray(start, end);
 				if (checksum(content) !== variant.dataChecksum) throw new Error("durable pack payload checksum 不匹配");
+				// payload 共享同一次 readFile 的 buffer；`leaf()` 返回时再复制，
+				// 避免为每个 variant 额外保留一份完整 payload。
 				leaf = {
 					kind: "file",
 					fingerprint: variant.fingerprint,
 					mode: variant.mode!,
-					bytes: new Uint8Array(content),
+					bytes: content,
 				};
 			}
 			const semanticFingerprint = leaf.kind === "absent"
@@ -490,6 +496,7 @@ async function assertSameFileIdentity(original: string, artifact: string, logica
 function canonicalEntries(
 	entries: readonly DurablePackEntryInput[],
 	validateSemanticFingerprints = true,
+	payloadOwnership: "copy" | "transfer" = "copy",
 ): DurablePackEntryInput[] {
 	const sorted = [...entries].sort((left, right) => left.path.localeCompare(right.path));
 	let previous: string | undefined;
@@ -503,8 +510,9 @@ function canonicalEntries(
 		if (entry.targetArtifact !== null) assertArtifact(entry.path, entry.targetArtifact, "target");
 		assertDigest(entry.sourceFingerprint, "sourceFingerprint");
 		if (entry.targetFingerprint !== null) assertDigest(entry.targetFingerprint, "targetFingerprint");
-		// 在校验及任何回调、await 之前取得所有权；调用方之后改写输入不影响 pack。
-		const variants = entry.variants.map((variant): DurableLeafInput => variant.kind === "file"
+		// 默认在校验及任何回调、await 之前复制 payload；调用方之后改写输入不影响 pack。
+		// "transfer" 只用于内部刚读出的独占 buffer，避免再复制一份完整 payload。
+		const variants = entry.variants.map((variant): DurableLeafInput => variant.kind === "file" && payloadOwnership === "copy"
 			? { ...variant, bytes: new Uint8Array(variant.bytes) }
 			: { ...variant }).sort((left, right) => left.fingerprint.localeCompare(right.fingerprint));
 		const fingerprints = new Set<string>();
@@ -626,7 +634,11 @@ function durablePackFromOwnedEntries(
 	);
 }
 
-async function writeAll(handle: FileHandle, buffers: readonly Uint8Array[]): Promise<number> {
+async function writeAll(
+	handle: FileHandle,
+	buffers: readonly Uint8Array[],
+	digest?: ReturnType<typeof createHash>,
+): Promise<number> {
 	let calls = 0;
 	let batch: Uint8Array[] = [];
 	let batchBytes = 0;
@@ -642,12 +654,15 @@ async function writeAll(handle: FileHandle, buffers: readonly Uint8Array[]): Pro
 			}
 			remainingBytes -= bytesWritten;
 			// 短写可能停在任意 buffer 内，也可能跨过多个 buffer。
+			// digest 只累积实际写出的字节，顺序与文件内容一致。
 			let consumed = bytesWritten;
 			let index = 0;
 			while (index < remaining.length && consumed >= remaining[index]!.byteLength) {
+				digest?.update(remaining[index]!);
 				consumed -= remaining[index]!.byteLength;
 				index += 1;
 			}
+			if (consumed > 0) digest?.update(remaining[index]!.subarray(0, consumed));
 			remaining = remaining.slice(index);
 			if (consumed > 0) remaining[0] = remaining[0]!.subarray(consumed);
 		}

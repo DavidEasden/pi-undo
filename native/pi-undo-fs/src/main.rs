@@ -14,7 +14,7 @@ use file_batch::{
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 #[cfg(not(unix))]
 use std::fs::OpenOptions;
@@ -129,12 +129,12 @@ fn run() -> Result<(), String> {
     if first == "--capabilities" {
         #[cfg(target_os = "macos")]
         {
-            let capabilities = r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","inspect-batches-v1","scan-directories-v1","scan-directories-v2","scan-serve-v1","restore-files-v2","restore-files-v3"]}"#;
+            let capabilities = r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","inspect-batches-v1","scan-directories-v1","scan-directories-v2","scan-serve-v1","scan-serve-cache-v1","restore-files-v2","restore-files-v3"]}"#;
             println!("{capabilities}");
         }
         #[cfg(target_os = "linux")]
         {
-            let capabilities = r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","inspect-batches-v1","scan-directories-v1","scan-directories-v2","restore-files-v2","restore-files-v3"]}"#;
+            let capabilities = r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","inspect-batches-v1","scan-directories-v1","scan-directories-v2","scan-serve-cache-v1","restore-files-v2","restore-files-v3"]}"#;
             println!("{capabilities}");
         }
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
@@ -443,16 +443,24 @@ fn run_inspect_batches(request_path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         let mut seen = BTreeSet::new();
+        let mut borrowed = HashSet::new();
+        collect_inspect_parents(&request.batches, &mut seen, &mut borrowed)?;
+        let parents: Vec<String> = borrowed.into_iter().map(ToOwned::to_owned).collect();
+        assert_inspect_parents(&workspace, &parents.iter().map(String::as_str).collect::<Vec<_>>())?;
+        drop(seen);
         let mut processed = 0usize;
         let mut batches = Vec::with_capacity(request.batches.len());
         for paths in request.batches {
-            let entries = inspect_paths(&workspace, paths, &mut seen)?;
+            let entries = parallel_inspect(&workspace, paths)?;
             processed += entries.len();
             batches.push(InspectBatchResponse {
                 processed: entries.len(),
                 entries,
             });
         }
+        // 叶子 stat 之后复核同一份父目录集合；整个请求只做前后两次，
+        // 不再按 batch 重复校验（batch 之间的父目录集合通常互不重叠）。
+        assert_inspect_parents(&workspace, &parents.iter().map(String::as_str).collect::<Vec<_>>())?;
         let response = InspectBatchesResponse {
             ok: true,
             processed,
@@ -505,49 +513,103 @@ fn inspect_paths(
     paths: Vec<String>,
     seen: &mut BTreeSet<String>,
 ) -> Result<Vec<InspectEntry>, String> {
+    let mut borrowed = HashSet::new();
+    collect_one_batch_parents(&paths, seen, &mut borrowed)?;
+    let parents: Vec<String> = borrowed.into_iter().map(ToOwned::to_owned).collect();
+    assert_inspect_parents(workspace, &parents.iter().map(String::as_str).collect::<Vec<_>>())?;
+    let entries = parallel_inspect(workspace, paths)?;
+    assert_inspect_parents(workspace, &parents.iter().map(String::as_str).collect::<Vec<_>>())?;
+    Ok(entries)
+}
+
+/// 校验单个 batch 的路径并收集祖先目录（借用路径字符串，避免为每个祖先单独分配）。
+#[cfg(unix)]
+fn collect_one_batch_parents<'a>(
+    paths: &'a [String],
+    seen: &mut BTreeSet<String>,
+    parents: &mut HashSet<&'a str>,
+) -> Result<(), String> {
     if paths.len() > MAX_INSPECT_BATCH_PATHS {
         return Err("inspect batch 路径数量超出限制".into());
     }
-    let mut parents = BTreeSet::new();
-    for path in &paths {
+    for path in paths {
         validate_relative_path(path)?;
         if !seen.insert(path.clone()) {
             return Err(format!("inspect 路径重复：{path}"));
         }
-        let parts = Path::new(path).components().collect::<Vec<_>>();
-        let mut parent = PathBuf::new();
-        for component in parts.iter().take(parts.len().saturating_sub(1)) {
-            if let Component::Normal(value) = component {
-                parent.push(value);
-                parents.insert(parent.clone());
+        for (index, byte) in path.bytes().enumerate() {
+            if byte == b'/' {
+                parents.insert(&path[..index]);
             }
         }
     }
-    assert_inspect_parents(workspace, &parents)?;
-    let entries = parallel_inspect(workspace, paths)?;
-    assert_inspect_parents(workspace, &parents)?;
-    Ok(entries)
+    Ok(())
 }
 
+/// 校验多个 batch 的路径并合并祖先目录；`seen` 在 batch 之间共享。
 #[cfg(unix)]
-fn assert_inspect_parents(workspace: &Path, parents: &BTreeSet<PathBuf>) -> Result<(), String> {
-    for parent in parents {
-        match fs::symlink_metadata(workspace.join(parent)) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(format!("inspect 中间路径是 symlink：{}", parent.display()));
-            }
-            Ok(metadata) if !metadata.file_type().is_dir() => {
-                return Err(format!("inspect 中间路径不是目录：{}", parent.display()));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!(
-                    "inspect 父目录 metadata 失败：{}: {error}",
-                    parent.display()
-                ));
-            }
+fn collect_inspect_parents<'a>(
+    batches: &'a [Vec<String>],
+    seen: &mut BTreeSet<String>,
+    parents: &mut HashSet<&'a str>,
+) -> Result<(), String> {
+    for paths in batches {
+        collect_one_batch_parents(paths, seen, parents)?;
+    }
+    Ok(())
+}
+
+/// 并行验证父目录：每个目录仍是独立 `lstat`（保持原有 symlink/非目录诊断），
+/// 但请求内共享去重后的集合，并用与叶子 stat 相同的 32 路并发执行。
+#[cfg(unix)]
+fn assert_inspect_parents(workspace: &Path, parents: &[&str]) -> Result<(), String> {
+    if parents.is_empty() {
+        return Ok(());
+    }
+    let workspace = Arc::new(workspace.to_path_buf());
+    let targets: Arc<Vec<&str>> = Arc::new(parents.to_vec());
+    let next = AtomicUsize::new(0);
+    let failure = Mutex::new(None::<String>);
+    thread::scope(|scope| {
+        for _ in 0..CONCURRENCY.min(targets.len()) {
+            let workspace = Arc::clone(&workspace);
+            let targets = Arc::clone(&targets);
+            let next = &next;
+            let failure = &failure;
+            scope.spawn(move || {
+                loop {
+                    if failure.lock().expect("inspect failure lock").is_some() {
+                        break;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= targets.len() {
+                        break;
+                    }
+                    let parent = targets[index];
+                    let result = match fs::symlink_metadata(workspace.join(parent)) {
+                        Ok(metadata) if metadata.file_type().is_symlink() => {
+                            Err(format!("inspect 中间路径是 symlink：{parent}"))
+                        }
+                        Ok(metadata) if !metadata.file_type().is_dir() => {
+                            Err(format!("inspect 中间路径不是目录：{parent}"))
+                        }
+                        Ok(_) => Ok(()),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(error) => Err(format!("inspect 父目录 metadata 失败：{parent}: {error}")),
+                    };
+                    if let Err(message) = result {
+                        let mut guard = failure.lock().expect("inspect failure lock");
+                        if guard.is_none() {
+                            *guard = Some(message);
+                        }
+                        break;
+                    }
+                }
+            });
         }
+    });
+    if let Some(message) = failure.lock().expect("inspect failure lock").take() {
+        return Err(message);
     }
     Ok(())
 }
@@ -1136,6 +1198,45 @@ mod tests {
         let request_path = request(&root, &["link/a.txt"]);
         let result = run_inspect(&request_path);
         assert!(result.unwrap_err().contains("中间路径是 symlink"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inspect_batches_validates_shared_parents_across_batches() {
+        let root = fixture();
+        fs::create_dir_all(root.join("node_modules/pkg/lib")).unwrap();
+        fs::write(root.join("node_modules/pkg/lib/a.js"), b"a").unwrap();
+        fs::write(root.join("node_modules/pkg/lib/b.js"), b"b").unwrap();
+        let request_path = batches_request(
+            &root,
+            &[
+                &["node_modules/pkg/lib/a.js"],
+                &["node_modules/pkg/lib/b.js", "node_modules/pkg/missing/c.js"],
+            ],
+        );
+        run_inspect_batches(&request_path).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inspect_batches_detects_symlink_parent_in_later_batch() {
+        let root = fixture();
+        fs::create_dir(root.join("target")).unwrap();
+        fs::write(root.join("target/a.txt"), b"abc").unwrap();
+        symlink(root.join("target"), root.join("link")).unwrap();
+        let request_path = batches_request(&root, &[&["a.txt"], &["link/a.txt"]]);
+        let error = run_inspect_batches(&request_path).unwrap_err();
+        assert!(error.contains("中间路径是 symlink"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inspect_rejects_file_as_parent_directory() {
+        let root = fixture();
+        fs::write(root.join("plain.txt"), b"abc").unwrap();
+        let request_path = request(&root, &["plain.txt/child.txt"]);
+        let error = run_inspect(&request_path).unwrap_err();
+        assert!(error.contains("中间路径不是目录"), "{error}");
         fs::remove_dir_all(root).unwrap();
     }
 

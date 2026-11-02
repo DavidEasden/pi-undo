@@ -56,6 +56,10 @@ const BLOB_BATCH_MAX_BYTES = 16 * 1024 * 1024;
 const BLOB_BATCH_MAX_ENTRIES = process.platform === "win32" ? 256 : 2_048;
 const RACY_CLEAN_WINDOW_NS = 2_000_000_000n;
 const LEAF_CACHE_FILE = "leaf-cache.json";
+// 私有 ODB 的 loose object 达到阈值后合并为 pack；阈值取得足够大，避免把高频 capture
+// 变成高频 repack，同时让大改动后的 cat-file 查询尽快走 pack 索引。
+const COMPACT_MIN_LOOSE_OBJECTS = 4_096;
+const COMPACT_MIN_LOOSE_KIB = 256 * 1024;
 
 interface PinRecord {
 	readonly schemaVersion: 1;
@@ -225,6 +229,8 @@ export interface SnapshotStoreOptions {
 	readonly lock?: WorkspaceLock;
 	readonly clock?: () => number;
 	readonly nativeMetadata?: NativeMetadataPort;
+	/** 仅供测试或受控调优：0 禁用 loose object 合并。 */
+	readonly compactMinLooseObjects?: number;
 }
 
 export interface CaptureOptions {
@@ -234,6 +240,11 @@ export interface CaptureOptions {
 	 * 因此校验窗口内出现的漂移依然会被拒绝。仅限调用方与本次枚举之间没有文件变更时使用。
 	 */
 	readonly topologyAlreadyValidated?: boolean;
+	/**
+	 * 调用方已证明 baseline 一定不是当前状态时跳过 baseline 探测；完整 capture 仍会
+	 * 重新建立对象、ignored proof 与 leaves 缓存。
+	 */
+	readonly skipBaselineProbe?: boolean;
 	/**
 	 * 跳过捕获或枚举结束后的 topology 二次校验（safety-snapshot post 扫描）。
 	 * 仅在调用方已持有工作区独占锁、且刚刚完成 discover 并确认 topology 未变化时传 true。
@@ -302,6 +313,7 @@ export class SnapshotStore {
 	private readonly lock: WorkspaceLock;
 	private readonly clock: () => number;
 	private readonly nativeMetadata: NativeMetadataPort;
+	private readonly compactMinLooseObjects: number;
 	private readonly manifestLocations = new Map<string, string>();
 	// Tree 与 blob 都由 object ID 内容寻址；缓存只复用已从私有 ODB 读取的不可变内容。
 	private readonly treeEntriesCache = new Map<string, Promise<CapturedTreeEntry[]>>();
@@ -323,6 +335,7 @@ export class SnapshotStore {
 		this.lock = options.lock ?? new WorkspaceLock();
 		this.clock = options.clock ?? Date.now;
 		this.nativeMetadata = options.nativeMetadata ?? new NativeMetadataInspector();
+		this.compactMinLooseObjects = options.compactMinLooseObjects ?? COMPACT_MIN_LOOSE_OBJECTS;
 	}
 
 	static supportsValidatedBlobBatch(store: SnapshotStore): boolean {
@@ -521,9 +534,13 @@ export class SnapshotStore {
 				throw new SnapshotStoreError("capture_failed", `broken root 不能静默进入 baseline 校验: ${brokenRoots.join(", ")}`);
 			}
 			const baselineValidationStartedAt = performance.now();
-			let baselineFresh: boolean;
+			let baselineFresh = false;
 			try {
-				baselineFresh = await this.isBaselineFresh(topology, baseline, scope, options, diagnostic);
+				// skipBaselineProbe 只由调用方对“已确定失效”的 baseline 传入；此时探测必然失败，
+				// 跳过它可以把一次完整 collectVisibleLeaves + ignored proof 从结算路径上省掉。
+				if (options.skipBaselineProbe !== true) {
+					baselineFresh = await this.isBaselineFresh(topology, baseline, scope, options, diagnostic);
+				}
 			} finally {
 				publishCaptureTiming(options.onTiming, "settled.baselineValidation", baselineValidationStartedAt);
 			}
@@ -538,17 +555,100 @@ export class SnapshotStore {
 			// 已完成一次捕获前 topology 校验；完整回退仍保留捕获后的校验。
 			if (diagnostic !== undefined) diagnostic.strategy = "baseline-fallback";
 			const fullCaptureStartedAt = performance.now();
+			let captured: SnapshotManifest;
 			try {
-				return await this.captureLocked(topology, scope, { ...options, topologyAlreadyValidated: true, skipPostTopologyCheck: options.skipPostTopologyCheck }, diagnostic);
+				captured = await this.captureLocked(
+					topology,
+					scope,
+					{ ...options, topologyAlreadyValidated: true, skipPostTopologyCheck: options.skipPostTopologyCheck },
+					diagnostic,
+				);
 			} finally {
 				publishCaptureTiming(options.onTiming, "settled.fullCapture", fullCaptureStartedAt);
 			}
+			// 完整捕获刚写入一批 loose object；结算路径已持有 store 与 workspace 锁，
+			// 是唯一可以在不打断恢复读取的情况下做维护的窗口。维护时长单独报告。
+			const compactStartedAt = performance.now();
+			await this.compactLooseObjectsLocked(topology);
+			publishCaptureTiming(options.onTiming, "settled.compact", compactStartedAt);
+			return captured;
 		} catch (error) {
 			if (error instanceof SnapshotStoreError) {
 				throw error;
 			}
 			throw new SnapshotStoreError("capture_failed", errorMessage(error), { cause: error });
 		}
+	}
+
+	/**
+	 * 把私有 ODB 的 loose object 合并为 pack。
+	 *
+	 * 私有仓库没有 refs，`git repack -a` 不会把 manifest 引用的对象视为可达，
+	 * 因此这里直接按磁盘上的 loose object 列表调用 pack-objects，再 prune-packed。
+	 * 维护失败不影响已经完成的 capture；取消/超时仍按操作契约向上传递。
+	 */
+	private async compactLooseObjectsLocked(topology: RootTopology): Promise<void> {
+		if (this.compactMinLooseObjects <= 0) return;
+		const storeDirectory = this.storeDirectory(topology);
+		let roots: string[];
+		try {
+			roots = await readdir(join(storeDirectory, "roots"));
+		} catch {
+			return;
+		}
+		for (const root of roots) {
+			try {
+				await this.compactGitDirectory(join(storeDirectory, "roots", root, "git"));
+			} catch {
+				// 维护是 best-effort：capture 已经完成，repack 失败/取消不影响本次结果，
+				// 未合并的 loose object 会在下一次阈值检查时重试。
+			}
+		}
+	}
+
+	private async compactGitDirectory(gitDirectory: string): Promise<void> {
+		const environment = cleanGitEnvironment();
+		const output = await this.runGit(
+			["--git-dir", gitDirectory, "count-objects", "-v"],
+			{ env: environment },
+		);
+		const looseCount = parseCountObjectsField(output, "count");
+		const looseKiB = parseCountObjectsField(output, "size");
+		if (looseCount < this.compactMinLooseObjects && looseKiB < COMPACT_MIN_LOOSE_KIB) return;
+		const objects = await this.listLooseObjectIds(gitDirectory);
+		if (objects.length === 0) return;
+		await this.runGit(
+			["--git-dir", gitDirectory, "pack-objects", "-q", join(gitDirectory, "objects", "pack", "pack")],
+			{ env: environment, stdin: `${objects.join("\n")}\n` },
+		);
+		await this.runGit(["--git-dir", gitDirectory, "prune-packed"], { env: environment });
+	}
+
+	private async listLooseObjectIds(gitDirectory: string): Promise<string[]> {
+		const objectsDirectory = join(gitDirectory, "objects");
+		const result: string[] = [];
+		let directories: string[];
+		try {
+			directories = await readdir(objectsDirectory);
+		} catch {
+			return result;
+		}
+		for (const directory of directories) {
+			if (!/^[0-9a-f]{2}$/.test(directory)) continue;
+			let files: string[];
+			try {
+				files = await readdir(join(objectsDirectory, directory));
+			} catch {
+				continue;
+			}
+			for (const file of files) {
+				// 兼容 SHA-1（40 字符）与 SHA-256（64 字符）对象目录。
+				if (/^[0-9a-f]{38}$/.test(file) || /^[0-9a-f]{62}$/.test(file)) {
+					result.push(`${directory}${file}`);
+				}
+			}
+		}
+		return result.sort();
 	}
 
 	private async isBaselineFresh(
@@ -1024,11 +1124,15 @@ export class SnapshotStore {
 				pending.push({ gitDirectory, objectId: request.blobId });
 			}
 			const bytesById = new Map<string, Uint8Array>();
-			const byGitDirectory = new Map<string, string[]>();
+			// 同一 ODB 的对象 ID 去重必须用 Set：10k 个唯一 blob 时 Array.includes 是 O(n²)。
+			const byGitDirectory = new Map<string, Set<string>>();
 			for (const { gitDirectory, objectId } of pending) {
-				const ids = byGitDirectory.get(gitDirectory) ?? [];
-				if (!ids.includes(objectId)) ids.push(objectId);
-				byGitDirectory.set(gitDirectory, ids);
+				let ids = byGitDirectory.get(gitDirectory);
+				if (ids === undefined) {
+					ids = new Set<string>();
+					byGitDirectory.set(gitDirectory, ids);
+				}
+				ids.add(objectId);
 			}
 			for (const [gitDirectory, objectIds] of byGitDirectory) {
 				for (const objectId of objectIds) {
@@ -1036,7 +1140,7 @@ export class SnapshotStore {
 					if (cached === undefined) continue;
 					bytesById.set(objectId, await cached.promise);
 				}
-				const missing = objectIds.filter((objectId) => !bytesById.has(objectId));
+				const missing = [...objectIds].filter((objectId) => !bytesById.has(objectId));
 				if (missing.length === 0) continue;
 				// batch 头部自带长度，无需预先知道 size；按响应自身长度解析后逐条校验。
 				const loaded = parseBatchBlobOutputByOrder(
@@ -2826,6 +2930,14 @@ function parseObjectIdLines(output: string, expectedCount: number): string[] {
 		throw new SnapshotStoreError("capture_failed", "git hash-object 批量输出无效");
 	}
 	return lines;
+}
+
+/** 解析 `git count-objects -v` 的整数字段；缺失或非法值按 0 处理（维护是 best-effort）。 */
+function parseCountObjectsField(output: string, field: string): number {
+	const match = new RegExp(`^${field}: (\\d+)$`, "m").exec(output);
+	if (match === null) return 0;
+	const value = Number(match[1]);
+	return Number.isSafeInteger(value) ? value : 0;
 }
 
 function treeDirectoryPaths(entries: readonly CapturedTreeEntry[]): string[] {

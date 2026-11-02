@@ -49,6 +49,7 @@ export interface ControllerDependencies {
 		baseline: SnapshotManifest,
 		onDiagnostics?: (diagnostic: CaptureDiagnostic) => void,
 		onTiming?: (phase: string, durationMs: number) => void,
+		options?: CaptureBaselineOptions,
 	) => Promise<SnapshotManifest>;
 	readonly captureSafety?: (
 		referenceManifestId: ManifestId,
@@ -85,6 +86,14 @@ export interface ControllerDependencies {
 	readonly onProcess?: (diagnostic: ProcessDiagnostic) => void;
 	readonly onOperationEnd?: (opId: string, result: OperationResult) => Promise<void>;
 	readonly onSettlement?: (diagnostic: SettlementDiagnostic) => void | Promise<void>;
+}
+
+export interface CaptureBaselineOptions {
+	/**
+	 * 调用方已证明 baseline 一定不是当前状态（例如 restore 后仍在 racy-clean 窗口内），
+	 * 跳过 isBaselineFresh 的完整探测，直接走 fullCapture。
+	 */
+	readonly skipBaselineProbe?: boolean;
 }
 
 export interface JournalPort {
@@ -626,16 +635,21 @@ export class UndoControllerImpl implements UndoController {
 		try {
 			// settled 复用 run 开始时的 before；helper 在缺少 captureBaseline 时回退完整 capture。
 			// 撕裂捕获（并发写撞上断言窗口）是暂态的：短暂退避后重试一次，成功则不清空历史。
+			// racy-clean 窗口（2s）内文件 ctime 未稳定，isBaselineFresh 必然失败且会多跑一轮
+			// collectVisibleLeaves；只有超过 2s 后才能从 target manifest 受益。
+			const appliedTargetInRacyWindow = appliedTargetManifest !== undefined &&
+				appliedTargetAt !== undefined && performance.now() - appliedTargetAt < 2_000;
 			const after = await measure("settled.capture", () =>
 				this.captureSettledBaselineWithRetry(
-					// racy-clean 窗口（2s）内文件 ctime 未稳定，isBaselineFresh 必然失败且会多跑一轮
-					// collectVisibleLeaves；只有超过 2s 后才能从 target manifest 受益。
-					(appliedTargetManifest !== undefined && appliedTargetAt !== undefined &&
-						performance.now() - appliedTargetAt >= 2_000)
+					appliedTargetManifest !== undefined && appliedTargetAt !== undefined &&
+						!appliedTargetInRacyWindow
 						? appliedTargetManifest
 						: staged.before,
 					(diagnostic) => captureDiagnostics.push(diagnostic),
 					recordCaptureTiming,
+					// 窗口内传入的 baseline 是 restore 前的 staged.before，已确定失效；
+					// 探测只会白跑一轮，直接进入 fullCapture。
+					{ skipBaselineProbe: appliedTargetInRacyWindow },
 				));
 			failureStage = "settled.changedPaths";
 			const changedPaths = await measure("settled.changedPaths", () =>
@@ -1045,8 +1059,10 @@ export class UndoControllerImpl implements UndoController {
 				await this.dependencies.journal.markCommitted(descriptor.opId);
 			});
 			this.lastSafetyManifestId = rollback.manifestId;
-			this.lastAppliedTargetManifest = target;
-			this.lastAppliedTargetAt = performance.now();
+			if (checkpoint.changedPaths.length > 0) {
+				this.lastAppliedTargetManifest = target;
+				this.lastAppliedTargetAt = performance.now();
+			}
 			return done(this.advanceHistory(action, checkpoint, { code: "ok", changedFiles: applied.verifiedPaths }));
 		} catch (error) {
 			if (this.recordUnsafeExit(error)) return done(this.recoveryResult());
@@ -1244,6 +1260,7 @@ export class UndoControllerImpl implements UndoController {
 		baseline: SnapshotManifest,
 		onDiagnostics?: (diagnostic: CaptureDiagnostic) => void,
 		onTiming?: (phase: string, durationMs: number) => void,
+		options: CaptureBaselineOptions = {},
 	): Promise<SnapshotManifest> {
 		const captureBaseline = this.dependencies.captureBaseline;
 		if (captureBaseline === undefined) return this.captureWithWorkspaceLock();
@@ -1256,7 +1273,7 @@ export class UndoControllerImpl implements UndoController {
 		}
 		const captureStartedAt = performance.now();
 		try {
-			return await captureBaseline(baseline, onDiagnostics, onTiming);
+			return await captureBaseline(baseline, onDiagnostics, onTiming, options);
 		} catch (error) {
 			this.recordUnsafeExit(error);
 			throw error;
@@ -1275,16 +1292,17 @@ export class UndoControllerImpl implements UndoController {
 		baseline: SnapshotManifest,
 		onDiagnostics?: (diagnostic: CaptureDiagnostic) => void,
 		onTiming?: (phase: string, durationMs: number) => void,
+		options: CaptureBaselineOptions = {},
 	): Promise<SnapshotManifest> {
 		try {
-			return await this.captureBaselineWithWorkspaceLock(baseline, onDiagnostics, onTiming);
+			return await this.captureBaselineWithWorkspaceLock(baseline, onDiagnostics, onTiming, options);
 		} catch (error) {
 			rethrowOperationFailure(error);
 			if (!isTransientCaptureFailure(error)) throw error;
 			const retryStartedAt = performance.now();
 			await sleep(250);
 			onTiming?.("settled.captureRetryDelay", performance.now() - retryStartedAt);
-			return await this.captureBaselineWithWorkspaceLock(baseline, onDiagnostics, onTiming);
+			return await this.captureBaselineWithWorkspaceLock(baseline, onDiagnostics, onTiming, options);
 		}
 	}
 

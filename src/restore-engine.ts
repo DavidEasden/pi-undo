@@ -27,6 +27,7 @@ import { recoverPackedMutations } from "./packed-recovery.ts";
 import type { ManifestId, RestorePath, SnapshotManifest, SnapshotRoot } from "./model.ts";
 import {
 	assertNoSymlinkEscape,
+	MutationPathIndex,
 	relativeSafePath,
 	sortDeletePaths,
 	sortWritePaths,
@@ -473,6 +474,8 @@ export class RestoreEngine {
 		const pack = await createDurablePack(cacheJournal, {
 			opId: cacheOpId,
 			planDigest: plan.planDigest,
+			// durablePackEntries 的 blob 是本次操作独占的 store 读取结果，可转移所有权。
+			payloadOwnership: "transfer",
 			entries: await this.durablePackEntries(
 				current,
 				target,
@@ -1019,6 +1022,8 @@ export class RestoreEngine {
 					durablePack = await createDurablePack(options.mutationJournal, {
 						opId: options.opId,
 						planDigest: plan.planDigest,
+						// 同上：这里的 entries 只属于本次 pack，写入后不再被其他调用方使用。
+						payloadOwnership: "transfer",
 						entries: await this.durablePackEntries(current, target, currentPaths, targetPaths, plan, options.opId),
 					});
 				}
@@ -1072,8 +1077,9 @@ export class RestoreEngine {
 		} finally {
 			reportRestoreTiming(options.onTiming, "apply.prefetch", t2);
 		}
+		const mutationIndex = new MutationPathIndex(plan.deletePaths, plan.writePaths);
 		const reusableTargetPaths = new Set(
-			[...targetPaths.keys()].filter((path) => !isPathAffectedByMutations(path, plan.deletePaths, plan.writePaths)),
+			[...targetPaths.keys()].filter((path) => !mutationIndex.affects(path)),
 		);
 		const t3 = performance.now();
 		const preflightPromise = this.verifyKnownState(
@@ -2322,16 +2328,6 @@ function entriesEquivalent(left: OwnedPath | undefined, right: OwnedPath): boole
 	return left !== undefined && sameEntry(left.entry, right.entry);
 }
 
-function isPathAffectedByMutations(
-	path: string,
-	deletePaths: readonly string[],
-	writePaths: readonly string[],
-): boolean {
-	return [...deletePaths, ...writePaths].some((mutationPath) =>
-		mutationPath === path || mutationPath.startsWith(`${path}/`) || path.startsWith(`${mutationPath}/`),
-	);
-}
-
 function entryFingerprint(owned: OwnedPath): string {
 	const path = owned.absolutePath;
 	if (owned.entry.kind === "directory") {
@@ -2514,17 +2510,20 @@ class IgnoredProofIndex {
 		if (this.exact.size === 0) return false;
 		// 排序成本只在第一次目录判定时付出，纯文件计划完全不触发。
 		this.sortedPaths ??= [...this.exact].sort();
-		const sorted = this.sortedPaths;
-		const prefix = `${path}/`;
-		let low = 0;
-		let high = sorted.length;
-		while (low < high) {
-			const middle = (low + high) >>> 1;
-			if (sorted[middle]! < prefix) low = middle + 1;
-			else high = middle;
-		}
-		return low < sorted.length && sorted[low]!.startsWith(prefix);
+		return sortedStartsWith(this.sortedPaths, `${path}/`);
 	}
+}
+
+/** 排序数组中第一个以 prefix 开头的项；相同逻辑供 ignored proof 与 mutation 索引复用。 */
+function sortedStartsWith(sorted: readonly string[], prefix: string): boolean {
+	let low = 0;
+	let high = sorted.length;
+	while (low < high) {
+		const middle = (low + high) >>> 1;
+		if (sorted[middle]! < prefix) low = middle + 1;
+		else high = middle;
+	}
+	return low < sorted.length && sorted[low]!.startsWith(prefix);
 }
 
 function rootBoundaryDirectories(root: string): string[] {

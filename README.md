@@ -214,6 +214,15 @@ Performance gains come from:
 - **Durable pack caching** — completed agent runs build and cache reverse/forward durable packs; the undo/redo hot path reuses the cached pack with manifest pin, avoiding redundant snapshot reads.
 - **Indexed WAL record lookups** — mutation records are indexed by ordinal for O(1) direct access instead of linear scan.
 - **Indexed path conflict resolution** — `exactExclusions` are stored as a Set for O(1) membership checks instead of O(n) `Array.includes`.
+- **Private ODB compaction** — loose snapshot objects are packed once 4,096 objects (or 256 MiB) accumulate, keeping `cat-file --batch-check` and blob reads on the pack index. 10k-object `assertComplete` dropped from ~331 ms to ~49 ms and 10k-blob reads from ~443–966 ms to ~158 ms on the local benchmark.
+- **Indexed mutation path checks** — `MutationPathIndex` replaces the per-target-path `[...deletePaths, ...writePaths].some(...)` scan (10k × 10k ≈ 962 ms → < 1 ms).
+- **Deduped batch blob reads** — object IDs are deduplicated with a `Set` instead of `Array.includes` (10k unique blobs ≈ 101 ms → 2.2 ms).
+- **Shared, parallel parent validation** — native metadata inspect validates the deduplicated parent set once per request with 32-way concurrency (10k deep paths 111.7 ms → 71.0 ms).
+- **Persistent resident scan cache** — `--serve` starts from the on-disk v2 directory cache and writes it back; idle timeout raised to 600 s. 20k-directory cold start 377 ms → 251 ms with a warm cache, steady-state requests remain 13–20 ms.
+- **Racy-window baseline skip** — settled capture skips the guaranteed-failing `isBaselineFresh` probe within 2 s after a restore, removing ~227–240 ms from the settlement path.
+- **Transferred pack payloads** — the restore path hands pack ownership of its freshly read blobs instead of copying them (64 MiB benchmark: +64.0 MiB → +0.01 MiB extra ArrayBuffers, +2.3 MiB RSS), and the pack checksum is computed during the write pass.
+
+The ignored-present proof still runs `git ls-files --others --ignored --exclude-standard` on every full capture (~363 ms for 10k ignored files on the local benchmark). Reusing a previous proof needs directory-cache evidence to cross the helper boundary, which is tracked in `docs/native-performance.md` as the remaining follow-up.
 - **Batch validated manifest blob reads** — durable pack reads coalesce blob fetches into a single batch per manifest with combined Git validation.
 
 ## How It Works

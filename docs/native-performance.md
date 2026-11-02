@@ -131,6 +131,93 @@ GitRunner 会对单次 Git stdout 应用 256 MiB 硬上限；超过上限时终�
 
 真实 Pi SDK、10,000 个 ignored 依赖包、单文件变更的三次 undo/redo 基准中，改动前 undo 中位数为 2,150 ms、每次 3 次完整拓扑发现；改动后中位数为 1,745 ms、每次 2 次发现。单次诊断中 safety 阶段从 504 ms 降至 90 ms：当 `changedPaths` 全部是叶子且工作区内容逐项匹配 checkpoint source 时，直接复用 source manifest；目录 scope、内容不匹配或无法证明时仍走原 scoped safety capture。运行时持有 workspace lock 后，visible-pre 的可见路径校验保留，但跳过其后的重复 topology 扫描；`restore-pre` 和 `restore-post` 两次检查仍保留。上述为本机样本，墙钟数据会受扫描缓存和负载影响，不构成其他工作区的速度保证。
 
+## 私有 ODB 合并、父目录校验与 pack 内存
+
+本轮不改恢复语义，只处理五类剩余成本：私有快照库长期保留 loose object、恢复路径上的两处 O(n²)、native metadata inspect 的重复父目录校验、常驻扫描重启后的冷启动，以及 durable pack 的整份 payload 副本。
+
+### 私有 ODB 定期合并 loose object
+
+私有仓库显式关闭了 `gc.auto` 与 `maintenance.auto`，此前没有任何 repack 路径，capture 写入的 blob/tree 会一直以 loose object 保留。`cat-file --batch-check` 与 `cat-file --batch` 因此需要逐个打开 loose 文件。现在 `captureBaselineLocked` 在完整 capture 结束后检查 `git count-objects -v`：loose 对象达到 4,096 个或 256 MiB 时，用磁盘上的 loose object 列表调用 `git pack-objects`，再执行 `git prune-packed`。私有仓库没有 refs，`git repack -a` 不会把 manifest 引用的对象视为可达，因此不能直接使用 repack。
+
+维护窗口与 capture 共用 store 锁，调用方（settled capture）同时持有 workspace 独占锁；维护失败不影响已经完成的 capture，未合并的对象会在下一次阈值检查时重试。维护耗时单独报告为 `settled.compact` 阶段，不计入 `settled.fullCapture`。默认阈值可通过 `SnapshotStoreOptions.compactMinLooseObjects` 调整，0 表示禁用。
+
+本机 macOS arm64、Node 23.11.1，10,000 个内容各异的文件，使用真实 `SnapshotStore`：
+
+| 指标 | 合并前（loose） | 合并后（packed） |
+| --- | ---: | ---: |
+| `assertComplete`（10k blob） | 331 ms | 49 ms |
+| `readBlobs`（10k blob，含 manifest 复验） | 443–966 ms | 158 ms |
+| `count-objects` | `count: 10202, in-pack: 0` | `count: 0, in-pack: 10205` |
+
+一次 10k 对象的 pack 生成在本机约 1.2 s，计入触发阈值的那次 settled capture；阈值越大维护越少、但 loose 查询窗口越长。该收益取决于对象被重复校验/读取的次数：每个 plan 会对 current 与 target 各做一次 `assertComplete`，durable pack 预取还会批量读取 blob，因此大改动后的 undo/redo 受益最明显。
+
+### 恢复路径的 O(n²)
+
+- `MutationPathIndex`（`src/path-safety.ts`）：`reusableTargetPaths` 原实现对每个 target path 重新展开 `[...deletePaths, ...writePaths]` 并线性扫描，10k × 10k 时约 962 ms。现在一次构建精确集合与排序列表，单次判定近 O(log n)，同数据形状 < 1 ms（构建 1.6 ms）。语义与 `mutationPath === path || mutationPath.startsWith(path + "/") || path.startsWith(mutationPath + "/")` 逐项等价，随机集合差分测试覆盖。
+- `SnapshotStore.readBlobs`：同一 ODB 内的对象 ID 去重从 `Array.includes` 改为 `Set`，10k 个唯一 blob 从约 101 ms 降到 2.2 ms。该路径会在 durable pack 预制的 source/target 两个方向各执行一次。
+
+### native metadata inspect 父目录校验
+
+`inspect-batches` 原来按 batch 各自构建 `BTreeSet<PathBuf>` 父目录集合并前后各校验一遍；10,000 个 `node_modules/pkg/lib/index.js` 会收集 20,001 个父目录、执行 40,002 次 `lstat`。现在：
+
+- 路径校验与父目录收集在整个请求内共享，parent 集合用 `HashSet<&str>` 借用请求中的路径字符串，避免为每个祖先分配 `PathBuf`；
+- 父目录校验用与叶子 stat 相同的 32 路并发执行，前后仍然各一次；
+- 保留原有 symlink/非目录诊断；macOS 上 `O_NOFOLLOW|O_DIRECTORY` 对 symlink 返回 `ENOTDIR` 的差异不再影响判定，因为改为直接 `lstat`。
+
+本机 10k 深路径（20,001 个父目录）`--inspect-batches`：111.7 ms → 71.0 ms，约 36%；平铺 10k 路径的基线仍约 20 ms。
+
+### 常驻扫描的持久缓存与闲置超时
+
+`--serve` 握手新增可选 `cachePath`。启动时读取一次性扫描使用的 v2 目录缓存作为初始 `previous`，每个目录仍逐项核验元数据，漂移会重新枚举；初始扫描结束后把最终目录表原子写回，供下一次进程启动复用。闲置超时从 60 s 提高到 600 s，TS 客户端从 70 s 提高到 610 s，避免间歇使用时反复付冷启动。
+
+本机 20,002 个目录：
+
+| 场景 | 初始扫描 |
+| --- | ---: |
+| serve 冷启动（无缓存） | 377 ms |
+| serve 使用持久缓存启动 | 251 ms |
+| serve 稳态请求（无变化/单文件变化） | 13–20 ms |
+
+### settled 的 baseline 探测
+
+restore 成功后 2 s 内的 racy-clean 窗口内，文件 ctime 尚未稳定，`isBaselineFresh` 必然返回 false，但仍会完整执行 `assertObjectsComplete`、`collectVisibleLeaves`、ignored proof 和叶子复核。调用方在这个窗口内传入的 baseline 已确定失效，因此 `CaptureOptions.skipBaselineProbe` 直接进入 fullCapture。
+
+控制器只在 `changedPaths.length > 0` 的 restore 后记录 target baseline；空 changedPaths 的 session-only undo 不写文件，探测仍可能成功，不跳过。多文件工作区实测 `settled.baselineValidation` 约 227–240 ms，本改动把这部分从结算路径上移除（诊断中保留 0 ms 阶段）。
+
+### durable pack 的内存副本
+
+`createDurablePack` 默认仍在校验前复制 payload，保证调用方之后改写输入不影响磁盘与驻留 pack。`restore-engine` 的 blob 来自本次操作独占的 store 读取，两个生产调用点改用 `payloadOwnership: "transfer"`，pack 直接引用这些 buffer。`loadDurablePack` 也不再为每个 variant 复制 payload，而是共享同一次 `readFile` 的 subarray，`leaf()` 返回时再复制。pack checksum 改为在 `writeAll` 按实际写出的字节增量计算，发布后不再完整遍历 payload。
+
+本机独立进程 64 MiB payload 基准（阶段边界观测，不是瞬时峰值）：
+
+| 模式 | 额外 ArrayBuffer | 额外 RSS | `pack.checksum` |
+| --- | ---: | ---: | ---: |
+| copy（默认/旧行为） | 64.0 MiB | 66.8 MiB | 24 ms |
+| transfer（生产路径） | 0.01 MiB | 2.3 MiB | ~0 ms |
+
+`PI_UNDO_PACK_MEMORY_TRANSFER=1` 可复现 transfer 数值；输入 buffer 本身仍由调用方持有，因此该表只表示 pack 阶段的额外增量。
+
+### 仍未处理：ignored-present proof 的全量枚举
+
+`captureIgnoredPresentPaths` 每次完整 capture 仍执行 `git ls-files --others --ignored --exclude-standard`。本机 10,000 个 `node_modules` 忽略文件约 363 ms（`--directory` 可降到约 30 ms，但会丢失具体路径，无法直接替代 proof）。复用旧 proof 需要证明 ignored 子树的目录项集合未变，即把目录扫描的 cache 复用证据（或 FSEvents 代数）传递到 capture；这需要新的 helper 协议和缓存 schema 变更，本轮未实现，避免在恢复安全判定上引入未经复核的信任路径。当前只完成了同一条路径上 native inspect 部分的优化。
+
+### 测试与复现
+
+新增覆盖：MutationPathIndex 随机差分、readBlobs 重复请求只发一次 batch、`skipBaselineProbe` 直接完整捕获、自动 loose object 合并与阈值以下不重写 pack、transfer 所有权与 copy 逐字节一致且 `leaf()` 仍返回副本、serve handshake 的 cachePath（`PI_UNDO_RUN_RESIDENT_LIVE=1` 冒烟用例）。
+
+```bash
+npm run build:native
+cp native/pi-undo-fs/target/release/pi-undo-fs native/bin/pi-undo-fs-darwin-arm64
+npm run test:native
+npm test
+npm run typecheck
+PI_UNDO_PACK_MEMORY_BENCHMARK=1 npx vitest run test/durable-pack-memory-benchmark.test.ts
+PI_UNDO_PACK_MEMORY_BENCHMARK=1 PI_UNDO_PACK_MEMORY_TRANSFER=1 npx vitest run test/durable-pack-memory-benchmark.test.ts
+PI_UNDO_RUN_RESIDENT_LIVE=1 npx vitest run test/resident-live.test.ts
+```
+
+本轮未在本机验证 Linux、其他架构或 Windows 的构建与运行；发布仍依赖现有六平台构建流程。
+
 ## 上一轮原生优化的历史数据
 
 下表保留上一轮以 `d7d80230` 为起点的结果，便于追踪原生扫描及普通文件恢复的收益；这些数据不是本轮缓存改动的前后对比。单位为毫秒。

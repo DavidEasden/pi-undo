@@ -174,3 +174,45 @@ function hasErrorCode(error: unknown, code: string): error is NodeJS.ErrnoExcept
 function fail(code: PathSafetyErrorCode, message: string): never {
 	throw new PathSafetyError(code, message);
 }
+
+/**
+ * mutation 影响判定索引。
+ *
+ * 原实现每次判定都重新展开 `[...deletePaths, ...writePaths]` 并线性扫描；
+ * 10k 目标路径 × 10k mutation 时是 O(n²)。这里把精确集合、mutation 祖先集合和
+ * 排序后的 mutation 列表一次建好，单次判定近 O(log n)。
+ * 语义与 `mutationPath === path || mutationPath.startsWith(path + "/") || path.startsWith(mutationPath + "/")` 完全一致。
+ */
+export class MutationPathIndex {
+	private readonly exact: ReadonlySet<string>;
+	private readonly sorted: readonly string[];
+
+	constructor(deletePaths: readonly string[], writePaths: readonly string[]) {
+		this.exact = new Set([...deletePaths, ...writePaths]);
+		this.sorted = [...this.exact].sort();
+	}
+
+	affects(path: string): boolean {
+		// mutation 是 path 本身，或是 path 内的后代。
+		if (this.exact.has(path) || sortedStartsWith(this.sorted, `${path}/`)) return true;
+		// path 位于某个 mutation 目录内：path 的严格祖先中存在 mutation。
+		let separator = path.lastIndexOf("/");
+		while (separator > 0) {
+			if (this.exact.has(path.slice(0, separator))) return true;
+			separator = path.lastIndexOf("/", separator - 1);
+		}
+		return false;
+	}
+}
+
+/** 排序数组中第一个以 prefix 开头的项；供 ignored proof 与 mutation 索引复用。 */
+export function sortedStartsWith(sorted: readonly string[], prefix: string): boolean {
+	let low = 0;
+	let high = sorted.length;
+	while (low < high) {
+		const middle = (low + high) >>> 1;
+		if (sorted[middle]! < prefix) low = middle + 1;
+		else high = middle;
+	}
+	return low < sorted.length && sorted[low]!.startsWith(prefix);
+}

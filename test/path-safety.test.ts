@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
-import { assertNoSymlinkParents, pathSetsOverlap } from "../src/path-safety.ts";
+import { assertNoSymlinkParents, MutationPathIndex, pathSetsOverlap } from "../src/path-safety.ts";
 
 describe("pathSetsOverlap", () => {
 	it.each([
@@ -74,3 +74,38 @@ function legacyPathSetsOverlap(leftPaths: readonly string[], rightPaths: readonl
 function isPathAtOrBelow(parent: string, candidate: string): boolean {
 	return candidate === parent || candidate.startsWith(`${parent}/`);
 }
+
+describe("MutationPathIndex", () => {
+	const cases: Array<[string, readonly string[], readonly string[], string, boolean]> = [
+		["mutation 与 path 相同", ["a/b"], [], "a/b", true],
+		["mutation 是 path 的后代", ["a/b/c"], [], "a/b", true],
+		["path 是 mutation 的后代", [], ["a/b"], "a/b/c", true],
+		["仅共享字符串前缀不算重叠", ["a-b"], [], "a", false],
+		["仅共享文件名前缀不算重叠", ["a/bc"], [], "a/b", false],
+		["完全无关", ["x/y"], ["z"], "a/b", false],
+	];
+	it.each(cases)("%s", (_label, deletePaths, writePaths, candidate, expected) => {
+		expect(new MutationPathIndex(deletePaths, writePaths).affects(candidate)).toBe(expected);
+	});
+	it("与原线性谓词在随机路径集合上等价", () => {
+		let state = 0x9e3779b9;
+		const random = (): number => {
+			state = (Math.imul(state, 1103515245) + 12345) >>> 0;
+			return state;
+		};
+		const path = (): string => Array.from({ length: 1 + random() % 4 }, () => `p${random() % 8}`).join("/");
+		const linear = (candidate: string, mutations: readonly string[]): boolean =>
+			mutations.some((mutation) =>
+				mutation === candidate ||
+				mutation.startsWith(`${candidate}/`) ||
+				candidate.startsWith(`${mutation}/`),
+			);
+		for (let iteration = 0; iteration < 2_000; iteration += 1) {
+			const deletePaths = Array.from({ length: random() % 8 }, path);
+			const writePaths = Array.from({ length: random() % 8 }, path);
+			const index = new MutationPathIndex(deletePaths, writePaths);
+			const candidate = path();
+			expect(index.affects(candidate)).toBe(linear(candidate, [...deletePaths, ...writePaths]));
+		}
+	});
+});

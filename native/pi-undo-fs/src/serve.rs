@@ -6,14 +6,14 @@
 
 use crate::directory::Directory;
 use crate::scan_directories::{
-    CachedDirectory, Repository, Response, ScanState, scan, scan_changed,
+    CachedDirectory, Repository, Response, ScanState, load_cache, scan, scan_changed, write_cache,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -21,13 +21,17 @@ use std::time::{Duration, Instant};
 
 const SERVE_PROTOCOL_VERSION: u32 = 1;
 /// 闲置超时：无请求持续该时长后自杀，由调用方按需重启。
-const SERVE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// 大工作区冷启动需要完整枚举，保留常驻进程比反复重启更划算。
+const SERVE_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ServeRequest {
     schema_version: u32,
     workspace_root: String,
+    /// 可选的持久目录缓存；启动时复用可避免进程重启后的完整重枚举。
+    #[serde(default)]
+    cache_path: Option<String>,
 }
 
 struct EventBatch {
@@ -105,6 +109,11 @@ fn main_loop(
     let _ = output.flush();
 
     // 初始完整扫描建立缓存；失败则整体退出，由调用方回退一次性扫描。
+    // 持久缓存只作为起点：scan_inner 仍逐目录核验元数据，漂移会重新枚举。
+    let previous_cache = request
+        .cache_path
+        .as_deref()
+        .and_then(|path| load_cache(Path::new(path), &root, &workspace));
     let mut state = ResidentState {
         workspace,
         workspace_dev,
@@ -113,7 +122,7 @@ fn main_loop(
         watch,
     };
     let mut scan_state = ScanState {
-        previous: None,
+        previous: previous_cache.as_ref().map(|cache| &cache.directories),
         next: BTreeMap::new(),
         reused_directories: 0,
     };
@@ -137,6 +146,15 @@ fn main_loop(
         } else {
             (response.directories, response.repositories)
         };
+    // 初始扫描结束后写回持久缓存，供下一次进程启动复用；写入失败只是失去预热，不影响服务。
+    if let Some(cache_path) = request.cache_path.as_deref() {
+        let _ = write_cache(
+            Path::new(cache_path),
+            &state.workspace,
+            &root,
+            state.directories.clone(),
+        );
+    }
     let initial = serde_json::json!({
         "ok": true,
         "directories": initial_directories,

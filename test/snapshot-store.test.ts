@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { access, chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -1017,6 +1018,51 @@ describe("SnapshotStore", () => {
 			...requests[0]!,
 			relativePath: "second.txt",
 		}])).rejects.toMatchObject({ code: "object_missing" });
+	});
+
+	it("批量 blob 读取对重复请求只发一次 cat-file --batch", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, "first.txt", "first\n");
+		const topology = await new RootDiscovery().discover(workspace);
+		const git = new RecordingGitRunner();
+		const store = new SnapshotStore({ storeRoot, git, discovery: new RootDiscovery(git) });
+		const manifest = await store.capture(topology);
+		const entry = (await store.listTree(manifest.manifestId, "."))
+			.find((candidate) => candidate.kind === "file" && candidate.relativePath === "first.txt");
+		expect(entry?.blobId).toBeDefined();
+		const request = { rootPath: ".", blobId: entry!.blobId!, relativePath: "first.txt" };
+		git.calls.length = 0;
+
+		const result = await SnapshotStore.readBlobs(store, manifest.manifestId, [request, request, request]);
+
+		expect(result).toHaveLength(3);
+		for (const bytes of result) expect(Buffer.from(bytes).toString("utf8")).toBe("first\n");
+		expect(git.calls.filter((call) => call.args[0] === "cat-file" && call.args[1] === "--batch")).toHaveLength(1);
+	});
+
+	it("skipBaselineProbe 跳过 baseline 探测并直接完整捕获", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, "first.txt", "before\n");
+		const topology = await new RootDiscovery().discover(workspace);
+		const store = new SnapshotStore({ storeRoot, discovery: new RootDiscovery() });
+		const baseline = await store.capture(topology);
+		await writeFixtureFile(workspace, "first.txt", "after\n");
+		const diagnostics: CaptureDiagnostic[] = [];
+		const timings: string[] = [];
+
+		const captured = await store.captureBaseline(topology, baseline, undefined, {
+			skipBaselineProbe: true,
+			onDiagnostics: (diagnostic) => diagnostics.push(diagnostic),
+			onTiming: (phase) => timings.push(phase),
+		});
+
+		expect(captured.manifestId).not.toBe(baseline.manifestId);
+		expect(diagnostics.at(-1)?.strategy).toBe("baseline-fallback");
+		expect(diagnostics.at(-1)?.baselineProbeFiles ?? 0).toBe(0);
+		expect(timings).toContain("settled.baselineValidation");
+		expect(timings).toContain("settled.fullCapture");
 	});
 
 	it("批量适配器对自定义 store 保留逐项串行 readBlob fallback", async () => {
@@ -2351,3 +2397,62 @@ describe("SnapshotStore", () => {
 		expect(gcResult).toEqual({ status: "fulfilled", value: 0 });
 	});
 });
+
+describe("私有 ODB loose object 合并", () => {
+	it("完整 capture 达到阈值后把 loose object 合并为 pack", async () => {
+		const workspace = await temporaryRoot("pi-undo-compact-");
+		await writeFixtureFile(workspace, ".gitignore", "ignored/\n");
+		for (let index = 0; index < 12; index += 1) {
+			await writeFixtureFile(workspace, `src/file-${index}.txt`, `content-${index}\n`);
+		}
+		const storeRoot = await temporaryRoot("pi-undo-compact-store-");
+		// 阈值设为 1，让本用例不依赖大工作区；生产默认值为 4,096。
+		const store = new SnapshotStore({ storeRoot, compactMinLooseObjects: 1, discovery: new RootDiscovery() });
+		const topology = await new RootDiscovery().discover(workspace);
+		const baseline = await store.capture(topology);
+		const gitDirectory = await findPrivateGitDirectory(storeRoot);
+		expect(readCountObjects(gitDirectory)).toMatchObject({ count: expect.any(Number) });
+		expect(readCountObjects(gitDirectory).count).toBeGreaterThan(0);
+
+		await writeFixtureFile(workspace, "src/file-0.txt", "changed\n");
+		const captured = await store.captureBaseline(topology, baseline);
+
+		// 压缩只影响存储布局，不改变 manifest 的内容完整性。
+		expect(captured.manifestId).not.toBe(baseline.manifestId);
+		await expect(store.assertComplete(captured.manifestId)).resolves.toBeUndefined();
+		const after = readCountObjects(gitDirectory);
+		expect(after.inPack).toBeGreaterThan(0);
+		expect(after.count).toBe(0);
+	}, 60_000);
+
+	it("未达到阈值时不重写 pack", async () => {
+		const workspace = await temporaryRoot("pi-undo-compact-low-");
+		await writeFixtureFile(workspace, "file.txt", "before\n");
+		const storeRoot = await temporaryRoot("pi-undo-compact-low-store-");
+		const store = new SnapshotStore({ storeRoot, discovery: new RootDiscovery() });
+		const topology = await new RootDiscovery().discover(workspace);
+		const baseline = await store.capture(topology);
+		const gitDirectory = await findPrivateGitDirectory(storeRoot);
+		const before = readCountObjects(gitDirectory);
+		await writeFixtureFile(workspace, "file.txt", "after\n");
+		await store.captureBaseline(topology, baseline);
+		const after = readCountObjects(gitDirectory);
+		expect(after.inPack).toBe(0);
+		expect(after.count).toBeGreaterThan(0);
+	}, 60_000);
+});
+
+async function findPrivateGitDirectory(storeRoot: string): Promise<string> {
+	for (const store of await readdir(join(storeRoot, "stores"))) {
+		for (const root of await readdir(join(storeRoot, "stores", store, "roots"))) {
+			return join(storeRoot, "stores", store, "roots", root, "git");
+		}
+	}
+	throw new Error("私有 Git 目录不存在");
+}
+
+function readCountObjects(gitDirectory: string): { count: number; inPack: number } {
+	const output = execFileSync("git", ["--git-dir", gitDirectory, "count-objects", "-v"], { encoding: "utf8" });
+	const value = (field: string): number => Number(new RegExp(`^${field}: (\\d+)$`, "m").exec(output)?.[1] ?? "0");
+	return { count: value("count"), inPack: value("in-pack") };
+}
