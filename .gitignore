@@ -6,4 +6,5 @@ node_modules
 resources/
 *.tgz
 native/pi-undo-fs/target/
+.pi/
 .pi-subagents/
