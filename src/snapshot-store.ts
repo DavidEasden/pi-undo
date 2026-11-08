@@ -382,6 +382,26 @@ export class SnapshotStore {
 		return result;
 	}
 
+	async hashWorkspaceFiles(workspaceRoot: string, relativePaths: readonly string[]): Promise<readonly string[]> {
+		if (relativePaths.length === 0) return [];
+		const paths = relativePaths.map((path) => {
+			relativeSafePath(workspaceRoot, path);
+			if (path.split("/").some((part) => part.toLowerCase() === ".git")) {
+				throw new SnapshotStoreError("object_missing", "不能 hash Git metadata");
+			}
+			return path;
+		});
+		const batches = workspaceHashPathBatches(paths);
+		const hashed = await mapConcurrentOrdered(batches, HASH_BATCH_CONCURRENCY, async (batch) => {
+			const output = await this.runGit(["hash-object", "--no-filters", "--", ...batch], {
+				cwd: workspaceRoot,
+				env: sourceGitEnvironment(),
+			});
+			return parseObjectIdLines(output, batch.length);
+		});
+		return hashed.flat();
+	}
+
 	async durableCacheDirectory(): Promise<string> {
 		const directory = join(this.storeRoot, "durable-cache");
 		await mkdir(directory, { recursive: true });
@@ -2965,6 +2985,27 @@ function hashPathBatches(leaves: readonly VisibleLeaf[]): VisibleLeaf[][] {
 		}
 		current.push(leaf);
 		argumentBytes += leafBytes;
+	}
+	if (current.length > 0) result.push(current);
+	return result;
+}
+
+function workspaceHashPathBatches(paths: readonly string[]): string[][] {
+	const result: string[][] = [];
+	let current: string[] = [];
+	let argumentBytes = 0;
+	for (const path of paths) {
+		const pathBytes = Buffer.byteLength(path, "utf8") + 1;
+		if (
+			current.length > 0 &&
+			(current.length >= HASH_BATCH_MAX_PATHS || argumentBytes + pathBytes > HASH_BATCH_MAX_ARGUMENT_BYTES)
+		) {
+			result.push(current);
+			current = [];
+			argumentBytes = 0;
+		}
+		current.push(path);
+		argumentBytes += pathBytes;
 	}
 	if (current.length > 0) result.push(current);
 	return result;

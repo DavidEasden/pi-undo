@@ -27,6 +27,7 @@ import { recoverPackedMutations } from "./packed-recovery.ts";
 import type { ManifestId, RestorePath, SnapshotManifest, SnapshotRoot } from "./model.ts";
 import {
 	assertNoSymlinkEscape,
+	assertNoSymlinkParents,
 	MutationPathIndex,
 	relativeSafePath,
 	sortDeletePaths,
@@ -427,22 +428,46 @@ export class RestoreEngine {
 			const currentPaths = prepared === undefined
 				? await this.readOwnedPaths(current, scope)
 				: prepared.currentPaths;
+			const fileGroups = new Map<string, OwnedPath[]>();
+			const nonFilePaths = new Map<string, OwnedPath>();
+			const absentPaths = new Set<string>();
 			for (const path of scope) {
-				if (path === "." || currentPaths.get(path)?.entry.kind === "directory") {
-					// 目录 scope 不能由单个 lstat 证明全部 rollback 内容，继续走 scoped capture。
+				if (path === ".") {
+					return false;
+				}
+				const owned = currentPaths.get(path);
+				if (owned === undefined) {
+					absentPaths.add(path);
+					continue;
+				}
+				if (owned.entry.kind === "directory") {
+					// 目录 scope 不能由单个 lstat/hash 证明全部 rollback 内容。
+					return false;
+				}
+				if (owned.entry.kind === "file") {
+					const group = fileGroups.get(owned.root.relativeRoot) ?? [];
+					group.push(owned);
+					fileGroups.set(owned.root.relativeRoot, group);
+				} else {
+					nonFilePaths.set(path, owned);
+				}
+			}
+			const fileResults = await allCompleted([...fileGroups.values()].map((files) =>
+				this.verifySourceFiles(current.manifestId, files),
+			));
+			if (fileResults.some((result) => !result)) return false;
+			for (const path of absentPaths) {
+				await assertNoSymlinkEscape(this.workspaceRoot, path);
+				if (!await this.pathIsAbsent(path)) return false;
+			}
+			for (const [path, owned] of nonFilePaths) {
+				try {
+					await this.verifyEntry(current.manifestId, owned);
+				} catch {
 					return false;
 				}
 			}
-			const matches = await mapConcurrentOrdered(scope, RESTORE_FILE_VERIFY_CONCURRENCY, async (path) => {
-				const owned = currentPaths.get(path);
-				if (owned === undefined) {
-					await assertNoSymlinkEscape(this.workspaceRoot, path);
-					return this.pathIsAbsent(path);
-				}
-				await this.verifyEntry(current.manifestId, owned);
-				return true;
-			});
-			return matches.every(Boolean);
+			return true;
 		} catch (error) {
 			rethrowOperationFailure(error);
 			return false;
@@ -1359,6 +1384,53 @@ export class RestoreEngine {
 		};
 	}
 
+	private async verifySourceFiles(manifestId: ManifestId, files: readonly OwnedPath[]): Promise<boolean> {
+		if (files.length === 0) return true;
+		const hashWorkspaceFiles = (this.store as SnapshotStore & {
+			readonly hashWorkspaceFiles?: (workspaceRoot: string, relativePaths: readonly string[]) => Promise<readonly string[]>;
+		}).hashWorkspaceFiles;
+		if (hashWorkspaceFiles === undefined) {
+			await allCompleted(files.map((owned) => this.verifyEntry(manifestId, owned)));
+			return true;
+		}
+		const root = files[0]!.root;
+		if (files.some((owned) => owned.root.relativeRoot !== root.relativeRoot)) return false;
+		const workspacePaths = files.map((owned) => owned.absolutePath);
+		const before = await mapConcurrentOrdered(files, RESTORE_FILE_VERIFY_CONCURRENCY, (owned) =>
+			this.sourceFileMetadata(owned));
+		if (before.some((metadata) => metadata === undefined)) return false;
+		await assertNoSymlinkParents(this.workspaceRoot, workspacePaths);
+		const rootPath = root.relativeRoot === "."
+			? this.workspaceRoot
+			: join(this.workspaceRoot, ...root.relativeRoot.split("/"));
+		const objectIds = await hashWorkspaceFiles.call(this.store,
+			rootPath,
+			files.map((owned) => owned.entry.relativePath),
+		);
+		if (objectIds.length !== files.length) return false;
+		const after = await mapConcurrentOrdered(files, RESTORE_FILE_VERIFY_CONCURRENCY, (owned) =>
+			this.sourceFileMetadata(owned));
+		await assertNoSymlinkParents(this.workspaceRoot, workspacePaths);
+		return files.every((owned, index) =>
+			objectIds[index] === owned.entry.blobId &&
+			before[index] !== undefined && after[index] !== undefined &&
+			sameSourceMetadata(before[index]!, after[index]!));
+	}
+
+	private async sourceFileMetadata(owned: OwnedPath): Promise<BigIntStats | undefined> {
+		try {
+			const metadata = await lstat(this.absolutePath(owned.absolutePath), { bigint: true });
+			if (!metadata.isFile() || metadata.isSymbolicLink() || owned.entry.blobId === null ||
+				metadata.size !== BigInt(owned.entry.size) ||
+				(metadata.mode & 0o111n) !== BigInt(owned.entry.mode & 0o111)) {
+				return undefined;
+			}
+			return metadata;
+		} catch (error) {
+			if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ENOTDIR")) return undefined;
+			throw error;
+		}
+	}
 	private async readOwnedPaths(
 		manifest: SnapshotManifest,
 		scopePaths?: readonly string[],
@@ -2637,6 +2709,11 @@ async function mapConcurrentOrdered<T, R>(
 	await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, () => worker()));
 	if (failed) throw failure;
 	return results;
+}
+
+function sameSourceMetadata(left: BigIntStats, right: BigIntStats): boolean {
+	return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode &&
+		left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
 }
 
 function durablePairKey(

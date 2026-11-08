@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { access, chmod, lstat, mkdtemp, readFile, readdir, readlink, rename, rm, symlink, writeFile as writeRawFile } from "node:fs/promises";
+import { access, chmod, lstat, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile as writeRawFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -715,9 +715,12 @@ describe("RestoreEngine", () => {
 		await writeFile(repository.root, "nested/item.txt", "after\n");
 		const current = await store.capture(await discovery.discover(repository.root));
 		const engine = new RestoreEngine({ workspaceRoot: repository.root, store, discovery });
+		const hashWorkspaceFiles = vi.spyOn(store, "hashWorkspaceFiles");
 		discovery.reasons.length = 0;
 
-		expect(await engine.canReuseManifestSource(current, target, ["value.txt"])).toBe(true);
+		expect(await engine.canReuseManifestSource(current, target, ["value.txt", "nested/item.txt"])).toBe(true);
+		expect(hashWorkspaceFiles).toHaveBeenCalledTimes(1);
+		expect(hashWorkspaceFiles).toHaveBeenCalledWith(await realpath(repository.root), ["nested/item.txt", "value.txt"]);
 		expect(discovery.reasons).toEqual([]);
 		// Directory scopes and externally modified source files retain the scoped-capture fallback.
 		expect(await engine.canReuseManifestSource(current, target, ["nested"])).toBe(false);
