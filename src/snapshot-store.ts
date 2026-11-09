@@ -34,10 +34,11 @@ const GC_METADATA_FILE = "gc.json";
 const GC_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 const IGNORE_POLICY = "git-check-ignore-v1";
 const NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
-const TREE_CACHE_LIMIT = 256;
+const TREE_CACHE_LIMIT = 16;
+const TREE_CACHE_ENTRY_LIMIT = 32_768;
 const TREE_SCOPE_COMPACT_MIN_PATHS = process.platform === "win32" ? 512 : 4_096;
 const TREE_SCOPE_PROBE_MAX_BYTES = 2 * 1024 * 1024;
-const TREE_BLOB_MEMBERSHIP_LIMIT = 65_536;
+const TREE_BLOB_MEMBERSHIP_LIMIT = 8_192;
 const HASH_BATCH_MAX_PATHS = process.platform === "win32" ? 128 : 2_048;
 const HASH_BATCH_MAX_ARGUMENT_BYTES = process.platform === "win32" ? 24 * 1024 : 128 * 1024;
 const HASH_BATCH_CONCURRENCY = 4;
@@ -51,11 +52,14 @@ const METADATA_BATCHES_MAX_PATHS = 16_384;
 const METADATA_BATCHES_MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 const INDEX_BATCH_MAX_ENTRIES = 4_096;
 const INDEX_BATCH_MAX_BYTES = 8 * 1024 * 1024;
-const BLOB_CACHE_MAX_BYTES = 128 * 1024 * 1024;
+const DEFAULT_BLOB_CACHE_MAX_BYTES = 16 * 1024 * 1024;
+const BLOB_CACHE_MAX_ENTRIES = 1_024;
 const BLOB_BATCH_MAX_BYTES = 16 * 1024 * 1024;
 const BLOB_BATCH_MAX_ENTRIES = process.platform === "win32" ? 256 : 2_048;
 const RACY_CLEAN_WINDOW_NS = 2_000_000_000n;
 const LEAF_CACHE_FILE = "leaf-cache.json";
+const VISIBLE_LEAF_CACHE_MAX_ENTRIES = 8_192;
+const VISIBLE_LEAF_CACHE_MAX_FILE_BYTES = 8 * 1024 * 1024;
 // 私有 ODB 的 loose object 达到阈值后合并为 pack；阈值取得足够大，避免把高频 capture
 // 变成高频 repack，同时让大改动后的 cat-file 查询尽快走 pack 索引。
 const COMPACT_MIN_LOOSE_OBJECTS = 4_096;
@@ -241,6 +245,8 @@ export interface SnapshotStoreOptions {
 	readonly lock?: WorkspaceLock;
 	readonly clock?: () => number;
 	readonly nativeMetadata?: NativeMetadataPort;
+	/** 仅供测试或受控调优：0 禁用 blob 内存缓存。 */
+	readonly blobCacheMaxBytes?: number;
 	/** 仅供测试或受控调优：0 禁用 loose object 合并。 */
 	readonly compactMinLooseObjects?: number;
 	/** 阈值持续达到多久后才真正合并；默认 5 分钟。 */
@@ -329,10 +335,13 @@ export class SnapshotStore {
 	private readonly nativeMetadata: NativeMetadataPort;
 	private readonly compactMinLooseObjects: number;
 	private readonly compactMinAgeMs: number;
+	private readonly blobCacheMaxBytes: number;
 	private lastCompactCheckAt: number | undefined;
 	private readonly manifestLocations = new Map<string, string>();
 	// Tree 与 blob 都由 object ID 内容寻址；缓存只复用已从私有 ODB 读取的不可变内容。
 	private readonly treeEntriesCache = new Map<string, Promise<CapturedTreeEntry[]>>();
+	private readonly treeEntryCounts = new Map<string, number>();
+	private treeEntriesCachedCount = 0;
 	private readonly treeBlobMembership = new Map<string, string>();
 	private readonly blobCache = new Map<string, CachedBlob>();
 	private readonly visibleLeafCache = new Map<string, Map<string, CachedVisibleLeaf>>();
@@ -353,6 +362,10 @@ export class SnapshotStore {
 		this.nativeMetadata = options.nativeMetadata ?? new NativeMetadataInspector();
 		this.compactMinLooseObjects = options.compactMinLooseObjects ?? COMPACT_MIN_LOOSE_OBJECTS;
 		this.compactMinAgeMs = options.compactMinAgeMs ?? COMPACT_MIN_AGE_MS;
+		this.blobCacheMaxBytes = options.blobCacheMaxBytes ?? DEFAULT_BLOB_CACHE_MAX_BYTES;
+		if (!Number.isSafeInteger(this.blobCacheMaxBytes) || this.blobCacheMaxBytes < 0) {
+			throw new Error("blob 内存缓存预算必须是非负整数");
+		}
 	}
 
 	static supportsValidatedBlobBatch(store: SnapshotStore): boolean {
@@ -1634,10 +1647,16 @@ export class SnapshotStore {
 		const cache = inclusions !== null && inclusions.length === 0
 			? new Map<string, CachedVisibleLeaf>()
 			: new Map(previous);
+		let available = VISIBLE_LEAF_CACHE_MAX_ENTRIES - (
+			[...this.visibleLeafCache.entries()]
+				.filter(([directory]) => directory !== gitDirectory)
+				.reduce((total, [, entries]) => total + entries.size, 0) + cache.size
+		);
 		if (inclusions !== null && inclusions.length > 0) {
 			for (const relativePath of cache.keys()) {
 				if (inclusions.some((inclusion) => isPathAtOrBelow(inclusion, relativePath))) {
 					cache.delete(relativePath);
+					available += 1;
 				}
 			}
 		}
@@ -1645,15 +1664,39 @@ export class SnapshotStore {
 			const objectId = staged.objectIds.get(leaf.relativePath);
 			if (objectId === undefined) continue;
 			if (!leaf.cacheable) {
-				cache.delete(leaf.relativePath);
+				if (cache.delete(leaf.relativePath)) available += 1;
 				continue;
 			}
+			if (!cache.has(leaf.relativePath) && available <= 0) continue;
+			if (!cache.has(leaf.relativePath)) available -= 1;
 			cache.set(leaf.relativePath, { ...leaf, objectId, verifiedAtNs: staged.verifiedAtNs });
+		}
+		this.visibleLeafCache.set(gitDirectory, cache);
+		for (const storeDirectory of this.trimVisibleLeafCache()) {
+			this.leafCacheDirtyDirectories.add(storeDirectory);
 		}
 		if (!samePersistedLeafCache(previous, cache)) {
 			this.leafCacheDirtyDirectories.add(storeDirectoryForGitDirectory(gitDirectory));
 		}
-		this.visibleLeafCache.set(gitDirectory, cache);
+	}
+
+	private trimVisibleLeafCache(): Set<string> {
+		let count = [...this.visibleLeafCache.values()].reduce((total, cache) => total + cache.size, 0);
+		const changedDirectories = new Set<string>();
+		while (count > VISIBLE_LEAF_CACHE_MAX_ENTRIES) {
+			let removed = false;
+			for (const [gitDirectory, cache] of this.visibleLeafCache) {
+				const oldest = cache.keys().next().value as string | undefined;
+				if (oldest === undefined) continue;
+				cache.delete(oldest);
+				count -= 1;
+				changedDirectories.add(storeDirectoryForGitDirectory(gitDirectory));
+				removed = true;
+				break;
+			}
+			if (!removed) break;
+		}
+		return changedDirectories;
 	}
 
 	/** 从 storeDirectory 读取持久化叶子缓存并合并进内存；进程内已有条目优先。 */
@@ -1662,16 +1705,22 @@ export class SnapshotStore {
 		this.leafCacheDirectoriesLoaded.add(storeDirectory);
 		let file: unknown;
 		try {
+			const metadata = await lstat(join(storeDirectory, LEAF_CACHE_FILE));
+			if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > VISIBLE_LEAF_CACHE_MAX_FILE_BYTES) return;
 			file = JSON.parse(await readFile(join(storeDirectory, LEAF_CACHE_FILE), "utf8"));
 		} catch {
 			return; // 缺失或损坏：忽略，本次 capture 走冷路径并重建缓存。
 		}
 		if (!isPersistedLeafCacheFile(file)) return;
 		const prefix = `${storeDirectory}${sep}`;
+		let remaining = VISIBLE_LEAF_CACHE_MAX_ENTRIES -
+			[...this.visibleLeafCache.values()].reduce((total, cache) => total + cache.size, 0);
 		for (const [gitDirectory, entries] of Object.entries(file.entries)) {
+			if (remaining <= 0) break;
 			if (!gitDirectory.startsWith(prefix) || this.visibleLeafCache.has(gitDirectory)) continue;
 			const cache = new Map<string, CachedVisibleLeaf>();
 			for (const [relativePath, entry] of Object.entries(entries)) {
+				if (remaining <= 0) break;
 				cache.set(relativePath, {
 					relativePath,
 					kind: entry.kind,
@@ -1683,6 +1732,7 @@ export class SnapshotStore {
 					objectId: entry.objectId,
 					verifiedAtNs: BigInt(entry.verifiedAtNs),
 				});
+				remaining -= 1;
 			}
 			this.visibleLeafCache.set(gitDirectory, cache);
 		}
@@ -2022,7 +2072,11 @@ export class SnapshotStore {
 			: [...new Set(rootScopePaths.map((path) => relativeSafePath("/", path)))].sort(comparePaths);
 		const key = `${gitDirectory}\0${treeId}\0${scope === undefined ? "*" : checksum(canonicalJson(scope))}`;
 		const cached = this.treeEntriesCache.get(key);
-		if (cached !== undefined) return cached;
+		if (cached !== undefined) {
+			this.treeEntriesCache.delete(key);
+			this.treeEntriesCache.set(key, cached);
+			return cached;
+		}
 		const pending = (async () => {
 			const queryScope = scope === undefined || scope.length < TREE_SCOPE_COMPACT_MIN_PATHS
 				? scope
@@ -2051,14 +2105,38 @@ export class SnapshotStore {
 		while (this.treeEntriesCache.size > TREE_CACHE_LIMIT) {
 			const oldest = this.treeEntriesCache.keys().next().value as string | undefined;
 			if (oldest === undefined || oldest === key) break;
-			this.treeEntriesCache.delete(oldest);
+			this.dropTreeEntriesCache(oldest);
 		}
 		try {
-			return await pending;
+			const entries = await pending;
+			this.cacheTreeEntries(key, pending, entries.length);
+			return entries;
 		} catch (error) {
-			if (this.treeEntriesCache.get(key) === pending) this.treeEntriesCache.delete(key);
+			if (this.treeEntriesCache.get(key) === pending) this.dropTreeEntriesCache(key);
 			throw error;
 		}
+	}
+
+	private cacheTreeEntries(key: string, pending: Promise<CapturedTreeEntry[]>, count: number): void {
+		if (this.treeEntriesCache.get(key) !== pending) return;
+		if (count > TREE_CACHE_ENTRY_LIMIT) {
+			this.dropTreeEntriesCache(key);
+			return;
+		}
+		const previous = this.treeEntryCounts.get(key) ?? 0;
+		this.treeEntryCounts.set(key, count);
+		this.treeEntriesCachedCount += count - previous;
+		while (this.treeEntriesCache.size > TREE_CACHE_LIMIT || this.treeEntriesCachedCount > TREE_CACHE_ENTRY_LIMIT) {
+			const oldestKey = this.treeEntriesCache.keys().next().value as string | undefined;
+			if (oldestKey === undefined || oldestKey === key) break;
+			this.dropTreeEntriesCache(oldestKey);
+		}
+	}
+
+	private dropTreeEntriesCache(key: string): void {
+		this.treeEntriesCache.delete(key);
+		this.treeEntriesCachedCount -= this.treeEntryCounts.get(key) ?? 0;
+		this.treeEntryCounts.delete(key);
 	}
 
 	private async compactTreeQueryScope(
@@ -2229,7 +2307,7 @@ export class SnapshotStore {
 
 	private rememberBlobBytes(gitDirectory: string, objectId: string, bytes: Uint8Array): void {
 		const key = blobCacheKey(gitDirectory, objectId);
-		if (this.blobCache.has(key) || bytes.byteLength > BLOB_CACHE_MAX_BYTES) return;
+		if (this.blobCacheMaxBytes === 0 || this.blobCache.has(key) || bytes.byteLength > this.blobCacheMaxBytes) return;
 		const entry: CachedBlob = { promise: Promise.resolve(bytes), size: 0 };
 		this.blobCache.set(key, entry);
 		this.finishBlobCacheEntry(key, entry, bytes.byteLength);
@@ -2237,13 +2315,13 @@ export class SnapshotStore {
 
 	private finishBlobCacheEntry(key: string, entry: CachedBlob, size: number): void {
 		if (this.blobCache.get(key) !== entry) return;
-		if (size > BLOB_CACHE_MAX_BYTES) {
+		if (this.blobCacheMaxBytes === 0 || size > this.blobCacheMaxBytes) {
 			this.blobCache.delete(key);
 			return;
 		}
 		entry.size = size;
 		this.blobCacheBytes += size;
-		while (this.blobCacheBytes > BLOB_CACHE_MAX_BYTES) {
+		while (this.blobCacheBytes > this.blobCacheMaxBytes || this.blobCache.size > BLOB_CACHE_MAX_ENTRIES) {
 			const oldestKey = this.blobCache.keys().next().value as string | undefined;
 			if (oldestKey === undefined) break;
 			const oldest = this.blobCache.get(oldestKey)!;

@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 const SERVE_PROTOCOL_VERSION: u32 = 1;
 /// 闲置超时：无请求持续该时长后自杀，由调用方按需重启。
-/// 大工作区冷启动需要完整枚举，保留常驻进程比反复重启更划算。
-const SERVE_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// 空闲 10 秒后退出；客户端按需重新握手并复用持久目录缓存。
+const SERVE_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

@@ -25,6 +25,7 @@ export class ResidentScanClient {
 	private child: ChildProcessWithoutNullStreams | undefined;
 	private starting: Promise<ChildProcessWithoutNullStreams | undefined> | undefined;
 	private queue: Promise<unknown> = Promise.resolve();
+	private pendingScans = 0;
 	private buffer = "";
 	private waiter: LineWaiter | undefined;
 	private closed = false;
@@ -36,6 +37,7 @@ export class ResidentScanClient {
 		private readonly timeoutMs: number,
 		/** 与一次性 helper 共享的持久目录缓存；serve 启动时读取，初始扫描后写回。 */
 		private readonly cachePath?: string,
+		private readonly idleTimeoutMs = 11_000,
 	) {}
 
 	/** 建立进程并完成首次全量扫描；失败静默，正式扫描会回退。 */
@@ -44,11 +46,16 @@ export class ResidentScanClient {
 	}
 
 	scan(timeoutMs = this.timeoutMs): Promise<JsonObject | undefined> {
+		if (this.idleTimer !== undefined) clearTimeout(this.idleTimer);
+		this.pendingScans += 1;
 		const result = this.queue.then(
 			() => this.scanOne(timeoutMs),
 			() => this.scanOne(timeoutMs),
 		);
-		const settled = result.finally(() => this.scheduleIdle());
+		const settled = result.finally(() => {
+			this.pendingScans -= 1;
+			if (this.pendingScans === 0) this.scheduleIdle();
+		});
 		this.queue = settled.then(() => undefined, () => undefined);
 		return settled;
 	}
@@ -68,7 +75,7 @@ export class ResidentScanClient {
 	}
 
 	private async ensureChild(timeoutMs: number): Promise<ChildProcessWithoutNullStreams | undefined> {
-		if (this.child !== undefined && this.child.exitCode === null) return this.child;
+		if (this.child !== undefined && this.child.exitCode === null && this.child.signalCode === null) return this.child;
 		this.starting ??= this.spawnChild(timeoutMs).finally(() => { this.starting = undefined; });
 		return await this.starting;
 	}
@@ -118,7 +125,7 @@ export class ResidentScanClient {
 	}
 
 	private requestLine(child: ChildProcessWithoutNullStreams, request: string, timeoutMs: number): Promise<string | undefined> {
-		if (this.child !== child || child.exitCode !== null) return Promise.resolve(undefined);
+		if (this.child !== child || child.exitCode !== null || child.signalCode !== null) return Promise.resolve(undefined);
 		try {
 			child.stdin.write(`${request}\n`);
 		} catch {
@@ -214,30 +221,30 @@ export class ResidentScanClient {
 	private scheduleIdle(): void {
 		if (this.idleTimer !== undefined) clearTimeout(this.idleTimer);
 		if (this.closed) return;
-		// 与 Rust 端 600s 看门狗保持同一量级；大工作区冷启动比重启进程更贵。
-		this.idleTimer = setTimeout(() => {
-			void this.close();
-		}, 610_000);
+		// 与 Rust 端 10s 看门狗对齐；持久目录缓存让之后的按需重启可复用扫描结果。
+		this.idleTimer = setTimeout(() => this.stopChild(), this.idleTimeoutMs);
 		this.idleTimer.unref?.();
+	}
+
+	private stopChild(): void {
+		const child = this.child;
+		if (child !== undefined) this.invalidate(child);
+		this.buffer = "";
 	}
 
 	/** 丢弃当前进程但保留客户端，使下一次请求可以重新握手。 */
 	reset(): void {
 		this.closed = false;
 		if (this.idleTimer !== undefined) clearTimeout(this.idleTimer);
-		const child = this.child;
-		if (child !== undefined) this.invalidate(child);
-		this.buffer = "";
+		this.stopChild();
 	}
 
 	async close(): Promise<void> {
 		this.closed = true;
 		if (this.idleTimer !== undefined) clearTimeout(this.idleTimer);
-		const child = this.child;
-		if (child !== undefined) this.invalidate(child);
+		this.stopChild();
 		await this.queue;
-		this.child?.kill("SIGKILL");
-		this.child = undefined;
+		this.stopChild();
 	}
 }
 
