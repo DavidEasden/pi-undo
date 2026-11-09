@@ -728,6 +728,26 @@ describe("RestoreEngine", () => {
 		expect(await engine.canReuseManifestSource(current, target, ["value.txt"])).toBe(false);
 	});
 
+	it("direct safety-source reuse 后的 plan 复用已验证 current path map", async () => {
+		const workspace = await temporaryRoot("pi-undo-source-proof-plan-workspace-");
+		await writeFile(workspace, "value.txt", "target\n");
+		const storeRoot = await temporaryRoot("pi-undo-source-proof-plan-store-");
+		const discovery = new RootDiscovery();
+		const store = new SnapshotStore({ storeRoot, discovery });
+		const target = await store.capture(await discovery.discover(workspace));
+		await writeFile(workspace, "value.txt", "current\n");
+		const current = await store.capture(await discovery.discover(workspace), ["value.txt"]);
+		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+		const listTree = vi.spyOn(store, "listTree");
+
+		expect(await engine.canReuseManifestSource(current, target, ["value.txt"])).toBe(true);
+		listTree.mockClear();
+		await engine.plan(current, target, ["value.txt"]);
+
+		expect(listTree).toHaveBeenCalledTimes(1);
+		expect(listTree.mock.calls[0]?.[0]).toBe(target.manifestId);
+	});
+
 	it("durable source reuse 省略重复拓扑扫描，但 restore-pre 仍拒绝拓扑漂移", async (context) => {
 		if (!await nativeRestoreAvailable()) return context.skip();
 		const outer = await createGitRepo();
