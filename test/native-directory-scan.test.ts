@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { NativeDirectoryScanner } from "../src/native-directory-scan.ts";
+import { ResidentScanClient } from "../src/resident-scan-client.ts";
 import { createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
 import { RootDiscovery } from "../src/root-discovery.ts";
 import { createGitRepo, createNestedRepo } from "./fixtures.ts";
@@ -201,5 +202,36 @@ ${capabilities} else {
 			const request = await readFile(join(value.directory, "request-path"), "utf8").catch(() => undefined);
 			if (request !== undefined) await expect(lstat(request)).rejects.toMatchObject({ code: "ENOENT" });
 		} finally { scope.dispose(); }
+	});
+
+	it("闲置回收 serve 子进程后，下一次扫描按需重启", async () => {
+		const value = await helper(`
+import { appendFileSync } from "node:fs";
+import { createInterface } from "node:readline";
+appendFileSync(new URL("starts", import.meta.url), "x");
+let handshake = true;
+createInterface({ input: process.stdin }).on("line", (line) => {
+ if (handshake) {
+  handshake = false;
+  console.log(JSON.stringify({ ok: true, ready: true }));
+  console.log(JSON.stringify({ ok: true, initial: true }));
+ } else setTimeout(() => console.log(JSON.stringify({ ok: true, schemaVersion: JSON.parse(line).schemaVersion })), 30);
+});
+`);
+		const client = new ResidentScanClient(value.path, value.directory, 1_000, undefined, 15);
+		try {
+			const first = client.scan();
+			const second = client.scan();
+			await expect(first).resolves.toMatchObject({ ok: true, schemaVersion: 1 });
+			await new Promise((resolve) => setTimeout(resolve, 80));
+			await expect(second).resolves.toMatchObject({ ok: true, schemaVersion: 1 });
+			expect((await readFile(join(value.directory, "starts"), "utf8"))).toBe("x");
+			await new Promise((resolve) => setTimeout(resolve, 80));
+			const third = client.scan();
+			await expect(third).resolves.toMatchObject({ ok: true, schemaVersion: 1 });
+			expect((await readFile(join(value.directory, "starts"), "utf8"))).toBe("xx");
+		} finally {
+			await client.close();
+		}
 	});
 });

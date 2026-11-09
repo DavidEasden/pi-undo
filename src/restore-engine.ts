@@ -45,9 +45,11 @@ import {
 import { SnapshotStore, SnapshotStoreError } from "./snapshot-store.ts";
 import { WorkspaceLock } from "./workspace-lock.ts";
 
-const PREPARED_PLAN_CACHE_LIMIT = 16;
+const PREPARED_PLAN_CACHE_LIMIT = 2;
+const PREPARED_PLAN_PATH_LIMIT = 8_192;
+const DURABLE_CACHE_INDEX_LIMIT = 16;
 const DURABLE_CACHE_INDEX_FILE = "index.json";
-const DURABLE_PACK_MEMORY_MAX_BYTES = 64 * 1024 * 1024;
+const DURABLE_PACK_MEMORY_MAX_BYTES = 8 * 1024 * 1024;
 const RESTORE_FILE_BATCH_MAX_ENTRIES = 1_024;
 const RESTORE_FILE_BATCH_MAX_BYTES = 64 * 1024 * 1024;
 const RESTORE_FILE_PREPARE_CONCURRENCY = 32;
@@ -202,6 +204,7 @@ export class RestoreEngine {
 	private readonly discovery: RootDiscovery;
 	private readonly beforeMutation: RestoreEngineOptions["beforeMutation"];
 	private readonly preparedPlans = new Map<string, PreparedRestorePlan>();
+	private readonly preparedPathsByPlan = new WeakMap<RestorePlan, PreparedRestorePlan>();
 	private readonly durablePackCache = new Map<string, CachedDurablePack>();
 	private readonly durablePackByPair = new Map<string, CachedDurablePair>();
 	private readonly verifiedDurablePacks = new Set<string>();
@@ -400,7 +403,12 @@ export class RestoreEngine {
 					false,
 				);
 			}
-			this.verifiedDurablePacks.add(`${pairKey}:${cached.planDigest}`);
+			const resident = this.durablePackByPair.get(pairKey);
+			if (resident?.planDigest === cached.planDigest) {
+				this.verifiedDurablePacks.add(`${pairKey}:${cached.planDigest}`);
+			} else {
+				this.verifiedDurablePacks.delete(`${pairKey}:${cached.planDigest}`);
+			}
 			return true;
 		} catch (error) {
 			rethrowOperationFailure(error);
@@ -613,6 +621,13 @@ export class RestoreEngine {
 		pack: DurablePack,
 	): Promise<void> {
 		const bytes = await this.durablePackFileBytes(pack.storagePath);
+		if (bytes > this.durablePackCacheMaxBytes) {
+			const residentKey = `${pairKey}:${planDigest}`;
+			this.verifiedDurablePacks.delete(residentKey);
+			const existing = this.durablePackByPair.get(pairKey);
+			if (existing?.planDigest === planDigest) this.dropResidentDurablePack(pairKey);
+			return;
+		}
 		const previous = this.durablePackByPair.get(pairKey);
 		if (previous !== undefined) {
 			this.durablePackMemoryBytes -= previous.bytes;
@@ -631,12 +646,16 @@ export class RestoreEngine {
 		const cached = this.durablePackByPair.get(pairKey);
 		if (cached === undefined) return;
 		this.durablePackByPair.delete(pairKey);
+		this.verifiedDurablePacks.delete(`${pairKey}:${cached.planDigest}`);
 		this.durablePackMemoryBytes = Math.max(0, this.durablePackMemoryBytes - cached.bytes);
 	}
 
 	private dropResidentDurablePacks(planDigest: string): void {
 		for (const [pairKey, cached] of this.durablePackByPair) {
 			if (cached.planDigest === planDigest) this.dropResidentDurablePack(pairKey);
+		}
+		for (const key of this.verifiedDurablePacks) {
+			if (key.endsWith(`:${planDigest}`)) this.verifiedDurablePacks.delete(key);
 		}
 	}
 
@@ -742,7 +761,7 @@ export class RestoreEngine {
 	}
 
 	private async evictPersistedDurablePacks(keepPlanDigest: string): Promise<void> {
-		while (this.durableIndex !== undefined && this.durableIndex.entries.length > PREPARED_PLAN_CACHE_LIMIT) {
+		while (this.durableIndex !== undefined && this.durableIndex.entries.length > DURABLE_CACHE_INDEX_LIMIT) {
 			const oldest = this.durableIndex.entries.find((entry) => entry.planDigest !== keepPlanDigest);
 			if (oldest === undefined) break;
 			await this.dropPersistedDurablePack(oldest.planDigest);
@@ -806,7 +825,10 @@ export class RestoreEngine {
 		targetPaths: ReadonlyMap<string, OwnedPath>,
 	): void {
 		const cachedPlan = cloneRestorePlan(plan);
-		this.preparedPlans.set(preparedPlanKey(cachedPlan), { plan: cachedPlan, currentPaths, targetPaths });
+		const prepared = { plan: cachedPlan, currentPaths, targetPaths };
+		this.preparedPathsByPlan.set(plan, prepared);
+		if (currentPaths.size + targetPaths.size > PREPARED_PLAN_PATH_LIMIT) return;
+		this.preparedPlans.set(preparedPlanKey(cachedPlan), prepared);
 		while (this.preparedPlans.size > PREPARED_PLAN_CACHE_LIMIT) {
 			const oldest = this.preparedPlans.keys().next().value as string | undefined;
 			if (oldest === undefined) break;
@@ -815,6 +837,12 @@ export class RestoreEngine {
 	}
 
 	private takePreparedPlan(plan: RestorePlan): PreparedRestorePlan | undefined {
+		const transient = this.preparedPathsByPlan.get(plan);
+		this.preparedPathsByPlan.delete(plan);
+		if (transient !== undefined) {
+			this.preparedPlans.delete(preparedPlanKey(transient.plan));
+			return transient;
+		}
 		const key = preparedPlanKey(plan);
 		const prepared = this.preparedPlans.get(key);
 		if (prepared !== undefined) this.preparedPlans.delete(key);

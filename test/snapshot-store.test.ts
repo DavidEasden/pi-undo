@@ -1042,6 +1042,25 @@ describe("SnapshotStore", () => {
 		expect(git.calls.filter((call) => call.args[0] === "cat-file" && call.args[1] === "--batch")).toHaveLength(1);
 	});
 
+	it("blob 内存预算为 0 时每次读取都从私有 ODB 取回对象", async () => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		await writeFixtureFile(workspace, "first.txt", "first\n");
+		const topology = await new RootDiscovery().discover(workspace);
+		const git = new RecordingGitRunner();
+		const store = new SnapshotStore({ storeRoot, git, discovery: new RootDiscovery(git), blobCacheMaxBytes: 0 });
+		const manifest = await store.capture(topology);
+		const entry = (await store.listTree(manifest.manifestId, "."))
+			.find((candidate) => candidate.kind === "file" && candidate.relativePath === "first.txt");
+		const request = { rootPath: ".", blobId: entry!.blobId!, relativePath: "first.txt" };
+
+		await store.readBlob(manifest.manifestId, request.rootPath, request.blobId, request.relativePath);
+		git.calls.length = 0;
+		await store.readBlob(manifest.manifestId, request.rootPath, request.blobId, request.relativePath);
+
+		expect(git.calls.some((call) => call.args[0] === "cat-file" && call.args[1] === "--batch")).toBe(true);
+	});
+
 	it("skipBaselineProbe 跳过 baseline 探测并直接完整捕获", async () => {
 		const workspace = await temporaryRoot("pi-undo-snapshot-");
 		const storeRoot = await temporaryRoot("pi-undo-store-");
