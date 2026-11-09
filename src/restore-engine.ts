@@ -47,6 +47,8 @@ import { WorkspaceLock } from "./workspace-lock.ts";
 
 const PREPARED_PLAN_CACHE_LIMIT = 2;
 const PREPARED_PLAN_PATH_LIMIT = 8_192;
+const SOURCE_PROOF_PATH_CACHE_LIMIT = 65_536;
+const SOURCE_PROOF_MAX_AGE_MS = 10_000;
 const DURABLE_CACHE_INDEX_LIMIT = 16;
 const DURABLE_CACHE_INDEX_FILE = "index.json";
 const DURABLE_PACK_MEMORY_MAX_BYTES = 8 * 1024 * 1024;
@@ -150,6 +152,12 @@ interface PreparedRestorePlan {
 	readonly targetPaths: ReadonlyMap<string, OwnedPath>;
 }
 
+interface PendingSourceProof {
+	readonly key: string;
+	readonly currentPaths: ReadonlyMap<string, OwnedPath>;
+	readonly createdAt: number;
+}
+
 interface DurableCacheIndexEntry {
 	readonly currentManifestId: ManifestId;
 	readonly targetManifestId: ManifestId;
@@ -205,6 +213,8 @@ export class RestoreEngine {
 	private readonly beforeMutation: RestoreEngineOptions["beforeMutation"];
 	private readonly preparedPlans = new Map<string, PreparedRestorePlan>();
 	private readonly preparedPathsByPlan = new WeakMap<RestorePlan, PreparedRestorePlan>();
+	private pendingSourceProof: PendingSourceProof | undefined;
+	private pendingSourceProofTimer: ReturnType<typeof setTimeout> | undefined;
 	private readonly durablePackCache = new Map<string, CachedDurablePack>();
 	private readonly durablePackByPair = new Map<string, CachedDurablePair>();
 	private readonly verifiedDurablePacks = new Set<string>();
@@ -279,6 +289,7 @@ export class RestoreEngine {
 			? undefined
 			: this.findPreparedPlan(current.manifestId, target.manifestId, canonicalScopePaths);
 		if (prepared !== undefined) {
+			this.clearPendingSourceProof();
 			// 后台 durable prepare 已读取并验证过同一对 immutable manifest；复用路径表，
 			// 避免 undo 前再执行一轮 listTree 与 diff。
 			const pathsStarted = performance.now();
@@ -288,9 +299,13 @@ export class RestoreEngine {
 			return cloneRestorePlan(prepared.plan);
 		}
 
+		if (canonicalScopePaths === undefined) this.clearPendingSourceProof();
 		const pathsStarted = performance.now();
+		const pendingSourcePaths = canonicalScopePaths === undefined
+			? undefined
+			: this.takePendingSourceProof(current.manifestId, target.manifestId, canonicalScopePaths);
 		const [currentPaths, targetPaths] = await allCompleted([
-			this.readOwnedPaths(current, canonicalScopePaths),
+			pendingSourcePaths ?? this.readOwnedPaths(current, canonicalScopePaths),
 			this.readOwnedPaths(target, canonicalScopePaths),
 		]);
 		reportDurablePackTiming(options, "plan.paths", pathsStarted);
@@ -426,6 +441,7 @@ export class RestoreEngine {
 		target: SnapshotManifest,
 		scopePaths: readonly string[],
 	): Promise<boolean> {
+		this.clearPendingSourceProof();
 		try {
 			assertManifest(current);
 			assertManifest(target);
@@ -474,6 +490,9 @@ export class RestoreEngine {
 				} catch {
 					return false;
 				}
+			}
+			if (prepared === undefined) {
+				this.rememberPendingSourceProof(current.manifestId, target.manifestId, scope, currentPaths);
 			}
 			return true;
 		} catch (error) {
@@ -817,6 +836,47 @@ export class RestoreEngine {
 			return prepared;
 		}
 		return undefined;
+	}
+
+	private clearPendingSourceProof(): void {
+		this.pendingSourceProof = undefined;
+		if (this.pendingSourceProofTimer !== undefined) {
+			clearTimeout(this.pendingSourceProofTimer);
+			this.pendingSourceProofTimer = undefined;
+		}
+	}
+
+	private rememberPendingSourceProof(
+		currentManifestId: ManifestId,
+		targetManifestId: ManifestId,
+		scopePaths: readonly string[],
+		currentPaths: ReadonlyMap<string, OwnedPath>,
+	): void {
+		if (currentPaths.size > SOURCE_PROOF_PATH_CACHE_LIMIT) return;
+		this.clearPendingSourceProof();
+		const pending: PendingSourceProof = {
+			key: durablePairKey(currentManifestId, targetManifestId, scopePaths),
+			currentPaths,
+			createdAt: performance.now(),
+		};
+		this.pendingSourceProof = pending;
+		this.pendingSourceProofTimer = setTimeout(() => {
+			if (this.pendingSourceProof === pending) this.clearPendingSourceProof();
+		}, SOURCE_PROOF_MAX_AGE_MS);
+		this.pendingSourceProofTimer.unref?.();
+	}
+
+	private takePendingSourceProof(
+		currentManifestId: ManifestId,
+		targetManifestId: ManifestId,
+		scopePaths: readonly string[],
+	): ReadonlyMap<string, OwnedPath> | undefined {
+		const pending = this.pendingSourceProof;
+		this.clearPendingSourceProof();
+		if (pending === undefined || performance.now() - pending.createdAt > SOURCE_PROOF_MAX_AGE_MS) return undefined;
+		return pending.key === durablePairKey(currentManifestId, targetManifestId, scopePaths)
+			? pending.currentPaths
+			: undefined;
 	}
 
 	private rememberPreparedPlan(
