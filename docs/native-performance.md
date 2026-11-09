@@ -259,7 +259,25 @@ npm run typecheck
 PI_UNDO_PACK_MEMORY_BENCHMARK=1 npx vitest run test/durable-pack-memory-benchmark.test.ts
 PI_UNDO_PACK_MEMORY_BENCHMARK=1 PI_UNDO_PACK_MEMORY_TRANSFER=1 npx vitest run test/durable-pack-memory-benchmark.test.ts
 PI_UNDO_RUN_RESIDENT_LIVE=1 npx vitest run test/resident-live.test.ts
+PI_UNDO_MEMORY_BENCHMARK=1 npx vitest run test/resident-memory-benchmark.test.ts --reporter=verbose
 ```
+
+### Pi runtime 驻留内存基线
+
+`test/resident-memory-benchmark.test.ts` 以独立 Vitest 进程分别运行 SDK-only 测试夹具与启用 pi-undo 的 10,000 个 ignored 依赖包工作区，采集 workspace 建立后、SDK 初始化、pi-undo warm-up、run、undo/redo 和操作后的 idle 内存。报告包含 Vitest worker RSS、runner 进程树 RSS、native helper RSS，以及 Node heap、external 和 ArrayBuffer；Node 在可用时显式 GC 后另记 retained 样本。worker RSS 包含 Vitest 与基准代码本身，不等同生产 Pi 进程的 RSS；runner 进程树 RSS 是各进程 RSS 相加，会重复计算共享内存页，应主要比较同口径结果，并查看 worker/helper 分项。
+
+macOS arm64、Node 23.11.1 的一次采样：
+
+| 阶段 | Pi SDK worker RSS | pi-undo worker RSS | native helper RSS |
+| --- | ---: | ---: | ---: |
+| SDK 初始化后 retained | 162 MiB | 161 MiB | 未启动 |
+| pi-undo warm-up 后 retained | — | 174 MiB | 35 MiB |
+| undo/redo 后 idle retained | 162 MiB | 183 MiB | 38 MiB |
+| 操作期 worker 峰值 | — | 196 MiB | 峰值约 52 MiB |
+
+操作后 Node worker 的 retained heap 约 49 MiB，external 约 5 MiB；操作后 runner-tree RSS 约 394 MiB，但该总和包含 Vitest runner 并重复计算共享页。此前在 Vitest worker 内只遍历它自己的子进程，漏掉了 sibling native helper；当前基准会在 macOS native 模式下断言 warm-up helper RSS 非零。
+
+这组数据说明，SDK-only 测试夹具的 worker RSS 已约 162 MiB；该数字包含 Vitest 开销，不是生产 Pi 的独立测量，也说明几十 MiB 不能作为整个 Pi 进程的目标。当前扩展在该工作区上相对 SDK-only 夹具增加的 Node RSS 约 20–22 MiB，常驻原生 helper 另约 35–38 MiB。单次小文件操作没有覆盖大 payload 或大规模历史 pack；后续内存优化应继续测大型差异，并优先收紧/预算化缓存与 workspace 路径索引。
 
 本轮未在本机验证 Linux、其他架构或 Windows 的构建与运行；发布仍依赖现有六平台构建流程。
 
