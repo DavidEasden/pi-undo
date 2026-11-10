@@ -446,21 +446,17 @@ export async function finalizeDurablePack(
 				throw error;
 			});
 			if (targetArtifactExists) {
+				// identity 已证明 absolute 与 target artifact 指向同一 inode，pre/post fsync 各确认一次绑定即可。
 				await assertSameFileIdentity(absolute, targetArtifact, path);
-				if (await fingerprintFile(absolute, path) !== leaf.fingerprint) {
-					throw new Error(`durable finalization 文件 fingerprint 冲突：${path}`);
-				}
 				await fsyncFile(targetArtifact);
 				await assertSameFileIdentity(absolute, targetArtifact, path);
 			} else {
 				if (mutationStates?.get(path) !== "CLEANED") {
 					throw new Error(`durable finalization target ownership 缺失：${path}`);
 				}
-				if (await fingerprintFile(absolute, path) !== leaf.fingerprint) {
-					throw new Error(`durable finalization 文件 fingerprint 冲突：${path}`);
-				}
 				await fsyncFile(absolute);
 			}
+			// 落盘后必须从磁盘读回比对：pack bytes 只证明 pack 自身一致，不能证明工作区文件已正确写入。
 			if (await fingerprintFile(absolute, path) !== leaf.fingerprint) {
 				throw new Error(`durable finalization 后文件 fingerprint 冲突：${path}`);
 			}
