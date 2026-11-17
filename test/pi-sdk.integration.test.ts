@@ -280,7 +280,8 @@ describe("真实 pi 1.2.0 SDK", () => {
 				secondRunStarted = true;
 				const runPromise = session.prompt("慢慢输出");
 				await vi.waitFor(() => expect(session.isIdle).toBe(false), { timeout: 5_000 });
-				await delay(200);
+				// 等待 write 工具真正落盘，避免输入前快照耗时变化导致 abort 早于写入。
+				await vi.waitFor(async () => expect(await readValue(temp.workspace)).toBe("intermediate\n"), { timeout: 5_000 });
 
 				// 中断后立即发起 /undo；gate 连第二轮检查点入栈也平行防护。
 				await session.abort();

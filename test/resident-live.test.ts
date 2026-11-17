@@ -5,10 +5,13 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { NativeDirectoryScanner } from "../src/native-directory-scan.ts";
+import { nativeExecutable } from "../src/native-restore.ts";
 
-const binary = join(process.cwd(), "native/pi-undo-fs/target/release/pi-undo-fs");
+// 本地开发优先使用 cargo 产物；CI 的 package job 只有 native/bin 下的发布二进制。
+const localBinary = join(process.cwd(), "native/pi-undo-fs/target/release/pi-undo-fs");
+const binary = existsSync(localBinary) ? localBinary : nativeExecutable() ?? localBinary;
 
-describe.skipIf(process.env.PI_UNDO_RUN_RESIDENT_LIVE !== "1" || process.platform !== "darwin" || !existsSync(binary))("resident scan smoke", () => {
+describe.skipIf(process.env.PI_UNDO_RUN_RESIDENT_LIVE !== "1" || (process.platform !== "darwin" && process.platform !== "linux") || !existsSync(binary))("resident scan smoke", () => {
 	it("预热后复用缓存并在目录事件后重扫", async () => {
 		const root = await realpath(await mkdtemp(join(tmpdir(), "pi-undo-resident-live-")));
 		const scanner = new NativeDirectoryScanner(binary);

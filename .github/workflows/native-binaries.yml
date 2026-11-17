@@ -68,6 +68,10 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --locked --manifest-path native/pi-undo-fs/Cargo.toml --target "${{ matrix.target }}"
+      # 只在与 runner 同架构的 target 上运行测试（含 inotify 常驻监听测试），交叉编译产物无法在本机执行。
+      - name: Test helper
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo test --release --locked --manifest-path native/pi-undo-fs/Cargo.toml --target "${{ matrix.target }}"
       - name: Stage binary
         run: |
           mkdir -p native-artifact
@@ -136,6 +140,9 @@ jobs:
       - run: chmod +x native/bin/pi-undo-fs-*
       - run: npm ci
       - run: npm test
+        env:
+          # runner 为 linux-x64：同时跑常驻扫描（inotify）冒烟测试。
+          PI_UNDO_RUN_RESIDENT_LIVE: "1"
       - name: Typecheck project sources
         run: |
           output="$(npx tsc --noEmit 2>&1 || true)"

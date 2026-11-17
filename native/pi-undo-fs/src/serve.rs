@@ -1,7 +1,7 @@
 //! 常驻目录扫描服务（`--serve`）。
 //!
 //! 协议：stdin 逐行 JSON 请求，stdout 逐行 JSON 响应，握手后立即输出 ready 行。
-//! 安全模型：常驻缓存只有在 FSEvents 明确无变化时复用；事件异常、缓存漂移或扫描竞争时回退完整重扫。
+//! 安全模型：常驻缓存只有在 FSEvents（macOS）或 inotify（Linux）明确无变化时复用；事件异常、缓存漂移或扫描竞争时回退完整重扫。
 //! 每次响应前后仍验证 workspace 身份，局部扫描保留目录句柄与父子绑定检查。
 
 use crate::directory::Directory;
@@ -819,11 +819,15 @@ mod watch_impl {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+#[path = "watch_linux.rs"]
+mod watch_impl;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod watch_impl {
     use super::EventBatch;
 
-    // 非 macOS 平台暂不提供常驻模式：--serve 直接返回不支持。
+    // 其他平台暂不提供常驻模式：--serve 直接返回不支持。
     pub(super) struct Watch;
     impl Watch {
         pub(super) fn create(_workspace: &std::path::Path) -> Result<Self, String> {

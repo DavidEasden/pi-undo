@@ -1172,6 +1172,36 @@ export class SnapshotStore {
 			// 先完成全部 membership 校验，再按 gitDirectory 分组；同一个私有 ODB 的多个 blob
 			// 合并成一次 cat-file --batch，省掉每次进程启动的固定开销。
 			const pending: { readonly gitDirectory: string; readonly objectId: string }[] = [];
+			// membership 缓存有上限；大批量请求被淘汰的路径按 tree 合并成一次 ls-tree，
+			// 避免逐路径启动 git 进程。查询结果只在本次请求内使用，不依赖缓存是否保留。
+			const fetchedMembership = new Map<string, string>();
+			const missingByTree = new Map<string, { gitDirectory: string; treeId: string; paths: string[] }>();
+			for (const request of requests) {
+				const root = roots.get(request.rootPath);
+				if (root === undefined || root.state !== "active" || root.treeId === null || request.relativePath === undefined) continue;
+				const gitDirectory = this.rootGitDirectory(storeDirectory, root);
+				const safeRelativePath = relativeSafePath("/", request.relativePath);
+				const knownKey = treeBlobMembershipKey(gitDirectory, root.treeId, safeRelativePath);
+				const known = this.treeBlobMembership.get(knownKey);
+				if (known !== undefined) {
+					// 先记入本次请求的局部表：后续批量 ls-tree 可能把它从有界缓存中淘汰。
+					fetchedMembership.set(knownKey, known);
+					continue;
+				}
+				const treeKey = `${gitDirectory}\0${root.treeId}`;
+				let group = missingByTree.get(treeKey);
+				if (group === undefined) {
+					group = { gitDirectory, treeId: root.treeId, paths: [] };
+					missingByTree.set(treeKey, group);
+				}
+				group.paths.push(safeRelativePath);
+			}
+			for (const group of missingByTree.values()) {
+				const entries = await this.readTreeEntries(group.gitDirectory, group.treeId, group.paths);
+				for (const entry of entries) {
+					fetchedMembership.set(treeBlobMembershipKey(group.gitDirectory, group.treeId, entry.relativePath), entry.objectId);
+				}
+			}
 			for (const request of requests) {
 				const root = roots.get(request.rootPath);
 				if (root === undefined) {
@@ -1191,7 +1221,7 @@ export class SnapshotStore {
 					}
 				} else {
 					const membershipKey = treeBlobMembershipKey(gitDirectory, root.treeId, safeRelativePath);
-					let ownedBlobId = this.treeBlobMembership.get(membershipKey);
+					let ownedBlobId = this.treeBlobMembership.get(membershipKey) ?? fetchedMembership.get(membershipKey);
 					if (ownedBlobId === undefined) {
 						await this.readTreeEntries(gitDirectory, root.treeId, [safeRelativePath]);
 						ownedBlobId = this.treeBlobMembership.get(membershipKey);
