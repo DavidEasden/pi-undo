@@ -22,6 +22,7 @@ import {
 import { assertManifest, assertOperationId, canonicalJson, checksum } from "./encoding.ts";
 import { MutationJournal } from "./mutation-journal.ts";
 import { allCompleted, checkOperation, rethrowOperationFailure, isUnconfirmedExit, operationFailure, withRecoveryBudget } from "./operation-context.ts";
+import { allowsNativeMountFastPaths } from "./native-capabilities.ts";
 import { createNativeFileBatch, nativeRestoreCapability } from "./native-restore.ts";
 import { recoverPackedMutations } from "./packed-recovery.ts";
 import type { ManifestId, RestorePath, SnapshotManifest, SnapshotRoot } from "./model.ts";
@@ -515,7 +516,7 @@ export class RestoreEngine {
 		// durable pack 的 blob 读取和编码可能持续一段时间；保留已完成的 plan/path 表，
 		// 让用户在此窗口触发 undo 时复用前序准备结果，而不是重新 listTree。
 		this.rememberPreparedPlan(plan, prepared.currentPaths, prepared.targetPaths);
-		if (!this.canUseNativeFilePlan(plan, prepared.currentPaths, prepared.targetPaths)) return;
+		if (!await this.canUseNativeFilePlan(plan, prepared.currentPaths, prepared.targetPaths)) return;
 		const cacheRoot = await this.store.durableCacheDirectory();
 		const cacheOpId = `cache-${plan.planDigest}`;
 		const cacheJournal = new MutationJournal(
@@ -1103,7 +1104,7 @@ export class RestoreEngine {
 			!compatibilityMode &&
 			options.deferDurability === true &&
 			options.forceTargetArtifactSync !== true &&
-			this.canUseNativeFilePlan(plan, currentPaths, targetPaths)
+			await this.canUseNativeFilePlan(plan, currentPaths, targetPaths)
 		) {
 			try {
 				const cached = this.durablePackCache.get(plan.planDigest);
@@ -1169,10 +1170,7 @@ export class RestoreEngine {
 			);
 		}
 		const durablePackEnabled = durablePack !== undefined;
-		if (
-			nativeFileBatch !== undefined && durablePack !== undefined &&
-			this.canUseNativeFilePlan(plan, currentPaths, targetPaths)
-		) {
+		if (nativeFileBatch !== undefined && durablePack !== undefined) {
 			if (!await visiblePreflight) {
 				return { code: "restore_failed_safe", verifiedPaths: 0, totalPaths: 0 };
 			}
@@ -1275,11 +1273,11 @@ export class RestoreEngine {
 		}
 	}
 
-	private canUseNativeFilePlan(
+	private async canUseNativeFilePlan(
 		plan: RestorePlan,
 		currentPaths: ReadonlyMap<string, OwnedPath>,
 		targetPaths: ReadonlyMap<string, OwnedPath>,
-	): boolean {
+	): Promise<boolean> {
 		if (plan.deletePaths.length + plan.writePaths.length === 0) return false;
 		if (process.platform === "win32" && plan.deletePaths.length > 0) return false;
 		if (!plan.deletePaths.every((path) =>
@@ -1288,7 +1286,20 @@ export class RestoreEngine {
 			targetPaths.get(path)?.entry.kind === "file" &&
 			(currentPaths.get(path) === undefined || currentPaths.get(path)?.entry.kind === "file"))) return false;
 		const paths = [...plan.deletePaths, ...plan.writePaths];
-		return process.platform === "win32" || paths.every((path) => strictPathAncestors(path).length <= 128);
+		if (process.platform === "win32") return true;
+		if (paths.some((path) => strictPathAncestors(path).length > 128)) return false;
+		if (process.platform !== "linux") return true;
+		// 只有覆盖已有文件才用 renameat2。按实际父目录判断，以覆盖工作区内的嵌套挂载；
+		// 不跨操作缓存结果，预制 pack 之后挂载也可能变化。
+		const parents = [...new Set(plan.writePaths.filter((path) => currentPaths.has(path))
+			.map((path) => dirname(path)))];
+		for (let start = 0; start < parents.length; start += RESTORE_FILE_PREPARE_CONCURRENCY) {
+			checkOperation();
+			const supported = await allCompleted(parents.slice(start, start + RESTORE_FILE_PREPARE_CONCURRENCY)
+				.map((parent) => allowsNativeMountFastPaths(this.absolutePath(parent))));
+			if (supported.includes(false)) return false;
+		}
+		return true;
 	}
 
 	private async applyNativeFilePlan(

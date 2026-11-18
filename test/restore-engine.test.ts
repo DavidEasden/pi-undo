@@ -8,6 +8,7 @@ import * as atomicFs from "../src/atomic-fs.ts";
 import { hasDurablePack } from "../src/durable-pack.ts";
 import { canonicalJson, checksum, topologyFingerprint } from "../src/encoding.ts";
 import { MutationJournal } from "../src/mutation-journal.ts";
+import * as nativeCapabilities from "../src/native-capabilities.ts";
 import * as nativeRestore from "../src/native-restore.ts";
 import { nativeExecutable } from "../src/native-restore.ts";
 import { checkOperation, createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
@@ -533,6 +534,45 @@ describe("RestoreEngine", () => {
 			code: "ENOENT",
 		});
 		expect(await readFile(join(repository.root, "managed-dir/ignored.txt"), "utf8")).toBe("preserve-me\n");
+	});
+
+	it.skipIf(process.platform !== "linux").each([false, true])("覆盖目录不支持原生隔离时整批使用 WAL（已有预制包=%s）", async (prebuilt) => {
+		const workspace = await temporaryRoot("pi-undo-mount-workspace-");
+		const storeRoot = await temporaryRoot("pi-undo-mount-store-");
+		const discovery = new RootDiscovery(undefined, { scan: async () => undefined });
+		const store = new SnapshotStore({ storeRoot, discovery });
+		const scope = ["nested/a", "nested/b", "added", "removed"];
+		for (const path of ["nested/a", "nested/b", "added"]) await writeFile(workspace, path, "target\n");
+		const topology = await discovery.discover(workspace);
+		const target = await store.capture(topology);
+		await rm(join(workspace, "added"));
+		for (const path of ["nested/a", "nested/b", "removed"]) await writeFile(workspace, path, "source\n");
+		const current = await store.capture(topology);
+		const engine = new RestoreEngine({ workspaceRoot: workspace, store, discovery });
+		const plan = await engine.plan(current, target, scope);
+		const mount = vi.spyOn(nativeCapabilities, "allowsNativeMountFastPaths").mockResolvedValue(prebuilt);
+		const batch = vi.spyOn(nativeRestore, "createNativeFileBatch");
+		try {
+			await engine.prepareDurableRestore(current, target, scope);
+			const cacheJournal = new MutationJournal(join(storeRoot, "durable-cache", plan.planDigest, "mutations.jsonl"), `cache-${plan.planDigest}`);
+			expect(await hasDurablePack(cacheJournal)).toBe(prebuilt);
+			const nested = join(topology.workspaceIdentity, "nested");
+			expect(mount.mock.calls).toEqual([[nested]]);
+			mount.mockClear().mockImplementation(async (directory) => directory !== nested);
+			const journal = new MutationJournal(join(storeRoot, "mutations.jsonl"), "mount-fallback");
+			expect((await engine.apply(plan, target, {
+				opId: journal.operationId, mutationJournal: journal, deferDurability: true,
+			})).code).toBe("ok");
+			expect(mount.mock.calls).toEqual([[nested]]);
+			expect(batch).not.toHaveBeenCalled();
+			expect(await hasDurablePack(journal)).toBe(false);
+			await journal.assertCleaned();
+			for (const path of ["nested/a", "nested/b", "added"]) expect(await readFile(join(workspace, path), "utf8")).toBe("target\n");
+			await expect(lstat(join(workspace, "removed"))).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			batch.mockRestore();
+			mount.mockRestore();
+		}
 	});
 
 	it("native 不可用时预生成 pack 自动回退 TypeScript durability", async () => {

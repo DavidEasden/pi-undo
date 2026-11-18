@@ -1,5 +1,24 @@
 # 原生目录扫描与普通文件恢复性能验证
 
+## Linux 共享盘
+
+Linux arm64、Node 23.11.1、Pi 1.4.0 SDK。工作区和会话目录均放在同一 Parallels `fuse.prl_fsd` 挂载上。3,000 个 ignored 依赖包（6,002 个目录），每次只覆盖一个根目录文件。表中为每组连续三次操作的中位数；成功的用例同时断言文件内容与 undo/redo 栈。
+
+| 同一挂载上的配置 | 撤销 | 重做 |
+| --- | ---: | ---: |
+| `c73bd40f` 默认 | `recovery_required`，无有效耗时 | 未执行 |
+| `c73bd40f` 全局禁用 native | 5.54 s | 3.75 s |
+| 仅将 FUSE 覆盖切换到事务日志 | 5.58 s | 5.35 s |
+| 同时按目录项扫描，首次 / 复测 | 3.27 / 3.90 s | 3.25 / 3.88 s |
+
+失败的单文件用例在 `renameat2(RENAME_NOREPLACE)` 处返回 `EINVAL`。现在在预制 pack 和真正应用计划前，分别用 `statfs` 检查待覆盖普通文件的父目录（去重、有界并发）；Linux FUSE 或无法判断时，整批走原有 WAL。它是保守的挂载类型判断，不是在用户目录创建文件做能力探测；纯新增、纯删除不依赖这次 rename，保留原选择。已进入 mutation 的事务仍使用原恢复流程，不在失败后换实现。
+
+工作区根位于 Linux FUSE 时不启动 `--serve`，TypeScript 每次完整枚举目录，从枚举结果挑选可能含 `.git` 的目录再检查，不对每个普通目录单独查询 `.git`。仍遍历 ignored 目录，并在枚举前后复核目录路径。两次实测每轮撤销均执行两次拓扑发现。完整快照仍须通过 Git 枚举 ignored 叶子。未在 Windows 或其他 FUSE 驱动上实测，不把本机数据当作性能保证。
+
+复现：将 `TMPDIR` 指向共享盘上工作区外的临时目录，运行 `PI_UNDO_LARGE_WORKSPACE=1 npx vitest run test/large-workspace.test.ts -t '3000 个依赖包，修改 1 个文件'`。不指定 `TMPDIR` 时夹具通常在 `/tmp` 建工作区，测不到共享盘。
+
+## 历史基准
+
 本轮实现目录项缓存与 scoped restore 的可见路径检查；普通一次性扫描仍会逐个打开、核验工作区内的目录，宽目录最多使用 16 个有界 worker 并行处理。常驻 `--serve` 在 macOS 上使用 FSEvents 收集变更父目录，只重新枚举受影响祖先并合并局部 cache；无变化请求复用驻留 cache，事件丢失、监听停止或扫描竞争时回退完整校验。
 
 ## Durable pack 准备与批量写入

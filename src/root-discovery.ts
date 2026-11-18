@@ -176,14 +176,16 @@ export class RootDiscovery {
 	): Promise<Array<{ readonly path: string; readonly inspect: true }>> {
 		checkOperation();
 		if (!await isSafeDirectory(candidate.path, workspaceIdentity)) return [];
-		if (candidate.inspect) {
-			const inspection = await this.inspectRepository(candidate.path, workspaceIdentity);
-			this.recordInspection(workspaceIdentity, inspection, activeRoots);
-			if (!await isSafeDirectory(candidate.path, workspaceIdentity)) return [];
-		}
 		checkOperation();
 		const entries = await readdir(candidate.path, { withFileTypes: true });
 		if (!await isSafeDirectory(candidate.path, workspaceIdentity)) return [];
+		// 使用这次枚举识别候选；遇到大小写变体仍由文件系统对 .git 的实际查找决定。
+		if (candidate.inspect && entries.some((entry) => entry.name.toLowerCase() === ".git")) {
+			checkOperation();
+			const inspection = await this.inspectRepository(candidate.path, workspaceIdentity);
+			if (!await isSafeDirectory(candidate.path, workspaceIdentity)) return [];
+			this.recordInspection(workspaceIdentity, inspection, activeRoots);
+		}
 		return entries
 			.filter((entry) => entry.name !== ".git" && !entry.isSymbolicLink() && entry.isDirectory())
 			.map((entry) => ({ path: join(candidate.path, entry.name), inspect: true as const }));

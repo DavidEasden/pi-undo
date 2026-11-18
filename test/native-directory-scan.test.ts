@@ -1,9 +1,10 @@
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, statfs, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import * as nativeCapabilities from "../src/native-capabilities.ts";
 import { NativeDirectoryScanner } from "../src/native-directory-scan.ts";
 import { ResidentScanClient } from "../src/resident-scan-client.ts";
 import { createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
@@ -30,6 +31,38 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform === "win32" || process.env.PI_UNDO_DISABLE_NATIVE === "1")("NativeDirectoryScanner", () => {
+	it.skipIf(process.platform !== "linux")("只读识别挂载类型，无法查询时保守回退", async () => {
+		const workspace = await root();
+		expect(await nativeCapabilities.allowsNativeMountFastPaths(workspace)).toBe((await statfs(workspace)).type !== 0x65735546);
+		expect(await nativeCapabilities.allowsNativeMountFastPaths(join(workspace, "missing"))).toBe(false);
+		expect(await readdir(workspace)).toEqual([]);
+	});
+
+	it("不可靠挂载不启动监听，逐次枚举发现 ignored 目录中新增、删除的仓库标记", async () => {
+		const workspace = await root();
+		const value = await helper(`import {writeFileSync} from "node:fs"; writeFileSync(new URL("started", import.meta.url), "x");`);
+		const mount = vi.spyOn(nativeCapabilities, "allowsNativeMountFastPaths").mockResolvedValue(false);
+		const discovery = new RootDiscovery(undefined, new NativeDirectoryScanner(value.path));
+		try {
+			await writeFile(join(workspace, ".gitignore"), "vendor/\n");
+			await Promise.all(Array.from({ length: 64 }, (_, i) => mkdir(join(workspace, "vendor", `p${i}`), { recursive: true })));
+			const initial = await discovery.discover(workspace);
+			expect(initial.directoriesVisited).toBe(66);
+			discovery.warmScanCache(workspace);
+			const marker = join(workspace, "vendor/p0/.git");
+			await writeFile(marker, "无效的仓库指针\n");
+			expect((await discovery.discover(workspace)).roots).toContainEqual(expect.objectContaining({
+				relativeRoot: "vendor/p0", state: "broken",
+			}));
+			await rm(marker);
+			expect((await discovery.discover(workspace)).fingerprint).toBe(initial.fingerprint);
+			await expect(lstat(join(value.directory, "started"))).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			await discovery.dispose();
+			mount.mockRestore();
+		}
+	});
+
 	it("旧 helper 在私有目录探测且仅探测一次", async () => {
 		const value = await helper(`
 import { appendFileSync, readFileSync } from "node:fs";

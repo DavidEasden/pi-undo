@@ -167,6 +167,8 @@ recovery_required
 
 ### Performance Notes
 
+**Linux 共享盘：** 可以直接在 Parallels 的 `/media/psf` 下使用默认配置，不需要搬动项目或设置 `PI_UNDO_DISABLE_NATIVE=1`。工作区根位于 FUSE 时，每次完整枚举目录，不依赖宿主机是否投递 inotify 事件。覆盖已有普通文件时，若其父目录位于 FUSE，整批在写入前选择现有的 TypeScript 事务日志路径；元数据检查仍可使用原生 helper。见[共享盘实测](docs/native-performance.md#linux-共享盘)。
+
 普通文件恢复在持有 workspace 独占锁时，先逐项核验 changedPaths 中的叶子文件；若与 checkpoint source 一致，就直接复用 manifest，避免额外 scoped capture 和全目录扫描。目录 scope、内容不匹配或 source 无法证明时仍走 scoped safety capture。成功路径保留 `restore-pre` 与 `restore-post` 两次 topology 检查，并继续执行 scope 内可见路径校验；锁内省略其后的重复 topology 扫描。native helper 仍不跟随符号链接地扫描 ignored 目录中的嵌套仓库；没有默认跳过 `node_modules`，也没有使用 TTL 缓存。
 
 原生恢复可处理已有父目录中的普通文件删除、覆盖、创建及混合计划。`restore-files-v2` 覆盖子目录删除和混合 mutation；`restore-files-v3` 会把分散在大量父目录中的文件拆成多个批次，每批最多打开 128 个非根父目录句柄。旧 helper、缺少二进制、目录操作、类型替换及单条路径深度超过句柄预算时继续走 TypeScript 路径。durable pack、逐项内容校验、no-clobber 与恢复依据均保留。
@@ -218,7 +220,7 @@ Performance gains come from:
 - **Indexed mutation path checks** — `MutationPathIndex` replaces the per-target-path `[...deletePaths, ...writePaths].some(...)` scan (10k × 10k ≈ 962 ms → < 1 ms).
 - **Deduped batch blob reads** — object IDs are deduplicated with a `Set` instead of `Array.includes` (10k unique blobs ≈ 101 ms → 2.2 ms).
 - **Shared, parallel parent validation** — native metadata inspect validates the deduplicated parent set once per request with 32-way concurrency (10k deep paths 111.7 ms → 71.0 ms).
-- **Persistent resident scan cache** — `--serve` starts from the on-disk v2 directory cache and writes it back; idle timeout raised to 600 s. 20k-directory cold start 377 ms → 251 ms with a warm cache, steady-state requests remain 13–20 ms.
+- **常驻目录缓存**：使用 `--serve` 时可从磁盘 v2 缓存启动，当前服务空闲约 10 秒后退出。Linux FUSE 工作区不使用此缓存。
 - **Racy-window baseline skip** — settled capture skips the guaranteed-failing `isBaselineFresh` probe within 2 s after a restore, removing ~227–240 ms from the settlement path.
 - **Transferred pack payloads** — the restore path hands pack ownership of its freshly read blobs instead of copying them (64 MiB benchmark: +64.0 MiB → +0.01 MiB extra ArrayBuffers, +2.3 MiB RSS), and the pack checksum is computed during the write pass.
 

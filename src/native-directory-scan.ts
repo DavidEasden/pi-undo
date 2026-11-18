@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { GitRunError, runSupervisedProcess } from "./git-runner.ts";
-import { probeNativeCapabilities } from "./native-capabilities.ts";
+import { allowsNativeMountFastPaths, probeNativeCapabilities } from "./native-capabilities.ts";
 import { nativeExecutable } from "./native-restore.ts";
 import { checkOperation, configuredTimeout, OperationError, operationProcessOptions } from "./operation-context.ts";
 import { ResidentScanClient } from "./resident-scan-client.ts";
@@ -84,6 +84,7 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 	}
 
 	private async prewarmResident(workspaceRoot: string): Promise<void> {
+		if (!await allowsNativeMountFastPaths(workspaceRoot)) return;
 		const temporaryRoot = await realpath(tmpdir()).catch(() => undefined);
 		if (temporaryRoot === undefined || isPathInside(workspaceRoot, temporaryRoot)) return;
 		const requestDirectory = await mkdtemp(join(temporaryRoot, "pi-undo-native-serve-probe-"));
@@ -118,7 +119,7 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 
 	async scan(workspaceRoot: string): Promise<NativeDirectoryScan | undefined> {
 		checkOperation();
-		if (this.executable === undefined) return undefined;
+		if (this.executable === undefined || !await allowsNativeMountFastPaths(workspaceRoot)) return undefined;
 		const pendingPrewarm = this.prewarmInFlight;
 		if (pendingPrewarm?.workspaceRoot === workspaceRoot) await pendingPrewarm.promise;
 		checkOperation();

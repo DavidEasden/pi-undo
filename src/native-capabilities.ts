@@ -1,5 +1,19 @@
+import { statfs } from "node:fs/promises";
+
 import { GitRunError, runSupervisedProcess } from "./git-runner.ts";
 import { checkOperation, OperationError, operationProcessOptions, rethrowOperationFailure } from "./operation-context.ts";
+
+const LINUX_FUSE_SUPER_MAGIC = 0x65735546;
+
+/** Linux FUSE 不保证支持防覆盖 rename，也不保证宿主机变更会产生客户机 inotify 事件。 */
+export async function allowsNativeMountFastPaths(directory: string): Promise<boolean> {
+	if (process.platform !== "linux") return true;
+	try {
+		return (await statfs(directory)).type !== LINUX_FUSE_SUPER_MAGIC;
+	} catch {
+		return false;
+	}
+}
 
 /** 在私有目录探测，防止旧 helper 把 --capabilities 当成工作区里的请求文件。 */
 export async function probeNativeCapabilities(
