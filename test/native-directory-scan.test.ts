@@ -251,7 +251,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
  } else setTimeout(() => console.log(JSON.stringify({ ok: true, schemaVersion: JSON.parse(line).schemaVersion })), 30);
 });
 `);
-		const client = new ResidentScanClient(value.path, value.directory, 1_000, undefined, 15);
+		// timeout 是每次请求的预算，包含 spawn Node helper 与握手；实测一次约 750ms，1s 在负载下会偶发超时。
+		const client = new ResidentScanClient(value.path, value.directory, 5_000, undefined, 15);
 		try {
 			const first = client.scan();
 			const second = client.scan();
