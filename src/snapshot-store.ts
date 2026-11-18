@@ -12,6 +12,8 @@ import {
 	topologyFingerprint,
 } from "./encoding.ts";
 import { GitRunError, GitRunner, type GitRunOptions } from "./git-runner.ts";
+import { ignoredScanRoots, scanIgnoredDirectories } from "./ignored-directory-scan.ts";
+import { allowsNativeMountFastPaths } from "./native-capabilities.ts";
 import type {
 	DiscoveryRoot,
 	ManifestId,
@@ -45,6 +47,7 @@ const HASH_BATCH_CONCURRENCY = 4;
 const ROOT_CAPTURE_CONCURRENCY = 4;
 const FILE_SYSTEM_INSPECTION_CONCURRENCY = 32;
 const METADATA_BATCH_MAX_PATHS = 2_048;
+const IGNORED_SCAN_MIN_PATHS = 1_024;
 const METADATA_BATCH_HARD_MAX_PATHS = 8_192;
 const METADATA_BATCH_MAX_PATH_BYTES = 1 * 1024 * 1024;
 const METADATA_BATCHES_MAX_BATCHES = 32;
@@ -345,6 +348,8 @@ export class SnapshotStore {
 	private readonly treeBlobMembership = new Map<string, string>();
 	private readonly blobCache = new Map<string, CachedBlob>();
 	private readonly visibleLeafCache = new Map<string, Map<string, CachedVisibleLeaf>>();
+	/** 只作性能提示。显式注入的 metadata 校验器始终按原协议检查全部候选。 */
+	private readonly largeIgnoredRoots?: Set<string>;
 	/** check-ignore 探针结果缓存；同一进程内同一 cwd 只验证一次，失败不缓存。 */
 	private readonly validatedIgnoreQueries = new Set<string>();
 	private readonly leafCacheDirectoriesLoaded = new Set<string>();
@@ -356,6 +361,7 @@ export class SnapshotStore {
 		this.storeRoot = resolve(options.storeRoot ?? join(tmpdir(), "pi-undo-snapshot-store"));
 		this.storesRoot = join(this.storeRoot, "stores");
 		this.git = options.git ?? new GitRunner();
+		if (process.platform === "linux" && options.nativeMetadata === undefined) this.largeIgnoredRoots = new Set();
 		this.discovery = options.discovery ?? new RootDiscovery(this.git);
 		this.lock = options.lock ?? new WorkspaceLock();
 		this.clock = options.clock ?? Date.now;
@@ -1454,11 +1460,25 @@ export class SnapshotStore {
 		if (inclusions === null) {
 			return [];
 		}
-		const pathspecs = inclusions.length === 0 ? ["."] : inclusions.map(literalPathspec);
+		const fullRoot = inclusions.length === 0 && exclusions.length === 0;
+		let partition: { leaves: string[]; rest: string[] } | undefined;
+		if (fullRoot && this.largeIgnoredRoots?.has(cwd) &&
+			!await allowsNativeMountFastPaths(cwd) &&
+			!["GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"].some((key) => process.env[key] !== undefined)) {
+			try {
+				partition = await this.scanWhollyIgnoredDirectories(cwd, environment, gitBacked);
+			} catch (error) {
+				// 只丢弃可选的分区结果；正式 Git 查询与叶子校验的错误仍然上传。
+				rethrowOperationFailure(error);
+				checkOperation();
+			}
+		}
+		const pathspecs = partition !== undefined ? partition.rest.map(literalPathspec)
+			: inclusions.length === 0 ? ["."] : inclusions.map(literalPathspec);
 		for (const excluded of exclusions) {
 			pathspecs.push(excludeLiteralPathspec(excluded));
 		}
-		const output = await this.runGitBytes([
+		const output = pathspecs.length === 0 ? new Uint8Array() : await this.runGitBytes([
 			...(gitBacked ? ["-c", "core.fsmonitor=false"] : []),
 			"ls-files",
 			"--others",
@@ -1489,7 +1509,7 @@ export class SnapshotStore {
 		const kinds = nativeEntries === undefined
 			? await this.collectIgnoredPresentKindsFallback(cwd, candidates)
 			: nativeEntries.map((entry) => entry.kind);
-		const result: string[] = [];
+		const result = partition?.leaves.filter((path) => !exactExclusions.has(path)) ?? [];
 		for (let index = 0; index < candidates.length; index += 1) {
 			const relativePath = candidates[index]!;
 			const kind = kinds[index]!;
@@ -1499,7 +1519,45 @@ export class SnapshotStore {
 			}
 			result.push(relativePath);
 		}
+		if (fullRoot && this.largeIgnoredRoots !== undefined) {
+			if (result.length >= IGNORED_SCAN_MIN_PATHS) this.largeIgnoredRoots.add(cwd);
+			else this.largeIgnoredRoots.delete(cwd);
+		}
 		return result.sort(comparePaths);
+	}
+
+	private async scanWhollyIgnoredDirectories(
+		cwd: string, environment: Readonly<Record<string, string | undefined>>, gitBacked: boolean,
+	): Promise<{ leaves: string[]; rest: string[] } | undefined> {
+		const root = await ignoredScanRoots(cwd);
+		if (root === undefined || root.directories.length === 0) return undefined;
+		const env = gitBacked ? sourceGitEnvironment() : environment;
+		const gitOptions = { cwd, env };
+		const prefix = gitBacked ? ["-c", "core.fsmonitor=false"] : [];
+		// 必须查询目录本身，不附加 /。dir/* 可以匹配 dir/，却允许 !dir/keep 重新纳入叶子。
+		// ./ 消除以冒号开头的路径歧义；实际目录的类型由 Git 判定。
+		const requests = root.directories.map((name) => `./${name}`);
+		const classify = async (): Promise<Set<string>> => {
+			const output = await this.runGitBytes([...prefix, "check-ignore", "--stdin", "-z"], {
+				...gitOptions, stdin: `${requests.join("\0")}\0`,
+			});
+			const allowed = new Set(requests);
+			const names = splitNulRecords(output).map((record) => decodeUtf8(record));
+			if (names.some((name) => !allowed.has(name))) throw new Error("Git 返回未知的忽略目录");
+			return new Set(names.map((name) => name.slice(2)));
+		};
+		const ignored = await classify();
+		if (ignored.size === 0) return undefined;
+		const hasIndexedEntries = async () => (await this.runGitBytes([
+			...prefix, "ls-files", "--cached", "-z", "--", ...[...ignored].map((name) => `:(icase,literal)${name}`),
+		], { ...gitOptions, stdoutLimit: 64 * 1024 })).length !== 0;
+		if (await hasIndexedEntries()) return undefined;
+		const rest = root.names.filter((name) => !ignored.has(name));
+		const leaves = await scanIgnoredDirectories(cwd, [...ignored]);
+		const after = await ignoredScanRoots(cwd);
+		if (!after || !samePathList(root.names, after.names) || !samePathList(root.directories, after.directories) ||
+			!samePathList([...ignored].sort(), [...await classify()].sort()) || await hasIndexedEntries()) return undefined;
+		return { leaves, rest };
 	}
 
 	private async inspectNativeMetadataBatches(

@@ -224,7 +224,7 @@ Performance gains come from:
 - **Racy-window baseline skip** — settled capture skips the guaranteed-failing `isBaselineFresh` probe within 2 s after a restore, removing ~227–240 ms from the settlement path.
 - **Transferred pack payloads** — the restore path hands pack ownership of its freshly read blobs instead of copying them (64 MiB benchmark: +64.0 MiB → +0.01 MiB extra ArrayBuffers, +2.3 MiB RSS), and the pack checksum is computed during the write pass.
 
-The ignored-present proof still runs `git ls-files --others --ignored --exclude-standard` on every full capture (~363 ms for 10k ignored files on the local benchmark). Reusing a previous proof needs directory-cache evidence to cross the helper boundary, which is tracked in `docs/native-performance.md` as the remaining follow-up.
+**共享盘检查点**：上次完整枚举有至少 1,024 个忽略文件时，可批量扫描由 Git 确认整体忽略、且没有跟踪文件的顶层目录。每轮重新读取目录项，不复用上轮文件清单。首次捕获、局部快照或无法确认规则时仍使用原来的 Git 查询。在 Parallels 共享盘的 3,000 包单文件修改用例中，检查点等待从 6.69 秒降到 3.30 秒；见[检查点实测](docs/native-performance.md#共享盘检查点)。
 - **Batch validated manifest blob reads** — durable pack reads coalesce blob fetches into a single batch per manifest with combined Git validation.
 
 ## How It Works

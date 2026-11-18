@@ -4,7 +4,9 @@ import { access, chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as ignoredDirectoryScan from "../src/ignored-directory-scan.ts";
+import * as nativeCapabilities from "../src/native-capabilities.ts";
 import { canonicalJson, checksum, ignoredPresentClosure } from "../src/encoding.ts";
 import { GitRunError, GitRunner, type GitRunOptions, type GitRunResult } from "../src/git-runner.ts";
 import type { ManifestId, SnapshotManifest } from "../src/model.ts";
@@ -584,6 +586,66 @@ describe("SnapshotStore", () => {
 		expect(reused).toEqual(baseline);
 		expect(git.calls.some((call) => call.args[0] === "hash-object")).toBe(false);
 		expect(git.calls.some((call) => call.args[0] === "write-tree")).toBe(false);
+	});
+
+	it.skipIf(process.platform !== "linux")("共享盘分区枚举与 Git 精确结果一致；规则或 index 变化不复用旧证明", async () => {
+		const workspace = await temporaryRoot("pi-undo-ignored-proof-");
+		await createGitRepo(workspace);
+		const git = new RecordingGitRunner();
+		const discovery = new RootDiscovery(git, { scan: async () => undefined });
+		const store = new SnapshotStore({ storeRoot: await temporaryRoot("pi-undo-store-"), discovery, git });
+		const mount = vi.spyOn(nativeCapabilities, "allowsNativeMountFastPaths").mockResolvedValue(false);
+		try {
+			const rules = "deps/\npartial/*\n!partial/keep\n*.log\n";
+			await writeFixtureFile(workspace, ".gitignore", rules);
+			await mkdir(join(workspace, "deps"));
+			for (let i = 0; i < 1_024; i += 32) {
+				await Promise.all(Array.from({ length: 32 }, (_, n) => writeFile(join(workspace, "deps", `${i + n}`), "x")));
+			}
+			await writeFixtureFile(workspace, "partial/keep", "visible");
+			await writeFixtureFile(workspace, "partial/skip", "ignored");
+			await writeFixtureFile(workspace, "[literal].log", "ignored");
+			await writeFixtureFile(workspace, "deps/sub/.gitignore", "!keep\n");
+			await writeFixtureFile(workspace, "deps/sub/keep", "ignored");
+			await symlink("../partial", join(workspace, "deps", "link"));
+			const topology = await discovery.discover(workspace);
+			let before = await store.capture(topology);
+			const fullQuery = () => git.calls.some(({ args }) => args.includes("--ignored") && args.at(-1) === ".");
+			const compare = async (expectFull: boolean) => {
+				git.calls.length = 0;
+				const after = await store.captureBaseline(topology, before);
+				const expected = (await runGit(workspace, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", "."]))
+					.split("\0").filter(Boolean).sort();
+				expect(after.roots[0]?.ignoredPresentPaths).toEqual(expected);
+				expect(git.calls.some(({ args }) => args.includes("check-ignore") && args.includes("--stdin"))).toBe(true);
+				expect(fullQuery()).toBe(expectFull);
+				before = after;
+			};
+			await rm(join(workspace, "deps/0"));
+			await writeFixtureFile(workspace, "deps/新增\n文件", "new");
+			await compare(false);
+			expect(before.roots[0]?.ignoredPresentPaths).not.toContain("partial/keep");
+			// 在枚举完成后才强制加入 index；先前的分类结果必须作废。
+			const scan = ignoredDirectoryScan.scanIgnoredDirectories;
+			const changedIndex = vi.spyOn(ignoredDirectoryScan, "scanIgnoredDirectories").mockImplementationOnce(async (...args) => {
+				const paths = await scan(...args);
+				await runGit(workspace, ["add", "-f", "deps/1"]);
+				return paths;
+			});
+			try {
+				await compare(true);
+				expect(changedIndex).toHaveBeenCalled();
+			} finally { changedIndex.mockRestore(); }
+			expect(before.roots[0]?.ignoredPresentPaths).not.toContain("deps/1");
+			await runGit(workspace, ["rm", "--cached", "-f", "deps/1"]);
+			await writeFixtureFile(workspace, ".gitignore", rules.replace("!partial/keep", "!partial/skip"));
+			await compare(false);
+			expect(before.roots[0]?.ignoredPresentPaths).toContain("partial/keep");
+			const scoped = await store.capture(topology, ["deps/1"]);
+			expect(scoped.roots[0]?.ignoredPresentPaths).toEqual(["deps/1"]);
+			const excluded = await store.capture(topology, undefined, { excludePaths: ["deps/1"] });
+			expect(excluded.roots[0]?.ignoredPresentPaths).not.toContain("deps/1");
+		} finally { mount.mockRestore(); await discovery.dispose(); }
 	});
 
 	it("ignored-present 路径变化时拒绝复用 baseline", async () => {

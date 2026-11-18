@@ -37,7 +37,20 @@ describe.skipIf(process.env.PI_UNDO_LARGE_WORKSPACE !== "1")("大型工作区真
 				fauxAssistantMessage(paths.map((path) => fauxToolCall("write", { path, content: "after\n" })), { stopReason: "toolUse" }),
 				fauxAssistantMessage("完成"),
 			]);
-			await harness.session.prompt("更新测试文件");
+			// 单独记录 agent_settled 到检查点发布的等待，不把工具执行或后续 undo 算进来。
+			const controller = harness.runtime().controller;
+			const settle = controller.agentSettled.bind(controller);
+			let checkpointMs: number | undefined;
+			const timer = vi.spyOn(controller, "agentSettled").mockImplementation(async () => {
+				const started = performance.now();
+				await settle();
+				checkpointMs = Math.round(performance.now() - started);
+			});
+			try {
+				await harness.session.prompt("更新测试文件");
+				expect(controller.listCheckpoints().at(-1)?.changedPaths).toEqual([...paths].sort());
+				expect(checkpointMs).toBeDefined();
+			} finally { timer.mockRestore(); }
 			const timings: number[] = [];
 			const redoTimings: number[] = [];
 			const scans: number[] = [];
@@ -79,7 +92,7 @@ describe.skipIf(process.env.PI_UNDO_LARGE_WORKSPACE !== "1")("大型工作区真
 				expect(scan).toBeLessThanOrEqual(maxScans);
 			}
 			const report = JSON.stringify({
-				packages, changedFiles, timingsMs: timings, redoTimingsMs: redoTimings, scans,
+				packages, changedFiles, checkpointMs, timingsMs: timings, redoTimingsMs: redoTimings, scans,
 				nativeDisabled: process.env.PI_UNDO_DISABLE_NATIVE === "1",
 				medianMs: [...timings].sort((a, b) => a - b)[1],
 				peakRssMiB: Math.round(peakRss / 1024 / 1024),
