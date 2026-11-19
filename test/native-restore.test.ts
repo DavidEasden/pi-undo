@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -89,6 +89,16 @@ async function mixedFixture() {
 
 afterEach(async () => {
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+describe("native executable 解析", () => {
+	it("当前平台缺少随包 helper 时返回 undefined，而不是不存在的路径", async () => {
+		const { nativeExecutable } = await import("../src/native-restore.ts");
+		const executable = nativeExecutable();
+		if (executable === undefined) return;
+		// 返回了路径就一定是可访问的真实文件：调用方无需靠 access() 失败才发现缺失。
+		await expect(access(executable)).resolves.toBeUndefined();
+	});
 });
 
 describe("native restore helper", () => {

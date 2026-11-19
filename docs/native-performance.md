@@ -30,6 +30,23 @@ Linux arm64、Node 23.11.1、Pi 1.4.0 SDK。工作区和会话目录均放在同
 
 只把上次忽略文件数量作为选择执行方式的提示。满足阈值的 Linux 共享盘完整根，每次用 `check-ignore` 检查顶层目录本身（`dir/*` 不等于 `dir/`），再用 `ls-files --cached` 排除强制跟踪项。整体忽略的目录分批重新读取，只收集文件和符号链接，不跟随链接；其他项仍交由 Git 和原有 metadata 校验。扫描前后复核根目录清单、忽略规则结果和 index。遇到仓库标记、范围排除、特殊目录项、路径预算或无法确认的状态，就使用原查询；取消、超时不会启动重试。没有缩短等待超时，也没有提前发布检查点。
 
+### 分区扫描不再按挂载类型启用
+
+上一轮的 ignored 分区扫描只对 Linux FUSE 工作区启用：构造函数仅在 `process.platform === "linux"` 时建立规模集合，`captureIgnoredPresentPaths` 还额外要求 `allowsNativeMountFastPaths(cwd)` 为假。这条限制的理由是共享盘上的 `readdir` 更贵，但分区扫描的成本主体是目录项枚举，与文件系统类型无关——本地盘省掉的是同样的 `ls-files --ignored` 全量枚举。
+
+本机 macOS arm64、3,000 个依赖包、修改 1 个文件，直接调用 `discover` 与 `captureBaseline`：
+
+| 阶段 | 原实现 | 解禁后 |
+| --- | ---: | ---: |
+| 首次（`baseline-fallback`） | 344 / 433 ms | 360 / 433 ms |
+| 稳态 `baselineValidation`（三次） | 253 / 262 / 256 ms | 144 / 139 / 138 ms |
+
+分组计时中 `captureIgnoredPresentPaths` 占完整捕获的八成，其中 `ls-files --others --ignored` 约 190–200 ms，native metadata inspect 约 30 ms，`write-tree`、`read-tree` 与对象完整性各为个位数毫秒。分区路径把前者换成 `check-ignore`（约 6 ms）加目录枚举（约 80–190 ms，取决于目录项缓存是否命中）。
+
+首次捕获两侧持平：`node_modules` 刚建立时目录 mtime 仍在 `DirectoryListingCache` 的 2 秒 racy 窗口内，缓存不复用，分区枚举与 Git 精确查询打平。稳态收益来自目录项缓存命中。
+
+未在 Windows 启用（保留原查询），也未重新测 Linux 共享盘；上述数字是本机单次运行，不是性能保证。
+
 ### 目录项缓存复用
 
 共享盘上单次 `readdir` 约占目录扫描耗时的九成，`realpath` 约一成，提高并发（8→64）只从 1,937 ms 降到 1,684 ms。因此改为在同一 `RootDiscovery` 实例内缓存目录项：每次仍先 `lstat`，`dev`、`ino`、`mtime`、`ctime` 全部不变，且缓存时目录最后修改早于枚举时刻超过 2 秒，才复用上次结果，否则重新 `readdir`。枚举前后元数据不一致的结果不进入缓存。`realpath` 边界复核每次照常执行。ignored 目录扫描使用同一缓存，所以检查点的根发现与完整捕获、撤销前后的两次拓扑发现，都不再重复读取相同目录。

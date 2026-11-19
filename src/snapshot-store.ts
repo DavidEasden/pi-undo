@@ -13,7 +13,6 @@ import {
 } from "./encoding.ts";
 import { GitRunError, GitRunner, type GitRunOptions } from "./git-runner.ts";
 import { ignoredScanRoots, scanIgnoredDirectories } from "./ignored-directory-scan.ts";
-import { allowsNativeMountFastPaths } from "./native-capabilities.ts";
 import type {
 	DiscoveryRoot,
 	ManifestId,
@@ -361,7 +360,9 @@ export class SnapshotStore {
 		this.storeRoot = resolve(options.storeRoot ?? join(tmpdir(), "pi-undo-snapshot-store"));
 		this.storesRoot = join(this.storeRoot, "stores");
 		this.git = options.git ?? new GitRunner();
-		if (process.platform === "linux" && options.nativeMetadata === undefined) this.largeIgnoredRoots = new Set();
+		// 分区扫描的成本以目录项枚举为主，与文件系统类型无关：本地 APFS/ext4 与共享盘一样付
+		// readdir 的代价，只是共享盘更贵。默认对所有 Unix 平台记录规模，Windows 保持原查询。
+		if (process.platform !== "win32" && options.nativeMetadata === undefined) this.largeIgnoredRoots = new Set();
 		this.discovery = options.discovery ?? new RootDiscovery(this.git);
 		this.lock = options.lock ?? new WorkspaceLock();
 		this.clock = options.clock ?? Date.now;
@@ -1463,7 +1464,6 @@ export class SnapshotStore {
 		const fullRoot = inclusions.length === 0 && exclusions.length === 0;
 		let partition: { leaves: string[]; rest: string[] } | undefined;
 		if (fullRoot && this.largeIgnoredRoots?.has(cwd) &&
-			!await allowsNativeMountFastPaths(cwd) &&
 			!["GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"].some((key) => process.env[key] !== undefined)) {
 			try {
 				partition = await this.scanWhollyIgnoredDirectories(cwd, environment, gitBacked);

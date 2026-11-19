@@ -1,4 +1,4 @@
-import { constants } from "node:fs";
+import { constants, existsSync } from "node:fs";
 import { access, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -120,7 +120,10 @@ export function nativeExecutable(): string | undefined {
 	const architecture = process.arch === "arm64" ? "arm64" : process.arch === "x64" ? "x64" : undefined;
 	if (platform === undefined || architecture === undefined) return undefined;
 	const extension = process.platform === "win32" ? ".exe" : "";
-	return fileURLToPath(new URL(`../native/bin/pi-undo-fs-${platform}-${architecture}${extension}`, import.meta.url));
+	const executable = fileURLToPath(new URL(`../native/bin/pi-undo-fs-${platform}-${architecture}${extension}`, import.meta.url));
+	// 当前平台没有随包发布的 helper 时返回 undefined，而不是一个不存在的路径：
+	// 调用方据此明确走 TypeScript 回退，而不是靠后续 access() 失败才降级。
+	return existsSync(executable) ? executable : undefined;
 }
 
 async function runNative(

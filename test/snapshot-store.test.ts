@@ -6,7 +6,6 @@ import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as ignoredDirectoryScan from "../src/ignored-directory-scan.ts";
-import * as nativeCapabilities from "../src/native-capabilities.ts";
 import { canonicalJson, checksum, ignoredPresentClosure } from "../src/encoding.ts";
 import { GitRunError, GitRunner, type GitRunOptions, type GitRunResult } from "../src/git-runner.ts";
 import type { ManifestId, SnapshotManifest } from "../src/model.ts";
@@ -588,13 +587,13 @@ describe("SnapshotStore", () => {
 		expect(git.calls.some((call) => call.args[0] === "write-tree")).toBe(false);
 	});
 
-	it.skipIf(process.platform !== "linux")("共享盘分区枚举与 Git 精确结果一致；规则或 index 变化不复用旧证明", async () => {
+	// 分区扫描不再按挂载类型启用，因此在各平台用真实临时目录验证同一契约。
+	it.skipIf(process.platform === "win32")("分区枚举与 Git 精确结果一致；规则或 index 变化不复用旧证明", async () => {
 		const workspace = await temporaryRoot("pi-undo-ignored-proof-");
 		await createGitRepo(workspace);
 		const git = new RecordingGitRunner();
 		const discovery = new RootDiscovery(git, { scan: async () => undefined });
 		const store = new SnapshotStore({ storeRoot: await temporaryRoot("pi-undo-store-"), discovery, git });
-		const mount = vi.spyOn(nativeCapabilities, "allowsNativeMountFastPaths").mockResolvedValue(false);
 		try {
 			const rules = "deps/\npartial/*\n!partial/keep\n*.log\n";
 			await writeFixtureFile(workspace, ".gitignore", rules);
@@ -645,7 +644,7 @@ describe("SnapshotStore", () => {
 			expect(scoped.roots[0]?.ignoredPresentPaths).toEqual(["deps/1"]);
 			const excluded = await store.capture(topology, undefined, { excludePaths: ["deps/1"] });
 			expect(excluded.roots[0]?.ignoredPresentPaths).not.toContain("deps/1");
-		} finally { mount.mockRestore(); await discovery.dispose(); }
+		} finally { await discovery.dispose(); }
 	});
 
 	it("ignored-present 路径变化时拒绝复用 baseline", async () => {
