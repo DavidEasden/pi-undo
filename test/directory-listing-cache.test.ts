@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,7 +15,8 @@ afterEach(async () => {
 });
 
 async function temporaryRoot(): Promise<string> {
-	const root = await mkdtemp(join(tmpdir(), "pi-undo-listing-"));
+	// macOS 的 tmpdir 位于 /var 下（符号链接到 /private/var）；扫描会拒绝 realpath 与自身不同的目录。
+	const root = await realpath(await mkdtemp(join(tmpdir(), "pi-undo-listing-")));
 	roots.push(root);
 	return root;
 }
