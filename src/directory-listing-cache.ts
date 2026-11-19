@@ -16,6 +16,8 @@ export interface DirectoryListing {
 	readonly ctimeNs: bigint;
 	/** 枚举前后 mtime/ctime 一致；false 时 entries 仍是本次读取结果，但不进入缓存。 */
 	readonly stable: boolean;
+	/** 目录最后修改早于枚举时刻超过 racy 窗口；只有 settled 的列表可作为类型证据复用。 */
+	readonly settled: boolean;
 }
 
 interface CachedListing extends DirectoryListing {
@@ -76,6 +78,7 @@ export class DirectoryListingCache {
 			mtimeNs: after.mtimeNs,
 			ctimeNs: after.ctimeNs,
 			stable,
+			settled: listedAtNs - RACY_WINDOW_NS > after.mtimeNs,
 			listedAtNs,
 		};
 		// 枚举期间内容变化的结果只交给本次调用，不缓存。

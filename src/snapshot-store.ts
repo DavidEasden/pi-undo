@@ -1544,10 +1544,14 @@ export class SnapshotStore {
 		}
 		// ignored build/vendor trees 常含数万叶子；复用同一批量 metadata 协议，避免逐路径重复
 		// 遍历父目录。Native 与 fallback 都在叶子扫描前后复核共享父目录。
-		const nativeEntries = await this.inspectNativeMetadataBatches(cwd, candidates, requestDirectory);
-		const kinds = nativeEntries === undefined
+		// 目录项缓存已能证明类型时（共享盘稳态的常见情况）不再启动 native 进程。
+		const cachedKinds = await this.ignoredKindsFromListings(cwd, candidates);
+		const nativeEntries = cachedKinds === undefined
+			? await this.inspectNativeMetadataBatches(cwd, candidates, requestDirectory)
+			: undefined;
+		const kinds = cachedKinds ?? (nativeEntries === undefined
 			? await this.collectIgnoredPresentKindsFallback(cwd, candidates)
-			: nativeEntries.map((entry) => entry.kind);
+			: nativeEntries.map((entry) => entry.kind));
 		const result = partition?.leaves.filter((path) => !exactExclusions.has(path)) ?? [];
 		for (let index = 0; index < candidates.length; index += 1) {
 			const relativePath = candidates[index]!;
@@ -1640,6 +1644,68 @@ export class SnapshotStore {
 			result.push(...inspected);
 		}
 		return result;
+	}
+
+	/**
+	 * 目录项列表仍稳定时，用缓存证明忽略叶子类型，跳过 metadata 进程。
+	 * 任一父目录不可信（缓存缺失、枚举期间变化、仍在 racy 窗口）就整体回退。
+	 */
+	private async ignoredKindsFromListings(
+		cwd: string,
+		paths: readonly string[],
+	): Promise<readonly (NativeMetadataEntry["kind"] | "directory")[] | undefined> {
+		if (paths.length === 0) return [];
+		const namesByDirectory = new Map<string, string[]>();
+		for (const relativePath of paths) {
+			const separator = relativePath.lastIndexOf("/");
+			const directory = separator < 0 ? "" : relativePath.slice(0, separator);
+			const name = separator < 0 ? relativePath : relativePath.slice(separator + 1);
+			const names = namesByDirectory.get(directory);
+			if (names === undefined) namesByDirectory.set(directory, [name]);
+			else names.push(name);
+		}
+		const directories = [...namesByDirectory.keys()];
+		// 祖先链按目录粒度检查一次；父目录自身由 list() 的 lstat 拒绝 symlink。
+		// 根目录（空键）没有相对路径形式，不能传给路径校验。
+		const guardedDirectories = directories.filter((directory) => directory !== "");
+		await assertNoSymlinkParents(cwd, guardedDirectories);
+		const listings = new Map<string, {
+			readonly dev: bigint;
+			readonly ino: bigint;
+			readonly kinds: Map<string, "directory" | "file" | "symlink" | "other">;
+		}>();
+		for (const directory of directories) {
+			const listing = await this.discovery.listingCache.list(this.absolutePath(cwd, directory));
+			// 不稳定的枚举或仍处于 racy 窗口的列表不能作为类型证据。
+			if (listing === undefined || !listing.stable || !listing.settled) return undefined;
+			listings.set(directory, {
+				dev: listing.dev,
+				ino: listing.ino,
+				kinds: new Map(listing.entries.map((entry) => [entry.name, entry.kind])),
+			});
+		}
+		const kinds = paths.map((relativePath) => {
+			const separator = relativePath.lastIndexOf("/");
+			const directory = separator < 0 ? "" : relativePath.slice(0, separator);
+			const name = separator < 0 ? relativePath : relativePath.slice(separator + 1);
+			// 列表已证明不存在时按 absent 处理；调用方会跳过该路径。
+			return listings.get(directory)?.kinds.get(name) ?? "absent";
+		});
+		// 复核以目录为单位，而不是为每条叶子重走祖先链。
+		await assertNoSymlinkParents(cwd, guardedDirectories);
+		for (const directory of directories) {
+			const listing = listings.get(directory)!;
+			const metadata = await lstat(this.absolutePath(cwd, directory), { bigint: true }).catch(() => undefined);
+			if (
+				metadata === undefined || metadata.isSymbolicLink() || !metadata.isDirectory() ||
+				metadata.dev !== listing.dev || metadata.ino !== listing.ino
+			) return undefined;
+		}
+		return kinds;
+	}
+
+	private absolutePath(cwd: string, relativeDirectory: string): string {
+		return relativeDirectory === "" ? cwd : join(cwd, ...relativeDirectory.split("/"));
 	}
 
 	private async collectIgnoredPresentKindsFallback(

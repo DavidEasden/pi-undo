@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { access, chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { access, chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, unlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -649,6 +649,63 @@ describe("SnapshotStore", () => {
 			const excluded = await store.capture(topology, undefined, { excludePaths: ["deps/1"] });
 			expect(excluded.roots[0]?.ignoredPresentPaths).not.toContain("deps/1");
 		} finally { await discovery.dispose(); }
+	});
+
+	it("目录项列表稳定时复用缓存证明忽略叶子类型，不启动 metadata 进程", async () => {
+		const workspace = await temporaryRoot("pi-undo-ignored-kinds-");
+		await createGitRepo(workspace);
+		await writeFixtureFile(workspace, ".gitignore", "deps/\n*.log\n");
+		// 根目录的忽略叶子会形成空目录键，路径校验不能把它当作相对路径。
+		await writeFixtureFile(workspace, "root.log", "root");
+		await writeFixtureFile(workspace, "deps/a.txt", "a");
+		await writeFixtureFile(workspace, "deps/sub/b.txt", "b");
+		await symlink("a.txt", join(workspace, "deps", "link"));
+		// 把目录时间戳移到 racy 窗口之外，缓存才允许复用（真实工作区的目录通常早已稳定）。
+		const past = new Date(Date.now() - 60_000);
+		for (const directory of [workspace, join(workspace, "deps"), join(workspace, "deps", "sub")]) {
+			await utimes(directory, past, past);
+		}
+		const git = new RecordingGitRunner();
+		const discovery = new RootDiscovery(git, { scan: async () => undefined });
+		let inspections = 0;
+		const store = new SnapshotStore({
+			storeRoot: await temporaryRoot("pi-undo-store-"),
+			discovery,
+			git,
+			// 自定义 port 同时关闭分区扫描；本用例只验证 Git 返回的候选路径走缓存类型证明。
+			nativeMetadata: {
+				inspect: async (_cwd, paths) => {
+					// 只统计忽略叶子的类型查询；可见叶子的 metadata 复核另计。
+					if (paths.some((path) => path.startsWith("deps/"))) inspections += 1;
+					return undefined;
+				},
+			},
+		});
+		try {
+			const topology = await discovery.discover(workspace);
+			let before = await store.capture(topology);
+			const expected = (await runGit(workspace, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", "."]))
+				.split("\0").filter(Boolean).sort();
+			expect(before.roots[0]?.ignoredPresentPaths).toEqual(expected);
+			expect(before.roots[0]?.ignoredPresentPaths).toContain("deps/link");
+			expect(before.roots[0]?.ignoredPresentPaths).toContain("root.log");
+
+			inspections = 0;
+			before = await store.captureBaseline(topology, before);
+			expect(inspections).toBe(0);
+			expect(before.roots[0]?.ignoredPresentPaths).toEqual(expected);
+
+			// 新增叶子会改变父目录 mtime，缓存失效但结果仍须与 Git 一致。
+			await writeFixtureFile(workspace, "deps/sub/c.txt", "c");
+			before = await store.captureBaseline(topology, before);
+			expect(before.roots[0]?.ignoredPresentPaths).toEqual(
+				(await runGit(workspace, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", "."]))
+					.split("\0").filter(Boolean).sort(),
+			);
+			expect(before.roots[0]?.ignoredPresentPaths).toContain("deps/sub/c.txt");
+		} finally {
+			await discovery.dispose();
+		}
 	});
 
 	it("默认按实测成本选择证明路径，两轮内采样齐两个候选", async () => {
