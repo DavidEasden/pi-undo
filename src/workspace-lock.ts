@@ -11,6 +11,9 @@ const OWNER_SUFFIX = ".json";
 const DEFAULT_LEASE_MS = 30_000;
 const DEFAULT_RETRY_MS = 50;
 const DEFAULT_ACQUIRE_TIMEOUT_MS = 30_000;
+/** 释放时遇到交接窗口的确认窗口：owner 文件由 open+write 创建，内容会短暂不可解析。 */
+const RELEASE_HANDOFF_RETRY_MS = 2;
+const RELEASE_HANDOFF_RETRIES = 5;
 const inProcessQueues = new Map<string, Promise<void>>();
 
 interface LockOwner {
@@ -298,13 +301,20 @@ async function releaseOwner(lockDirectory: string, ownerFile: string, nonce: str
 		throw new WorkspaceLockError("lock_compromised", "workspace lock release 时 owner 已变化");
 	}
 	await unlink(join(lockDirectory, ownerFile));
-	if (!await removeEmptyDirectory(lockDirectory)) {
+	if (await removeEmptyDirectory(lockDirectory)) return;
+	// 目录非空：可能已有新 owner 接管，也可能正处于「目录已重建、owner 文件尚未写完」的交接窗口。
+	// owner 文件由 open+write 创建，内容会短暂不可解析；给接管方一个有限窗口，避免把正常交接误判为 compromised。
+	for (let attempt = 0; attempt <= RELEASE_HANDOFF_RETRIES; attempt += 1) {
 		const replacement = await readOwnerState(lockDirectory);
-		if (replacement.kind === "valid" && replacement.owner.nonce !== nonce) {
-			return;
+		if (replacement.kind === "valid") {
+			if (replacement.owner.nonce !== nonce) return;
+			break;
 		}
-		throw new WorkspaceLockError("lock_compromised", "workspace lock release 时目录已被复用");
+		// 无 owner 文件说明目录已被删除或刚由下一个 owner 重建：锁已经交出。
+		if (replacement.kind === "missing") return;
+		await delay(RELEASE_HANDOFF_RETRY_MS);
 	}
+	throw new WorkspaceLockError("lock_compromised", "workspace lock release 时目录已被复用");
 }
 
 async function removeEmptyDirectory(directory: string): Promise<boolean> {

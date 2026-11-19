@@ -516,4 +516,20 @@ describe("WorkspaceLock", () => {
 		});
 		expect(await readFile(join(lockDirectory, "owner.json"), "utf8")).toBe("{\"pid\":");
 	});
+
+	it("频繁接管下的 acquire/release 不产生 lock_compromised", async () => {
+		const root = await temporaryRoot();
+		const lockRoot = join(root, "locks");
+		const identity = "workspace-stress-handoff";
+		// 短租约强制 worker 之间频繁 stale 接管，容易踩到「目录已重建、owner 文件未写完」的交接窗口。
+		const workers = Array.from({ length: 8 }, async () => {
+			const lock = new WorkspaceLock({ lockRoot, retryMs: 1, leaseMs: 20, acquireTimeoutMs: 20_000 });
+			for (let round = 0; round < 20; round += 1) {
+				await lock.withLock(identity, async () => {
+					await new Promise((resolve) => setTimeout(resolve, 1));
+				});
+			}
+		});
+		await expect(Promise.all(workers)).resolves.toHaveLength(8);
+	});
 });
