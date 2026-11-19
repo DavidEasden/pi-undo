@@ -33,12 +33,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        if: matrix.target == 'x86_64-apple-darwin'
+        with:
+          node-version: 24
+          package-manager-cache: false
       - name: Build helper
         run: cargo build --release --locked --manifest-path native/pi-undo-fs/Cargo.toml --target "${{ matrix.target }}"
       - name: Stage binary
         run: |
           mkdir -p native-artifact
           cp "native/pi-undo-fs/target/${{ matrix.target }}/release/pi-undo-fs" "native-artifact/${{ matrix.output }}"
+      # 只在原生 target 上跑：macos-15 runner 是 x86_64，aarch64 产物无法本机执行。
+      # 覆盖 Linux CI 看不到的 macOS 语义：/var 符号链接、APFS 时间戳与 FSEvents 常驻扫描。
+      - name: Test suite (macOS native)
+        if: matrix.target == 'x86_64-apple-darwin'
+        env:
+          PI_UNDO_RUN_RESIDENT_LIVE: "1"
+        run: |
+          cp "native/pi-undo-fs/target/${{ matrix.target }}/release/pi-undo-fs" native/bin/pi-undo-fs-darwin-x64
+          chmod +x native/bin/pi-undo-fs-darwin-x64
+          npm ci
+          npm test
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.output }}
