@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -52,7 +52,9 @@ afterEach(async () => {
 });
 
 export async function createTempRoot(): Promise<TempRoot> {
-	const root = await mkdtemp(join(tmpdir(), "pi-undo-sdk-"));
+	// macOS 上 /var 指向 /private/var；未 realpath 的 workspace 会让依赖 realpath 边界复核的
+	// 目录扫描 fail-closed 回退，测不到生产路径。
+	const root = await realpath(await mkdtemp(join(tmpdir(), "pi-undo-sdk-")));
 	temporaryRoots.push(root);
 	const workspace = join(root, "workspace");
 	const agentDir = join(root, "agent");
