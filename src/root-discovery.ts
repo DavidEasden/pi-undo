@@ -175,10 +175,15 @@ export class RootDiscovery {
 		activeRoots: Map<string, DiscoveredRoot>,
 	): Promise<Array<{ readonly path: string; readonly inspect: true }>> {
 		checkOperation();
-		if (!await isSafeDirectory(candidate.path, workspaceIdentity)) return [];
+		// 初次只需 lstat 拒绝 symlink；真实路径边界在枚举后复核，减少共享盘上的一次 realpath 往返。
+		const before = await lstat(candidate.path).catch(() => undefined);
+		if (before === undefined || before.isSymbolicLink() || !before.isDirectory()) return [];
 		checkOperation();
 		const entries = await readdir(candidate.path, { withFileTypes: true });
-		if (!await isSafeDirectory(candidate.path, workspaceIdentity)) return [];
+		const after = await lstat(candidate.path).catch(() => undefined);
+		if (after === undefined || after.isSymbolicLink() || !after.isDirectory() ||
+			after.dev !== before.dev || after.ino !== before.ino ||
+			!isWithin(workspaceIdentity, await realpath(candidate.path).catch(() => ""))) return [];
 		// 使用这次枚举识别候选；遇到大小写变体仍由文件系统对 .git 的实际查找决定。
 		if (candidate.inspect && entries.some((entry) => entry.name.toLowerCase() === ".git")) {
 			checkOperation();
