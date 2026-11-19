@@ -1553,7 +1553,7 @@ export class SnapshotStore {
 		], { ...gitOptions, stdoutLimit: 64 * 1024 })).length !== 0;
 		if (await hasIndexedEntries()) return undefined;
 		const rest = root.names.filter((name) => !ignored.has(name));
-		const leaves = await scanIgnoredDirectories(cwd, [...ignored]);
+		const leaves = await scanIgnoredDirectories(cwd, [...ignored], this.discovery.listingCache);
 		const after = await ignoredScanRoots(cwd);
 		if (!after || !samePathList(root.names, after.names) || !samePathList(root.directories, after.directories) ||
 			!samePathList([...ignored].sort(), [...await classify()].sort()) || await hasIndexedEntries()) return undefined;

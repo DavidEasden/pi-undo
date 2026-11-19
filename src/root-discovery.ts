@@ -1,6 +1,7 @@
 import { lstat, readdir, readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
+import { DirectoryListingCache } from "./directory-listing-cache.ts";
 import { checksum, topologyFingerprint } from "./encoding.ts";
 import { GitRunError, GitRunner } from "./git-runner.ts";
 import type { DiscoveryRoot } from "./model.ts";
@@ -77,6 +78,8 @@ export class RootDiscovery {
 	private readonly git: GitRunner;
 	private lastDirectoryCount: number | undefined;
 	private readonly nativeScan: NativeDirectoryScanPort;
+	/** 共享盘 TypeScript 扫描的目录项缓存；ignored 扫描与恢复前后发现复用同一份。 */
+	readonly listingCache = new DirectoryListingCache();
 
 	constructor(git = new GitRunner(), nativeScan: NativeDirectoryScanPort = new NativeDirectoryScanner()) {
 		this.git = git;
@@ -175,15 +178,11 @@ export class RootDiscovery {
 		activeRoots: Map<string, DiscoveredRoot>,
 	): Promise<Array<{ readonly path: string; readonly inspect: true }>> {
 		checkOperation();
-		// 初次只需 lstat 拒绝 symlink；真实路径边界在枚举后复核，减少共享盘上的一次 realpath 往返。
-		const before = await lstat(candidate.path).catch(() => undefined);
-		if (before === undefined || before.isSymbolicLink() || !before.isDirectory()) return [];
-		checkOperation();
-		const entries = await readdir(candidate.path, { withFileTypes: true });
-		const after = await lstat(candidate.path).catch(() => undefined);
-		if (after === undefined || after.isSymbolicLink() || !after.isDirectory() ||
-			after.dev !== before.dev || after.ino !== before.ino ||
+		// 缓存层每次都 lstat，并在 dev/ino/mtime/ctime 不变时复用目录项；真实路径边界每次仍复核。
+		const listing = await this.listingCache.list(candidate.path);
+		if (listing === undefined ||
 			!isWithin(workspaceIdentity, await realpath(candidate.path).catch(() => ""))) return [];
+		const entries = listing.entries;
 		// 使用这次枚举识别候选；遇到大小写变体仍由文件系统对 .git 的实际查找决定。
 		if (candidate.inspect && entries.some((entry) => entry.name.toLowerCase() === ".git")) {
 			checkOperation();
@@ -192,7 +191,7 @@ export class RootDiscovery {
 			this.recordInspection(workspaceIdentity, inspection, activeRoots);
 		}
 		return entries
-			.filter((entry) => entry.name !== ".git" && !entry.isSymbolicLink() && entry.isDirectory())
+			.filter((entry) => entry.name !== ".git" && entry.kind === "directory")
 			.map((entry) => ({ path: join(candidate.path, entry.name), inspect: true as const }));
 	}
 

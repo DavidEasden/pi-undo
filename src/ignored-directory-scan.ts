@@ -1,6 +1,7 @@
 import { lstat, readdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
 
+import type { DirectoryListingCache } from "./directory-listing-cache.ts";
 import { allCompleted, checkOperation } from "./operation-context.ts";
 import { relativeSafePath } from "./path-safety.ts";
 
@@ -28,7 +29,11 @@ export async function ignoredScanRoots(cwd: string): Promise<{ names: string[]; 
 }
 
 /** 这里只枚举 Git 已确认整体忽略且无 index 条目的目录。忽略证明需要叶子名和类型，不需要文件内容。 */
-export async function scanIgnoredDirectories(cwd: string, roots: readonly string[]): Promise<string[]> {
+export async function scanIgnoredDirectories(
+	cwd: string,
+	roots: readonly string[],
+	listingCache?: DirectoryListingCache,
+): Promise<string[]> {
 	let level = [...roots];
 	const leaves: string[] = [];
 	let entriesSeen = 0;
@@ -39,21 +44,35 @@ export async function scanIgnoredDirectories(cwd: string, roots: readonly string
 			checkOperation();
 			await allCompleted(level.slice(start, start + PARALLEL_DIRECTORIES).map(async (directory) => {
 				const absolute = join(cwd, directory);
-				const before = await lstat(absolute, { bigint: true });
-				if (!before.isDirectory() || await realpath(absolute) !== absolute) throw new Error("忽略目录绑定发生变化");
-				const entries = await readdir(absolute, { withFileTypes: true });
-				const after = await lstat(absolute, { bigint: true });
-				if (!after.isDirectory() || before.dev !== after.dev || before.ino !== after.ino ||
-					before.ctimeNs !== after.ctimeNs || before.mtimeNs !== after.mtimeNs ||
-					await realpath(absolute) !== absolute) throw new Error("忽略目录枚举期间发生变化");
+				let entries: ReadonlyArray<{ readonly name: string; readonly kind: string }>;
+				if (listingCache !== undefined) {
+					// 缓存层负责 lstat 与 dev/ino/mtime/ctime 复核；枚举期间变化（stable=false）同样拒绝。
+					const listing = await listingCache.list(absolute);
+					if (listing === undefined || !listing.stable || await realpath(absolute) !== absolute) {
+						throw new Error("忽略目录枚举期间发生变化");
+					}
+					entries = listing.entries;
+				} else {
+					const before = await lstat(absolute, { bigint: true });
+					if (!before.isDirectory() || await realpath(absolute) !== absolute) throw new Error("忽略目录绑定发生变化");
+					const dirents = await readdir(absolute, { withFileTypes: true });
+					const after = await lstat(absolute, { bigint: true });
+					if (!after.isDirectory() || before.dev !== after.dev || before.ino !== after.ino ||
+						before.ctimeNs !== after.ctimeNs || before.mtimeNs !== after.mtimeNs ||
+						await realpath(absolute) !== absolute) throw new Error("忽略目录枚举期间发生变化");
+					entries = dirents.map((entry) => ({
+						name: entry.name,
+						kind: entry.isSymbolicLink() ? "symlink" : entry.isDirectory() ? "directory" : entry.isFile() ? "file" : "other",
+					}));
+				}
 				for (const entry of entries) {
 					if (entry.name.toLowerCase() === ".git" || entry.name.includes("\uFFFD")) throw new Error("忽略目录需要 Git 精确枚举");
 					const path = `${directory}/${entry.name}`;
 					pathBytes += Buffer.byteLength(path);
 					if (++entriesSeen > 262_144 || pathBytes > 32 * 1024 * 1024) throw new Error("忽略目录枚举超过预算");
 					relativeSafePath(cwd, path);
-					if (entry.isDirectory()) next.push(path);
-					else if (entry.isFile() || entry.isSymbolicLink()) leaves.push(path);
+					if (entry.kind === "directory") next.push(path);
+					else if (entry.kind === "file" || entry.kind === "symlink") leaves.push(path);
 					else throw new Error("特殊目录项需要 Git 精确枚举");
 				}
 			}));
