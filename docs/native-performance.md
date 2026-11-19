@@ -30,22 +30,38 @@ Linux arm64、Node 23.11.1、Pi 1.4.0 SDK。工作区和会话目录均放在同
 
 只把上次忽略文件数量作为选择执行方式的提示。满足阈值的 Linux 共享盘完整根，每次用 `check-ignore` 检查顶层目录本身（`dir/*` 不等于 `dir/`），再用 `ls-files --cached` 排除强制跟踪项。整体忽略的目录分批重新读取，只收集文件和符号链接，不跟随链接；其他项仍交由 Git 和原有 metadata 校验。扫描前后复核根目录清单、忽略规则结果和 index。遇到仓库标记、范围排除、特殊目录项、路径预算或无法确认的状态，就使用原查询；取消、超时不会启动重试。没有缩短等待超时，也没有提前发布检查点。
 
-### 分区扫描不再按挂载类型启用
+### ignored-present 证明路径按实测成本选择
 
-上一轮的 ignored 分区扫描只对 Linux FUSE 工作区启用：构造函数仅在 `process.platform === "linux"` 时建立规模集合，`captureIgnoredPresentPaths` 还额外要求 `allowsNativeMountFastPaths(cwd)` 为假。这条限制的理由是共享盘上的 `readdir` 更贵，但分区扫描的成本主体是目录项枚举，与文件系统类型无关——本地盘省掉的是同样的 `ls-files --ignored` 全量枚举。
+上一轮的分区扫描只对 Linux FUSE 工作区启用：构造函数仅在 `process.platform === "linux"` 时建立规模集合，`captureIgnoredPresentPaths` 还额外要求 `allowsNativeMountFastPaths(cwd)` 为假。
 
-本机 macOS arm64、3,000 个依赖包、修改 1 个文件，直接调用 `discover` 与 `captureBaseline`：
+本轮先在 macOS 本地盘上把它解禁，测到稳态 `baselineValidation` 从约 255 ms 降到约 145 ms。但在 Linux 上复核时发现同一改动造成回退——结论是「哪条路径更快」并不由平台决定：
 
-| 阶段 | 原实现 | 解禁后 |
+| 环境 | `ls-files --others --ignored`（3,000 文件） | 分区枚举（目录项缓存命中） |
 | --- | ---: | ---: |
-| 首次（`baseline-fallback`） | 344 / 433 ms | 360 / 433 ms |
-| 稳态 `baselineValidation`（三次） | 253 / 262 / 256 ms | 144 / 139 / 138 ms |
+| macOS arm64 本地 APFS | 约 180–200 ms | 约 222 ms |
+| Linux arm64 本地 ext4 | 约 22–35 ms | 约 80–150 ms |
+| Linux arm64 Parallels FUSE | 约 4,590 ms | 约 200 ms |
 
-分组计时中 `captureIgnoredPresentPaths` 占完整捕获的八成，其中 `ls-files --others --ignored` 约 190–200 ms，native metadata inspect 约 30 ms，`write-tree`、`read-tree` 与对象完整性各为个位数毫秒。分区路径把前者换成 `check-ignore`（约 6 ms）加目录枚举（约 80–190 ms，取决于目录项缓存是否命中）。
+Git 的 `--ignored` 查询在 ext4 上比分区快、在 APFS 上略快、在 FUSE 上慢二十倍。任何按平台写死的选择都会在其中两种环境上吃亏，因此改为运行时采样：
 
-首次捕获两侧持平：`node_modules` 刚建立时目录 mtime 仍在 `DirectoryListingCache` 的 2 秒 racy 窗口内，缓存不复用，分区枚举与 Git 精确查询打平。稳态收益来自目录项缓存命中。
+- 有完整样本时选实测更快的一侧，且要求分区明显更快（`partitionMs * 1.1 < gitMs`），避免在噪声区间反复摇摆。
+- 样本不全时交替采集，先 Git 后分区各一次；FUSE 例外，那里 Git 精确查询慢两个数量级，不能为了采样先付这一次。
+- 只在完整根（`inclusions` 与 `exclusions` 都为空）上采样，且两类样本必须对应同一覆盖面——分区成功时 Git 只查剩余的 `rest`，不能当作完整查询的基准。
+- `SnapshotStoreOptions.ignoredProofPath` 仅供测试固定路径，跳过自适应。
 
-未在 Windows 启用（保留原查询），也未重新测 Linux 共享盘；上述数字是本机单次运行，不是性能保证。
+三环境实测（3,000 依赖包、改 1 个文件，`discover` 加 `captureBaseline`，稳态 `baselineValidation`）：
+
+| 环境 | 原实现 | 本轮 |
+| --- | ---: | ---: |
+| macOS arm64 本地 APFS | 253–262 ms | 259–269 ms |
+| Linux arm64 本地 ext4 | 62–66 ms | 61–63 ms |
+| Linux arm64 Parallels FUSE | 193–214 ms | 214–221 ms |
+
+三处都落在原实现的波动区间内。本轮不声称提速，只把路径选择从平台猜测改为实测，让 macOS 与 Linux 用户都不再因平台判断而拿到较慢的一侧；FUSE 上的快路径保持不变。
+
+分组计时中 `captureIgnoredPresentPaths` 占完整捕获的八成，其中 `ls-files --others --ignored` 占绝大部分，native metadata inspect 约 30 ms，`write-tree`、`read-tree` 与对象完整性各为个位数毫秒。分区路径把前者换成 `check-ignore`（约 6 ms）加目录枚举。
+
+「解禁即提速」这个早期结论不成立：当时的 138 ms 来自目录项缓存已热的特定测量顺序，无法在干净会话复现。未在 Windows 启用（保留原查询）。
 
 ### 目录项缓存复用
 

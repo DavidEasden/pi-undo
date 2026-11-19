@@ -13,6 +13,7 @@ import {
 } from "./encoding.ts";
 import { GitRunError, GitRunner, type GitRunOptions } from "./git-runner.ts";
 import { ignoredScanRoots, scanIgnoredDirectories } from "./ignored-directory-scan.ts";
+import { allowsNativeMountFastPaths } from "./native-capabilities.ts";
 import type {
 	DiscoveryRoot,
 	ManifestId,
@@ -247,6 +248,8 @@ export interface SnapshotStoreOptions {
 	readonly lock?: WorkspaceLock;
 	readonly clock?: () => number;
 	readonly nativeMetadata?: NativeMetadataPort;
+	/** 仅供测试：固定 ignored-present 证明路径，跳过实测自适应。 */
+	readonly ignoredProofPath?: "git" | "partition";
 	/** 仅供测试或受控调优：0 禁用 blob 内存缓存。 */
 	readonly blobCacheMaxBytes?: number;
 	/** 仅供测试或受控调优：0 禁用 loose object 合并。 */
@@ -349,6 +352,14 @@ export class SnapshotStore {
 	private readonly visibleLeafCache = new Map<string, Map<string, CachedVisibleLeaf>>();
 	/** 只作性能提示。显式注入的 metadata 校验器始终按原协议检查全部候选。 */
 	private readonly largeIgnoredRoots?: Set<string>;
+	/**
+	 * 每个 cwd 上两条证明路径的实测耗时。谁便宜取决于 git 与 readdir 的真实开销，不能只看平台：
+	 * 同是 Linux，本地 ext4 上 `ls-files --ignored` 约 25 ms（比分区快），Parallels FUSE 上
+	 * 却是 4,590 ms（比分区慢 20 倍）。因此初始猜测只看挂载类型，之后用采样结果收敛。
+	 */
+	private readonly ignoredProofCost = new Map<string, { partitionMs?: number; gitMs?: number }>();
+	/** 仅供测试：固定证明路径，跳过自适应采样。 */
+	private readonly forcedIgnoredProofPath?: "git" | "partition";
 	/** check-ignore 探针结果缓存；同一进程内同一 cwd 只验证一次，失败不缓存。 */
 	private readonly validatedIgnoreQueries = new Set<string>();
 	private readonly leafCacheDirectoriesLoaded = new Set<string>();
@@ -360,9 +371,10 @@ export class SnapshotStore {
 		this.storeRoot = resolve(options.storeRoot ?? join(tmpdir(), "pi-undo-snapshot-store"));
 		this.storesRoot = join(this.storeRoot, "stores");
 		this.git = options.git ?? new GitRunner();
-		// 分区扫描的成本以目录项枚举为主，与文件系统类型无关：本地 APFS/ext4 与共享盘一样付
-		// readdir 的代价，只是共享盘更贵。默认对所有 Unix 平台记录规模，Windows 保持原查询。
+		// 分区扫描是可选快路径，是否真的更快由 ignoredProofCost 的实测结果收敛；
+		// Windows 保留原查询。
 		if (process.platform !== "win32" && options.nativeMetadata === undefined) this.largeIgnoredRoots = new Set();
+		this.forcedIgnoredProofPath = options.ignoredProofPath;
 		this.discovery = options.discovery ?? new RootDiscovery(this.git);
 		this.lock = options.lock ?? new WorkspaceLock();
 		this.clock = options.clock ?? Date.now;
@@ -1463,8 +1475,25 @@ export class SnapshotStore {
 		}
 		const fullRoot = inclusions.length === 0 && exclusions.length === 0;
 		let partition: { leaves: string[]; rest: string[] } | undefined;
-		if (fullRoot && this.largeIgnoredRoots?.has(cwd) &&
-			!["GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"].some((key) => process.env[key] !== undefined)) {
+		const measured = this.ignoredProofCost.get(cwd);
+		let preferPartition: boolean;
+		if (this.forcedIgnoredProofPath !== undefined) {
+			preferPartition = this.forcedIgnoredProofPath === "partition";
+		} else if (measured?.gitMs !== undefined && measured.partitionMs !== undefined) {
+			// 两个样本齐全：要求分区明显更快，避免在噪声区间反复摇摆。
+			preferPartition = measured.partitionMs * 1.1 < measured.gitMs;
+		} else if (measured?.gitMs === undefined) {
+			// 还没有任何样本：FUSE 上 Git 精确查询慢两个数量级，直接上分区；
+			// 其他平台先采样 Git（它通常不慢）。
+			preferPartition = !await allowsNativeMountFastPaths(cwd);
+		} else {
+			// 已有 gitMs、缺 partitionMs：轮到采样分区。
+			preferPartition = true;
+		}
+		const partitionEligible = fullRoot && preferPartition && this.largeIgnoredRoots?.has(cwd) &&
+			!["GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"].some((key) => process.env[key] !== undefined);
+		const partitionStartedAt = performance.now();
+		if (partitionEligible) {
 			try {
 				partition = await this.scanWhollyIgnoredDirectories(cwd, environment, gitBacked);
 			} catch (error) {
@@ -1478,6 +1507,7 @@ export class SnapshotStore {
 		for (const excluded of exclusions) {
 			pathspecs.push(excludeLiteralPathspec(excluded));
 		}
+		const gitStartedAt = performance.now();
 		const output = pathspecs.length === 0 ? new Uint8Array() : await this.runGitBytes([
 			...(gitBacked ? ["-c", "core.fsmonitor=false"] : []),
 			"ls-files",
@@ -1488,6 +1518,15 @@ export class SnapshotStore {
 			"--",
 			...pathspecs,
 		], { cwd, env: gitBacked ? sourceGitEnvironment() : environment });
+		// 只在完整根上采样，且两类样本必须对应同一覆盖面：分区成功时 Git 只查剩余的 rest，
+		// 不能拿来当作完整查询的基准。
+		if (fullRoot && this.forcedIgnoredProofPath === undefined) {
+			if (partition !== undefined) {
+				this.ignoredProofCost.set(cwd, { ...measured, partitionMs: gitStartedAt - partitionStartedAt });
+			} else {
+				this.ignoredProofCost.set(cwd, { ...measured, gitMs: performance.now() - gitStartedAt });
+			}
+		}
 		const candidates: string[] = [];
 		const seen = new Set<string>();
 		for (const relativePath of parseNulPaths(output)) {

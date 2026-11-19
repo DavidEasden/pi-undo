@@ -593,7 +593,11 @@ describe("SnapshotStore", () => {
 		await createGitRepo(workspace);
 		const git = new RecordingGitRunner();
 		const discovery = new RootDiscovery(git, { scan: async () => undefined });
-		const store = new SnapshotStore({ storeRoot: await temporaryRoot("pi-undo-store-"), discovery, git });
+		// 两条证明路径的取舍由运行时实测成本决定；本用例固定分区路径，只验证其与 Git
+		// 精确查询结果一致，以及规则/index 变化时旧证明作废。
+		const store = new SnapshotStore({
+			storeRoot: await temporaryRoot("pi-undo-store-"), discovery, git, ignoredProofPath: "partition",
+		});
 		try {
 			const rules = "deps/\npartial/*\n!partial/keep\n*.log\n";
 			await writeFixtureFile(workspace, ".gitignore", rules);
@@ -644,6 +648,38 @@ describe("SnapshotStore", () => {
 			expect(scoped.roots[0]?.ignoredPresentPaths).toEqual(["deps/1"]);
 			const excluded = await store.capture(topology, undefined, { excludePaths: ["deps/1"] });
 			expect(excluded.roots[0]?.ignoredPresentPaths).not.toContain("deps/1");
+		} finally { await discovery.dispose(); }
+	});
+
+	it("默认按实测成本选择证明路径，两轮内采样齐两个候选", async () => {
+		const workspace = await temporaryRoot("pi-undo-ignored-adaptive-");
+		await createGitRepo(workspace);
+		const git = new RecordingGitRunner();
+		const discovery = new RootDiscovery(git, { scan: async () => undefined });
+		const store = new SnapshotStore({ storeRoot: await temporaryRoot("pi-undo-store-"), discovery, git });
+		try {
+			await writeFixtureFile(workspace, ".gitignore", "deps/\n");
+			await mkdir(join(workspace, "deps"));
+			for (let i = 0; i < 1_024; i += 32) {
+				await Promise.all(Array.from({ length: 32 }, (_, n) => writeFile(join(workspace, "deps", `${i + n}`), "x")));
+			}
+			const topology = await discovery.discover(workspace);
+			let before = await store.capture(topology);
+			const usedPartition = () => git.calls.some(({ args }) => args.includes("check-ignore") && args.includes("--stdin"));
+			// 第 1 轮：无样本，采集 Git；第 2 轮：补采分区。此后按实测结果固定选择。
+			git.calls.length = 0;
+			before = await store.captureBaseline(topology, before);
+			const firstUsedPartition = usedPartition();
+			git.calls.length = 0;
+			before = await store.captureBaseline(topology, before);
+			const secondUsedPartition = usedPartition();
+			// 两轮必须覆盖到不同的路径，否则策略会永久卡在一侧。
+			expect([firstUsedPartition, secondUsedPartition]).toContain(true);
+			expect([firstUsedPartition, secondUsedPartition]).toContain(false);
+			// 采样收敛后结果仍然正确。
+			const expected = (await runGit(workspace, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", "."]))
+				.split("\0").filter(Boolean).sort();
+			expect(before.roots[0]?.ignoredPresentPaths).toEqual(expected);
 		} finally { await discovery.dispose(); }
 	});
 
