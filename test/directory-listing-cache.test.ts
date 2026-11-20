@@ -1,11 +1,11 @@
-import { mkdir, mkdtemp, realpath, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
 import { DirectoryListingCache } from "../src/directory-listing-cache.ts";
-import { scanIgnoredDirectories } from "../src/ignored-directory-scan.ts";
+import { ignoredScanRoots, scanIgnoredDirectories } from "../src/ignored-directory-scan.ts";
 import { RootDiscovery } from "../src/root-discovery.ts";
 import { createGitRepo, createNestedRepo } from "./fixtures.ts";
 
@@ -74,6 +74,34 @@ describe("DirectoryListingCache", () => {
 		await age(directory);
 		const replaced = await cache.list(directory);
 		expect(replaced?.entries.map((entry) => entry.name)).toEqual(["new.txt"]);
+	});
+
+	it.skipIf(process.platform === "win32")("分区不跟随父级链接，不跨仓库；同名替换不能通过绑定复核", async () => {
+		const root = await temporaryRoot();
+		const outside = await temporaryRoot();
+		await mkdir(join(root, "pkg", "build"), { recursive: true });
+		await mkdir(join(outside, "build"));
+		await symlink(outside, join(root, "link"));
+		const hints = new Set(["link/build", "pkg/build"]);
+		const before = await ignoredScanRoots(root, hints);
+		expect(before?.names).toEqual(["link", "pkg/build"]);
+		expect(before?.directories).toEqual(["pkg/build"]);
+		await rename(join(root, "pkg", "build"), join(outside, "old"));
+		await mkdir(join(root, "pkg", "build"));
+		const after = await ignoredScanRoots(root, hints);
+		expect(after?.names).toEqual(before?.names);
+		expect(after?.bindings).not.toEqual(before?.bindings);
+		await writeFile(join(root, "pkg", ".git"), "标记");
+		expect(await ignoredScanRoots(root, hints)).toBeUndefined();
+	});
+
+	it("嵌套分区按所有展开层累计参数预算，超过预算不返回部分清单", async () => {
+		const root = await temporaryRoot();
+		const parent = "p".repeat(120);
+		await mkdir(join(root, parent, "build"), { recursive: true });
+		// 名称自身并不长，但正向 pathspec 必须逐个携带完整父路径。
+		for (let i = 0; i < 180; i += 1) await writeFile(join(root, parent, String(i)), "");
+		expect(await ignoredScanRoots(root, new Set([`${parent}/build`]))).toBeUndefined();
 	});
 
 	it("ignored 扫描复用 discovery 的缓存后仍能发现新增叶子", async () => {

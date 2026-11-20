@@ -1,31 +1,62 @@
-import { lstat, readdir, realpath } from "node:fs/promises";
+import { lstat, opendir, readdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { DirectoryListingCache } from "./directory-listing-cache.ts";
 import { allCompleted, checkOperation } from "./operation-context.ts";
 import { relativeSafePath } from "./path-safety.ts";
 
-const MAX_ROOT_ENTRIES = 512;
-const MAX_ROOT_ARGUMENT_BYTES = 24 * 1024;
+const MAX_PARTITION_ENTRIES = 512;
+const MAX_PARTITION_ARGUMENT_BYTES = 24 * 1024;
 const PARALLEL_DIRECTORIES = 16;
 
-/** 只分割根目录一层，剩余项仍交给原 Git 查询；不能无损表示或参数过长时不分割。 */
-export async function ignoredScanRoots(cwd: string): Promise<{ names: string[]; directories: string[] } | undefined> {
-	const entries = await readdir(cwd, { withFileTypes: true });
-	if (entries.length > MAX_ROOT_ENTRIES) return undefined;
+async function directoryBinding(absolute: string): Promise<string> {
+	const stat = await lstat(absolute, { bigint: true });
+	if (!stat.isDirectory() || await realpath(absolute) !== absolute) throw new Error("忽略目录绑定发生变化");
+	return `${absolute}\0${stat.dev}:${stat.ino}:${stat.mtimeNs}:${stat.ctimeNs}`;
+}
+
+/** 只展开提示目录的祖先；每层从真实目录取齐所有同级项，不依赖提示的完整性。 */
+export async function ignoredScanRoots(cwd: string, hints: ReadonlySet<string>): Promise<{
+	names: string[]; directories: string[]; bindings: string[];
+} | undefined> {
+	const expand = new Set<string>();
+	for (const path of hints) {
+		relativeSafePath(cwd, path);
+		if (path === "." || path.split("/").some((part) => part.toLowerCase() === ".git")) return undefined;
+		for (let end = path.indexOf("/"); end >= 0; end = path.indexOf("/", end + 1)) {
+			expand.add(path.slice(0, end));
+			if (expand.size > MAX_PARTITION_ENTRIES) return undefined;
+		}
+	}
 	const names: string[] = [];
 	const directories: string[] = [];
+	const bindings: string[] = [];
+	const parents = ["."];
+	let count = 0;
 	let bytes = 0;
-	for (const entry of entries) {
-		if (entry.name === ".git") continue;
-		if (entry.name.includes("\uFFFD") || entry.name.toLowerCase() === ".git") return undefined;
-		relativeSafePath(cwd, entry.name);
-		bytes += Buffer.byteLength(entry.name) + 20;
-		if (bytes > MAX_ROOT_ARGUMENT_BYTES) return undefined;
-		names.push(entry.name);
-		if (entry.isDirectory()) directories.push(entry.name);
+	for (const parent of parents) {
+		checkOperation();
+		const absolute = join(cwd, parent);
+		bindings.push(await directoryBinding(absolute));
+		for await (const entry of await opendir(absolute)) {
+			if (parent === "." && entry.name === ".git") continue;
+			if (entry.name.includes("\uFFFD") || entry.name.toLowerCase() === ".git") return undefined;
+			const path = parent === "." ? entry.name : `${parent}/${entry.name}`;
+			relativeSafePath(cwd, path);
+			bytes += Buffer.byteLength(path) + 20;
+			if (++count > MAX_PARTITION_ENTRIES || bytes > MAX_PARTITION_ARGUMENT_BYTES) return undefined;
+			if (entry.isDirectory() && expand.has(path) && !hints.has(path)) {
+				parents.push(path);
+			} else {
+				names.push(path);
+				if (entry.isDirectory() && (parent === "." || hints.has(path))) {
+					directories.push(path);
+					bindings.push(await directoryBinding(join(cwd, path)));
+				}
+			}
+		}
 	}
-	return { names: names.sort(), directories: directories.sort() };
+	return { names: names.sort(), directories: directories.sort(), bindings: bindings.sort() };
 }
 
 /** 这里只枚举 Git 已确认整体忽略且无 index 条目的目录。忽略证明需要叶子名和类型，不需要文件内容。 */

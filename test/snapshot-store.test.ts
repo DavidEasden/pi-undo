@@ -613,7 +613,8 @@ describe("SnapshotStore", () => {
 			await symlink("../partial", join(workspace, "deps", "link"));
 			const topology = await discovery.discover(workspace);
 			let before = await store.capture(topology);
-			const fullQuery = () => git.calls.some(({ args }) => args.includes("--ignored") && args.at(-1) === ".");
+			const fullQuery = () => git.calls.some(({ args }) =>
+				args.includes("--ignored") && !args.includes("--directory") && args.at(-1) === ".");
 			const compare = async (expectFull: boolean) => {
 				git.calls.length = 0;
 				const after = await store.captureBaseline(topology, before);
@@ -649,6 +650,75 @@ describe("SnapshotStore", () => {
 			const excluded = await store.capture(topology, undefined, { excludePaths: ["deps/1"] });
 			expect(excluded.roots[0]?.ignoredPresentPaths).not.toContain("deps/1");
 		} finally { await discovery.dispose(); }
+	});
+
+	it.skipIf(process.platform === "win32")("仅有嵌套忽略目录时按真实同级项分区；余集查询期间变化则重新取证", async () => {
+		const workspace = await temporaryRoot("pi-undo-nested-proof-");
+		await createGitRepo(workspace);
+		const git = new RecordingGitRunner();
+		const discovery = new RootDiscovery(git, { scan: async () => undefined });
+		const store = new SnapshotStore({
+			storeRoot: await temporaryRoot("pi-undo-store-"), discovery, git, ignoredProofPath: "partition",
+		});
+		const parent = "src/[pkg]";
+		const target = `${parent}/build`;
+		const rules = "build/\n*.log\npartial/*\n!partial/keep\n";
+		const scan = vi.spyOn(ignoredDirectoryScan, "scanIgnoredDirectories");
+		const run = git.run.bind(git);
+		let afterRest: (() => Promise<void>) | undefined;
+		let omitHints = false;
+		const runner = vi.spyOn(git, "run").mockImplementation(async (args, options) => {
+			const result = await run(args, options);
+			if (args.includes("--directory") && omitHints) return successfulGitResult(Buffer.alloc(0));
+			if (args.includes("--ignored") && !args.includes("--directory") && args.at(-1) !== "." && afterRest) {
+				const change = afterRest;
+				afterRest = undefined;
+				await change();
+			}
+			return result;
+		});
+		try {
+			await writeFixtureFile(workspace, `${parent}/.gitignore`, rules);
+			await runGit(workspace, ["add", "--", `:(literal)${parent}/.gitignore`]);
+			await mkdir(join(workspace, target));
+			for (let i = 0; i < 1_024; i += 32) {
+				await Promise.all(Array.from({ length: 32 }, (_, n) => writeFile(join(workspace, target, `${i + n}`), "x")));
+			}
+			await symlink("../partial", join(workspace, target, "link"));
+			await writeFixtureFile(workspace, `${parent}/:带换行\n.log`, "x");
+			await writeFixtureFile(workspace, `${parent}/partial/keep`, "visible");
+			await writeFixtureFile(workspace, `${parent}/partial/skip`, "ignored");
+			const topology = await discovery.discover(workspace);
+			await store.capture(topology);
+			const compare = async (full: boolean) => {
+				git.calls.length = 0;
+				const manifest = await store.capture(topology);
+				const expected = (await runGit(workspace, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", "."]))
+					.split("\0").filter(Boolean).sort();
+				expect(manifest.roots[0]?.ignoredPresentPaths).toEqual(expected);
+				const exact = git.calls.filter(({ args }) => args.includes("--ignored") && !args.includes("--directory"));
+				expect(exact.some(({ args }) => args.at(-1) === ".")).toBe(full);
+				return expected;
+			};
+			const paths = await compare(false);
+			expect(scan.mock.calls.some(([, roots]) => roots.includes(target))).toBe(true);
+			expect(paths).toContain(`${target}/link`);
+			expect(paths).not.toContain(`${parent}/partial/keep`);
+			expect(git.calls.some(({ args }) => args.includes("--ignored") && args.includes(`:(top,literal)${parent}/partial`))).toBe(true);
+			// 提示遗漏不能让某个子树从 proof 消失，即使没有任何顶层整体忽略目录。
+			omitHints = true;
+			await compare(true);
+			omitHints = false;
+			afterRest = () => writeFixtureFile(workspace, `${parent}/later.log`, "new");
+			expect(await compare(true)).toContain(`${parent}/later.log`);
+			// 只改规则文件内容，目录身份和名称列表都不变，仍需重查分类。
+			afterRest = () => writeFixtureFile(workspace, `${parent}/.gitignore`, rules.replace("build/", "build/*\n!build/0"));
+			expect(await compare(true)).not.toContain(`${target}/0`);
+		} finally {
+			runner.mockRestore();
+			scan.mockRestore();
+			await discovery.dispose();
+		}
 	});
 
 	it("目录项列表稳定时复用缓存证明忽略叶子类型，不启动 metadata 进程", async () => {
@@ -708,36 +778,56 @@ describe("SnapshotStore", () => {
 		}
 	});
 
-	it("默认按实测成本选择证明路径，两轮内采样齐两个候选", async () => {
-		const workspace = await temporaryRoot("pi-undo-ignored-adaptive-");
+	it.skipIf(process.platform === "win32")("按完整证明耗时选路：分区成本包含剩余 Git 查询和叶子复核", async () => {
+		const workspace = await realpath(await temporaryRoot("pi-undo-ignored-adaptive-"));
 		await createGitRepo(workspace);
 		const git = new RecordingGitRunner();
 		const discovery = new RootDiscovery(git, { scan: async () => undefined });
 		const store = new SnapshotStore({ storeRoot: await temporaryRoot("pi-undo-store-"), discovery, git });
+		let elapsed = 0;
+		let pendingLeafCheck = false;
+		const clock = vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+		const run = git.run.bind(git);
+		const runner = vi.spyOn(git, "run").mockImplementation((args, options) => {
+			if (args.includes("--ignored") && !args.includes("--directory")) {
+				pendingLeafCheck = args.at(-1) !== ".";
+				elapsed += pendingLeafCheck ? 50 : 100;
+			}
+			return run(args, options);
+		});
+		const list = discovery.listingCache.list.bind(discovery.listingCache);
+		const listings = vi.spyOn(discovery.listingCache, "list").mockImplementation((path) => {
+			if (pendingLeafCheck && path === workspace) {
+				elapsed += 50;
+				pendingLeafCheck = false;
+			}
+			return list(path);
+		});
 		try {
-			await writeFixtureFile(workspace, ".gitignore", "deps/\n");
+			await writeFixtureFile(workspace, ".gitignore", "deps/\nroot.log\n");
+			await writeFixtureFile(workspace, "root.log", "ignored");
 			await mkdir(join(workspace, "deps"));
 			for (let i = 0; i < 1_024; i += 32) {
 				await Promise.all(Array.from({ length: 32 }, (_, n) => writeFile(join(workspace, "deps", `${i + n}`), "x")));
 			}
 			const topology = await discovery.discover(workspace);
-			let before = await store.capture(topology);
-			const usedPartition = () => git.calls.some(({ args }) => args.includes("check-ignore") && args.includes("--stdin"));
-			// 第 1 轮：无样本，采集 Git；第 2 轮：补采分区。此后按实测结果固定选择。
-			git.calls.length = 0;
-			before = await store.captureBaseline(topology, before);
-			const firstUsedPartition = usedPartition();
-			git.calls.length = 0;
-			before = await store.captureBaseline(topology, before);
-			const secondUsedPartition = usedPartition();
-			// 两轮必须覆盖到不同的路径，否则策略会永久卡在一侧。
-			expect([firstUsedPartition, secondUsedPartition]).toContain(true);
-			expect([firstUsedPartition, secondUsedPartition]).toContain(false);
-			// 采样收敛后结果仍然正确。
 			const expected = (await runGit(workspace, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", "."]))
 				.split("\0").filter(Boolean).sort();
-			expect(before.roots[0]?.ignoredPresentPaths).toEqual(expected);
-		} finally { await discovery.dispose(); }
+			const sample = async () => {
+				git.calls.length = 0;
+				expect((await store.capture(topology)).roots[0]?.ignoredPresentPaths).toEqual(expected);
+				return git.calls.some(({ args }) => args.includes("check-ignore") && args.includes("--stdin"));
+			};
+			expect(await sample()).toBe(false);
+			expect(await sample()).toBe(true);
+			// 100 对 50+50：没有显著收益。漏计余集或叶子复核任意一项都会选错。
+			expect(await sample()).toBe(false);
+		} finally {
+			listings.mockRestore();
+			runner.mockRestore();
+			clock.mockRestore();
+			await discovery.dispose();
+		}
 	});
 
 	it("ignored-present 路径变化时拒绝复用 baseline", async () => {

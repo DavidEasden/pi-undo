@@ -48,6 +48,7 @@ const ROOT_CAPTURE_CONCURRENCY = 4;
 const FILE_SYSTEM_INSPECTION_CONCURRENCY = 32;
 const METADATA_BATCH_MAX_PATHS = 2_048;
 const IGNORED_SCAN_MIN_PATHS = 1_024;
+const IGNORED_QUERY_ARGS = ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"] as const;
 const METADATA_BATCH_HARD_MAX_PATHS = 8_192;
 const METADATA_BATCH_MAX_PATH_BYTES = 1 * 1024 * 1024;
 const METADATA_BATCHES_MAX_BATCHES = 32;
@@ -1473,8 +1474,8 @@ export class SnapshotStore {
 		if (inclusions === null) {
 			return [];
 		}
+		const proofStartedAt = performance.now();
 		const fullRoot = inclusions.length === 0 && exclusions.length === 0;
-		let partition: { leaves: string[]; rest: string[] } | undefined;
 		const measured = this.ignoredProofCost.get(cwd);
 		let preferPartition: boolean;
 		if (this.forcedIgnoredProofPath !== undefined) {
@@ -1492,41 +1493,21 @@ export class SnapshotStore {
 		}
 		const partitionEligible = fullRoot && preferPartition && this.largeIgnoredRoots?.has(cwd) &&
 			!["GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"].some((key) => process.env[key] !== undefined);
-		const partitionStartedAt = performance.now();
+		const gitOptions = { cwd, env: gitBacked ? sourceGitEnvironment() : environment };
+		const prefix = gitBacked ? ["-c", "core.fsmonitor=false"] : [];
+		const query = (pathspecs: readonly string[]) => this.runGitBytes([...prefix, ...IGNORED_QUERY_ARGS, "--", ...pathspecs], gitOptions);
+		let partition: { leaves: string[]; output: Uint8Array } | undefined;
 		if (partitionEligible) {
-			try {
-				partition = await this.scanWhollyIgnoredDirectories(cwd, environment, gitBacked);
-			} catch (error) {
-				// 只丢弃可选的分区结果；正式 Git 查询与叶子校验的错误仍然上传。
-				rethrowOperationFailure(error);
-				checkOperation();
+			const plan = await optionalIgnoredProbe(() => this.scanWhollyIgnoredDirectories(gitOptions, prefix));
+			if (plan !== undefined) {
+				// 用正向路径避免 Git 进入已扫描的子树；空余集不能变成无 pathspec 的全根查询。
+				const output = plan.rest.length === 0 ? new Uint8Array() : await query(plan.rest.map(literalPathspec));
+				if (await optionalIgnoredProbe(plan.isCurrent)) partition = { leaves: plan.leaves, output };
 			}
 		}
-		const pathspecs = partition !== undefined ? partition.rest.map(literalPathspec)
-			: inclusions.length === 0 ? ["."] : inclusions.map(literalPathspec);
-		for (const excluded of exclusions) {
-			pathspecs.push(excludeLiteralPathspec(excluded));
-		}
-		const gitStartedAt = performance.now();
-		const output = pathspecs.length === 0 ? new Uint8Array() : await this.runGitBytes([
-			...(gitBacked ? ["-c", "core.fsmonitor=false"] : []),
-			"ls-files",
-			"--others",
-			"--ignored",
-			"--exclude-standard",
-			"-z",
-			"--",
-			...pathspecs,
-		], { cwd, env: gitBacked ? sourceGitEnvironment() : environment });
-		// 只在完整根上采样，且两类样本必须对应同一覆盖面：分区成功时 Git 只查剩余的 rest，
-		// 不能拿来当作完整查询的基准。
-		if (fullRoot && this.forcedIgnoredProofPath === undefined) {
-			if (partition !== undefined) {
-				this.ignoredProofCost.set(cwd, { ...measured, partitionMs: gitStartedAt - partitionStartedAt });
-			} else {
-				this.ignoredProofCost.set(cwd, { ...measured, gitMs: performance.now() - gitStartedAt });
-			}
-		}
+		const output = partition?.output ?? await query([
+			...(inclusions.length === 0 ? ["."] : inclusions.map(literalPathspec)), ...exclusions.map(excludeLiteralPathspec),
+		]);
 		const candidates: string[] = [];
 		const seen = new Set<string>();
 		for (const relativePath of parseNulPaths(output)) {
@@ -1566,17 +1547,30 @@ export class SnapshotStore {
 			if (result.length >= IGNORED_SCAN_MIN_PATHS) this.largeIgnoredRoots.add(cwd);
 			else this.largeIgnoredRoots.delete(cwd);
 		}
-		return result.sort(comparePaths);
+		result.sort(comparePaths);
+		if (fullRoot && this.forcedIgnoredProofPath === undefined) {
+			// 两侧都计到完整证明就绪；尝试分区后回退的代价也归分区，不能算成纯 Git 样本。
+			this.ignoredProofCost.set(cwd, {
+				...this.ignoredProofCost.get(cwd),
+				[partitionEligible ? "partitionMs" : "gitMs"]: performance.now() - proofStartedAt,
+			});
+		}
+		return result;
 	}
 
 	private async scanWhollyIgnoredDirectories(
-		cwd: string, environment: Readonly<Record<string, string | undefined>>, gitBacked: boolean,
-	): Promise<{ leaves: string[]; rest: string[] } | undefined> {
-		const root = await ignoredScanRoots(cwd);
+		gitOptions: GitRunOptions & { cwd: string }, prefix: readonly string[],
+	): Promise<{ leaves: string[]; rest: string[]; isCurrent: () => Promise<boolean> } | undefined> {
+		const { cwd } = gitOptions;
+		// --directory 的输出只作为拆分位置提示。超限或失败时仍可沿用顶层分区。
+		const hints = await optionalIgnoredProbe(async () => {
+			const output = await this.runGitBytes([...prefix, ...IGNORED_QUERY_ARGS, "--directory", "--", "."],
+				{ ...gitOptions, stdoutLimit: 64 * 1024 });
+			return new Set(splitNulRecords(output).map((record) => decodeUtf8(record))
+				.filter((path) => path.endsWith("/")).map((path) => path.slice(0, -1)));
+		}) ?? new Set<string>();
+		const root = await ignoredScanRoots(cwd, hints);
 		if (root === undefined || root.directories.length === 0) return undefined;
-		const env = gitBacked ? sourceGitEnvironment() : environment;
-		const gitOptions = { cwd, env };
-		const prefix = gitBacked ? ["-c", "core.fsmonitor=false"] : [];
 		// 必须查询目录本身，不附加 /。dir/* 可以匹配 dir/，却允许 !dir/keep 重新纳入叶子。
 		// ./ 消除以冒号开头的路径歧义；实际目录的类型由 Git 判定。
 		const requests = root.directories.map((name) => `./${name}`);
@@ -1597,10 +1591,13 @@ export class SnapshotStore {
 		if (await hasIndexedEntries()) return undefined;
 		const rest = root.names.filter((name) => !ignored.has(name));
 		const leaves = await scanIgnoredDirectories(cwd, [...ignored], this.discovery.listingCache);
-		const after = await ignoredScanRoots(cwd);
-		if (!after || !samePathList(root.names, after.names) || !samePathList(root.directories, after.directories) ||
-			!samePathList([...ignored].sort(), [...await classify()].sort()) || await hasIndexedEntries()) return undefined;
-		return { leaves, rest };
+		const isCurrent = async () => {
+			const after = await ignoredScanRoots(cwd, hints);
+			return after !== undefined && samePathList(root.names, after.names) && samePathList(root.directories, after.directories) &&
+				samePathList(root.bindings, after.bindings) && samePathList([...ignored].sort(), [...await classify()].sort()) &&
+				!await hasIndexedEntries();
+		};
+		return { leaves, rest, isCurrent };
 	}
 
 	private async inspectNativeMetadataBatches(
@@ -3493,6 +3490,17 @@ function assertPinReason(reason: string): void {
 
 function rootRelativePath(parent: string, child: string): string {
 	return parent === "." ? child : child.slice(parent.length + 1);
+}
+
+/** 只允许丢弃优化提示；取消、超时与未确认退出不能触发新的 Git 查询。 */
+async function optionalIgnoredProbe<T>(probe: () => Promise<T>): Promise<T | undefined> {
+	try {
+		return await probe();
+	} catch (error) {
+		rethrowOperationFailure(error);
+		checkOperation();
+		return undefined;
+	}
 }
 
 function literalPathspec(path: string): string {
