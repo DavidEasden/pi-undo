@@ -59,6 +59,34 @@ async function must(command, args, label, options = {}) {
 	return result.stdout;
 }
 
+/** 调用 gh 并检查退出码；网络错误重试。 */
+async function ghRetry(args, label, attempts = 6) {
+	for (let attempt = 1; attempt <= attempts; attempt += 1) {
+		const result = await tryExec("gh", args);
+		if (result.ok) return result.stdout;
+		log(`  ${label} 失败（${attempt}/${attempts}）：${firstLine(result.stderr || result.message)}`);
+		await sleep(3000);
+	}
+	throw new ReleaseError(`${label} 失败（已尝试 ${attempts} 次）`);
+}
+
+/** 调用 gh 并把输出解析为 JSON；网络错误与瞬时失败都重试。 */
+async function ghJson(args, label, attempts = 6) {
+	for (let attempt = 1; attempt <= attempts; attempt += 1) {
+		const result = await tryExec("gh", args);
+		if (result.ok) {
+			try {
+				return JSON.parse(result.stdout);
+			} catch {
+				// 输出不是合法 JSON，同样按失败重试一次。
+			}
+		}
+		log(`  ${label} 失败（${attempt}/${attempts}）：${firstLine(result.stderr || result.message)}`);
+		await sleep(3000);
+	}
+	throw new ReleaseError(`${label} 失败（已尝试 ${attempts} 次）`);
+}
+
 /** 拉取远端 main；网络抖动时重试，与推送保持一致。 */
 async function fetchWithRetry(attempts = MAX_PUSH_ATTEMPTS) {
 	for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -95,7 +123,6 @@ async function preflight() {
 	if (!auth.ok) {
 		throw new ReleaseError(`gh 认证不可用：${firstLine(auth.stderr || auth.stdout)}`);
 	}
-
 	await fetchWithRetry();
 	const behind = Number(await must("git", ["rev-list", "--count", "HEAD..origin/main"], "比较远端 main"));
 	if (behind > 0) {
@@ -167,12 +194,10 @@ async function pushWithRetry(ref) {
 async function waitForRun(tag) {
 	log(`→ 等待 tag ${tag} 触发 CI`);
 	for (let attempt = 1; attempt <= 60; attempt += 1) {
-		const output = await must(
-			"gh",
+		const runs = await ghJson(
 			["run", "list", "--limit", "10", "--json", "databaseId,headBranch,event"],
 			"查询 CI runs",
 		);
-		const runs = JSON.parse(output);
 		const matched = runs.find((run) => run.headBranch === tag && run.event === "push");
 		if (matched !== undefined) {
 			log(`  run ${matched.databaseId}`);
@@ -187,12 +212,10 @@ async function waitForRun(tag) {
 async function waitForRunCompletion(runId) {
 	let reruns = 0;
 	for (;;) {
-		const output = await must(
-			"gh",
+		const data = await ghJson(
 			["run", "view", String(runId), "--json", "status,conclusion,jobs"],
 			"查询 CI 状态",
 		);
-		const data = JSON.parse(output);
 		if (data.status !== "completed") {
 			await sleep(20000);
 			continue;
@@ -211,7 +234,7 @@ async function waitForRunCompletion(runId) {
 		}
 		reruns += 1;
 		log(`  CI 失败（${data.conclusion}），重跑失败 job（第 ${reruns}/${MAX_CI_RERUNS} 次）`);
-		await must("gh", ["run", "rerun", String(runId), "--failed"], "重跑 CI");
+		await ghRetry(["run", "rerun", String(runId), "--failed"], "重跑 CI");
 		await sleep(15000);
 	}
 }
