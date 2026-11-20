@@ -48,7 +48,8 @@
 		"test:native": "cargo test --manifest-path native/pi-undo-fs/Cargo.toml && vitest run test/native-restore.test.ts test/native-directory-scan.test.ts test/root-discovery.test.ts test/durable-pack.test.ts test/packed-recovery.test.ts",
 		"build:native": "cargo build --release --manifest-path native/pi-undo-fs/Cargo.toml",
 		"typecheck": "tsc --noEmit",
-		"pack:dry-run": "npm pack --dry-run"
+		"pack:dry-run": "npm pack --dry-run",
+		"release": "node scripts/release.mjs"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": ">=1.2.0",
