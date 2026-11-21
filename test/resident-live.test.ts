@@ -52,6 +52,13 @@ describe.skipIf(process.env.PI_UNDO_RUN_RESIDENT_LIVE !== "1" || (process.platfo
 				repositories: [expect.objectContaining({ path: "deps/p2/deep" })] });
 			await rm(join(workspace, "deps/p2/deep/.git"));
 			expect(await scan()).toMatchObject({ ok: true, leaves: ["deps/moved"], repositories: [] });
+			// 新增目录只访问受影响路径，不能重扫整棵近期依赖树。
+			await mkdir(join(workspace, "deps/fresh/nested"), { recursive: true });
+			expect(await scan()).toMatchObject({ ok: true });
+			await writeFile(join(workspace, "deps/fresh/nested/leaf"), "x\n");
+			expect(await scan()).toMatchObject({
+				ok: true, leaves: ["deps/fresh/nested/leaf", "deps/moved"],
+			});
 		} finally {
 			await client.close();
 			await rm(base, { recursive: true, force: true });

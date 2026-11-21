@@ -40,6 +40,8 @@ struct EventBatch {
     uncertain: bool,
     /// 仅普通文件目录项或明确的目录元数据事件，允许核验后复用无事件的近期子树。
     file_entries_only: bool,
+    /// 本次进程的监听从未丢失事件；只有此时才允许不看时间戳窗口复用子树。
+    coverage_trusted: bool,
 }
 
 impl EventBatch {
@@ -49,6 +51,7 @@ impl EventBatch {
             changed_paths: HashSet::new(),
             uncertain: true,
             file_entries_only: false,
+            coverage_trusted: false,
         }
     }
 }
@@ -301,8 +304,14 @@ fn serve_local(
 ) -> Result<HitResponse, String> {
     assert_workspace_identity(state)?;
     let (response, changed_cache, removed, reused) =
-        scan_changed(root, &events.changed_paths, &state.directories, events.file_entries_only && !events.uncertain)
-            .map_err(|error| error.to_string())?;
+    scan_changed(
+        root,
+        &events.changed_paths,
+        &state.directories,
+        events.file_entries_only && !events.uncertain,
+        events.coverage_trusted && !events.uncertain,
+    )
+    .map_err(|error| error.to_string())?;
     for removed_path in removed {
         let prefix = format!("{removed_path}/");
         state
@@ -488,6 +497,8 @@ mod watch_impl {
         pending: Mutex<EventBatch>,
         generation: AtomicU64,
         running: AtomicBool,
+        /// 一旦丢失事件或监听异常就永久降级，后续不再信任时间戳窗口以外的复用。
+        trusted: AtomicBool,
     }
 
     pub(super) struct Watch {
@@ -518,6 +529,7 @@ mod watch_impl {
         }
         if num_events > 0 && (event_paths.is_null() || event_flags.is_null()) {
             pending.uncertain = true;
+            events.trusted.store(false, Ordering::Release);
             events.generation.fetch_add(1, Ordering::Release);
             return;
         }
@@ -528,10 +540,15 @@ mod watch_impl {
             let value = unsafe { CFArrayGetValueAtIndex(paths, index as isize) };
             let Some(event_path) = cf_string_to_string(value) else {
                 pending.uncertain = true;
+                pending.coverage_trusted = false;
+                events.trusted.store(false, Ordering::Release);
                 invalidates = true;
                 continue;
             };
             invalidates |= record_event_path(&mut pending, &events.workspace, &event_path, flags);
+            if !pending.coverage_trusted {
+                events.trusted.store(false, Ordering::Release);
+            }
         }
         // 代数只追踪会影响目录缓存的事件，否则 late drain 仍会把纯内容修改升级为全量重扫。
         if invalidates {
@@ -576,12 +593,14 @@ mod watch_impl {
             | EVENT_UNMOUNT;
         if flags & LOSS_FLAGS != 0 {
             batch.uncertain = true;
+            batch.coverage_trusted = false;
             return true;
         }
         let event_path = std::path::Path::new(path);
         let workspace_path = std::path::Path::new(workspace);
         let Ok(relative) = event_path.strip_prefix(workspace_path) else {
             batch.uncertain = true;
+            batch.coverage_trusted = false;
             return true;
         };
         let mut components = Vec::new();
@@ -590,6 +609,7 @@ mod watch_impl {
                 std::path::Component::Normal(value) => {
                     let Some(value) = value.to_str() else {
                         batch.uncertain = true;
+            batch.coverage_trusted = false;
                         return true;
                     };
                     components.push(value);
@@ -597,6 +617,7 @@ mod watch_impl {
                 std::path::Component::CurDir => {}
                 _ => {
                     batch.uncertain = true;
+            batch.coverage_trusted = false;
                     return true;
                 }
             }
@@ -627,6 +648,7 @@ mod watch_impl {
         let is_file_like = flags & (EVENT_ITEM_IS_FILE | EVENT_ITEM_IS_SYMLINK) != 0;
         if !is_directory && !is_file_like {
             batch.uncertain = true;
+            batch.coverage_trusted = false;
             return true;
         }
         let parent = std::path::Path::new(&relative_path)
@@ -649,6 +671,7 @@ mod watch_impl {
     fn insert_changed_path(batch: &mut EventBatch, path: String) {
         if batch.changed_paths.len() >= MAX_CHANGED_PATHS && !batch.changed_paths.contains(&path) {
             batch.uncertain = true;
+            batch.coverage_trusted = false;
             batch.changed_paths.clear();
             return;
         }
@@ -667,9 +690,11 @@ mod watch_impl {
                     changed_paths: HashSet::new(),
                     uncertain: false,
                     file_entries_only: true,
+                    coverage_trusted: true,
                 }),
                 generation: AtomicU64::new(0),
                 running: AtomicBool::new(true),
+                trusted: AtomicBool::new(true),
             }
         }
 
@@ -758,6 +783,20 @@ mod watch_impl {
         }
 
         #[test]
+        fn event_loss_permanently_disables_trusted_coverage() {
+            let events = shared_events();
+            emit_events(&events, &[("/workspace/repo/file", EVENT_ITEM_IS_FILE | EVENT_ITEM_MODIFIED)]);
+            assert!(events.trusted.load(Ordering::Acquire));
+            assert!(events.pending.lock().unwrap().coverage_trusted);
+            emit_events(&events, &[("/workspace/repo/file", EVENT_KERNEL_DROPPED)]);
+            assert!(!events.trusted.load(Ordering::Acquire));
+            assert!(!events.pending.lock().unwrap().coverage_trusted);
+            // 后续普通内容事件不能恢复信任。
+            emit_events(&events, &[("/workspace/repo/file", EVENT_ITEM_IS_FILE | EVENT_ITEM_MODIFIED)]);
+            assert!(!events.trusted.load(Ordering::Acquire));
+        }
+
+        #[test]
         fn only_known_file_batches_allow_racy_sibling_reuse() {
             let known = EVENT_ITEM_IS_FILE | EVENT_ITEM_CREATED | EVENT_ITEM_MODIFIED | EVENT_ITEM_INODE_META_MOD;
             let events = shared_events();
@@ -788,6 +827,7 @@ mod watch_impl {
                 changed_paths: HashSet::new(),
                 uncertain: false,
                 file_entries_only: true,
+                coverage_trusted: true,
             };
             record_event_path(
                 &mut batch,
@@ -819,6 +859,7 @@ mod watch_impl {
                 changed_paths: HashSet::new(),
                 uncertain: false,
                 file_entries_only: true,
+                coverage_trusted: true,
             };
             for flags in [EVENT_MUST_SCAN_SUBDIRS, EVENT_USER_DROPPED, EVENT_KERNEL_DROPPED,
                 EVENT_IDS_WRAPPED, EVENT_ROOT_CHANGED, EVENT_MOUNT, EVENT_UNMOUNT] {
@@ -832,6 +873,7 @@ mod watch_impl {
                 changed_paths: HashSet::new(),
                 uncertain: false,
                 file_entries_only: true,
+                coverage_trusted: true,
             };
             record_event_path(&mut batch, "/workspace", "/outside/repo", EVENT_ITEM_IS_DIR);
             assert!(batch.uncertain);
@@ -853,9 +895,11 @@ mod watch_impl {
                     changed_paths: HashSet::new(),
                     uncertain: false,
                     file_entries_only: true,
+                    coverage_trusted: true,
                 }),
                 generation: AtomicU64::new(0),
                 running: AtomicBool::new(false),
+                trusted: AtomicBool::new(true),
             });
             let path_c = CString::new(workspace.to_str().ok_or("workspace 路径不是 UTF-8")?)
                 .map_err(|_| "workspace 路径含 NUL")?;
@@ -973,6 +1017,7 @@ mod watch_impl {
                 return EventBatch::unknown();
             }
             let generation = self.events.generation.load(Ordering::Acquire);
+            let trusted = self.events.trusted.load(Ordering::Acquire);
             let mut pending = match self.events.pending.lock() {
                 Ok(pending) => pending,
                 Err(_) => return EventBatch::unknown(),
@@ -980,11 +1025,13 @@ mod watch_impl {
             let changed_paths = std::mem::take(&mut pending.changed_paths);
             let uncertain = std::mem::replace(&mut pending.uncertain, false);
             let file_entries_only = std::mem::replace(&mut pending.file_entries_only, true);
+            let batch_trusted = std::mem::replace(&mut pending.coverage_trusted, trusted);
             EventBatch {
                 generation,
                 changed_paths,
                 uncertain,
                 file_entries_only,
+                coverage_trusted: trusted && batch_trusted,
             }
         }
     }

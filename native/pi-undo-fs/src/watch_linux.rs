@@ -266,7 +266,7 @@ impl Watch {
             by_path: HashMap::new(),
             generation: 0,
             degraded: false,
-            pending: EventBatch { generation: 0, changed_paths: HashSet::new(), uncertain: false, file_entries_only: false },
+            pending: EventBatch { generation: 0, changed_paths: HashSet::new(), uncertain: false, file_entries_only: false, coverage_trusted: false },
         };
         // 初始 watch 建立失败（如超过 max_user_watches）时拒绝常驻模式，调用方回退一次性扫描。
         if let Err(error) = inner.add_tree("", 0, false) {
@@ -293,7 +293,7 @@ impl Watch {
         let generation = inner.generation;
         let changed_paths = std::mem::take(&mut inner.pending.changed_paths);
         let uncertain = std::mem::replace(&mut inner.pending.uncertain, false);
-        EventBatch { generation, changed_paths, uncertain, file_entries_only: false }
+        EventBatch { generation, changed_paths, uncertain, file_entries_only: false, coverage_trusted: false }
     }
 }
 
