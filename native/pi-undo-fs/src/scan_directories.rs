@@ -17,7 +17,7 @@ struct Request {
     cache_path: Option<String>,
 }
 
-pub(crate) const CACHE_SCHEMA_VERSION: u32 = 2;
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 3;
 const RACY_DIRECTORY_WINDOW_NS: u128 = 2_000_000_000;
 static NEXT_CACHE_WRITE: AtomicU64 = AtomicU64::new(0);
 
@@ -43,6 +43,8 @@ pub(crate) struct CachedDirectory {
     pub(crate) has_git: bool,
     pub(crate) racy: bool,
     pub(crate) children: Vec<String>,
+    /// 完整的直接叶子名；仓库标记或特殊项使该目录无法用于忽略证明。
+    pub(crate) leaves: Option<Vec<String>>,
 }
 
 pub(crate) struct ScanState<'a> {
@@ -245,15 +247,18 @@ fn scan_inner(
         });
     }
     let mut children = Vec::new();
+    let mut leaves = Some(Vec::new());
     for (name, kind) in entries {
+        if name.eq_ignore_ascii_case(".git") {
+            leaves = None;
+        }
         if name == ".git" {
             continue;
         }
         let name_os = OsStr::new(&name);
-        let is_directory = kind == libc::DT_DIR
-            || (kind == libc::DT_UNKNOWN
-                && directory.stat(name_os)?.st_mode & libc::S_IFMT == libc::S_IFDIR);
-        if !is_directory {
+        let kind = entry_kind(directory, name_os, kind)?;
+        if kind != libc::DT_DIR {
+            record_leaf(&mut leaves, name, kind);
             continue;
         }
         let child = directory.open_child(name_os)?;
@@ -273,7 +278,7 @@ fn scan_inner(
     assert_unchanged(path, &before, &after)?;
     state.next.insert(
         path.into(),
-        cached_directory(&after, has_git, child_names, observed_at),
+        cached_directory(&after, has_git, child_names, leaves, observed_at),
     );
     Ok(())
 }
@@ -506,15 +511,18 @@ fn scan_changed_inner(
         });
     }
     let mut children = Vec::new();
+    let mut leaves = Some(Vec::new());
     for (name, kind) in entries {
+        if name.eq_ignore_ascii_case(".git") {
+            leaves = None;
+        }
         if name == ".git" {
             continue;
         }
         let name_os = OsStr::new(&name);
-        let is_directory = kind == libc::DT_DIR
-            || (kind == libc::DT_UNKNOWN
-                && directory.stat(name_os)?.st_mode & libc::S_IFMT == libc::S_IFDIR);
-        if !is_directory {
+        let kind = entry_kind(directory, name_os, kind)?;
+        if kind != libc::DT_DIR {
+            record_leaf(&mut leaves, name, kind);
             continue;
         }
         let child_path = if path.is_empty() {
@@ -560,7 +568,7 @@ fn scan_changed_inner(
     assert_unchanged(path, &before, &after)?;
     next.insert(
         path.into(),
-        cached_directory(&after, has_git, children, observed_at),
+        cached_directory(&after, has_git, children, leaves, observed_at),
     );
     Ok(())
 }
@@ -579,6 +587,10 @@ fn scan_cached_ancestor(
 ) -> std::io::Result<()> {
     let observed_at = SystemTime::now();
     let before = directory.file.metadata()?;
+    // 祖先仍需绑定缓存身份；发现漂移交由调用方完整重扫。
+    if !metadata_matches(cached, &before) {
+        return Err(std::io::Error::other("事件祖先的目录 cache 已漂移"));
+    }
     response.directories += 1;
     if !path.is_empty() && cached.has_git {
         response.repositories.push(Repository {
@@ -620,7 +632,7 @@ fn scan_cached_ancestor(
     assert_unchanged(path, &before, &after)?;
     next.insert(
         path.into(),
-        cached_directory(&after, cached.has_git, cached.children.clone(), observed_at),
+        cached_directory(&after, cached.has_git, cached.children.clone(), cached.leaves.clone(), observed_at),
     );
     Ok(())
 }
@@ -659,6 +671,7 @@ pub(crate) fn cached_directory(
     metadata: &std::fs::Metadata,
     has_git: bool,
     children: Vec<String>,
+    leaves: Option<Vec<String>>,
     observed_at: SystemTime,
 ) -> CachedDirectory {
     CachedDirectory {
@@ -672,7 +685,78 @@ pub(crate) fn cached_directory(
         // 以枚举开始时刻判定；长子树扫描不能把同一时间戳窗口内的变化变成可信缓存。
         racy: directory_is_racy(metadata, observed_at),
         children,
+        leaves,
     }
+}
+
+/// 未知 d_type 必须通过不跟随链接的 stat 确认，不能把特殊文件当成叶子。
+fn entry_kind(directory: &Directory, name: &OsStr, kind: u8) -> std::io::Result<u8> {
+    if kind != libc::DT_UNKNOWN {
+        return Ok(kind);
+    }
+    Ok(match directory.stat(name)?.st_mode & libc::S_IFMT {
+        libc::S_IFDIR => libc::DT_DIR,
+        libc::S_IFREG => libc::DT_REG,
+        libc::S_IFLNK => libc::DT_LNK,
+        _ => libc::DT_UNKNOWN,
+    })
+}
+
+fn record_leaf(leaves: &mut Option<Vec<String>>, name: String, kind: u8) {
+    if kind == libc::DT_REG || kind == libc::DT_LNK {
+        if let Some(leaves) = leaves {
+            leaves.push(name);
+        }
+    } else {
+        *leaves = None;
+    }
+}
+
+/// 仅从本次事件校验后的 cache 取叶子；不读取文件内容，也不跟随符号链接。
+pub(crate) fn collect_leaves(
+    directories: &BTreeMap<String, CachedDirectory>,
+    roots: &[String],
+) -> Result<Vec<String>, String> {
+    if roots.is_empty() || roots.len() > 512 {
+        return Err("叶子扫描根数量无效".into());
+    }
+    let workspace_dev = directories.get("").ok_or("叶子 cache 缺少 workspace 根")?.dev;
+    let mut pending = Vec::new();
+    for root in roots {
+        if root.is_empty() || !valid_directory_path(root)
+            || root.split('/').any(|part| part.eq_ignore_ascii_case(".git")) {
+            return Err("叶子扫描根无效".into());
+        }
+        pending.push(root.clone());
+    }
+    let mut seen = HashSet::new();
+    let mut leaves = Vec::new();
+    let mut entries = 0usize;
+    let mut bytes = 0usize;
+    while let Some(path) = pending.pop() {
+        if !seen.insert(path.clone()) {
+            return Err("叶子扫描根重叠或 cache 重复".into());
+        }
+        let directory = directories.get(&path).ok_or("叶子扫描目录不在本次 cache 中")?;
+        // 根文件系统的事件保证不能延伸到嵌套挂载；跨设备子树继续使用原枚举。
+        if directory.dev != workspace_dev {
+            return Err("跨设备子树需要重新枚举".into());
+        }
+        let names = directory.leaves.as_ref().filter(|_| !directory.has_git)
+            .ok_or("仓库标记或特殊项需要 Git 精确枚举")?;
+        for name in names.iter().chain(&directory.children) {
+            let length = path.len() + 1 + name.len();
+            bytes += length;
+            entries += 1;
+            if entries > 262_144 || bytes > 32 * 1024 * 1024 {
+                return Err("叶子扫描超过预算".into());
+            }
+        }
+        leaves.extend(names.iter().map(|name| format!("{path}/{name}")));
+        pending.extend(directory.children.iter().map(|name| format!("{path}/{name}")));
+    }
+    leaves.sort();
+    Ok(leaves)
 }
 
 pub(crate) fn metadata_matches(cached: &CachedDirectory, metadata: &std::fs::Metadata) -> bool {
@@ -720,6 +804,11 @@ pub(crate) fn load_cache(path: &Path, root: &Directory, workspace: &Path) -> Opt
         || !cache.directories.contains_key("")
         || !cache.directories.iter().all(|(path, directory)| {
             valid_directory_path(path) && valid_children(&directory.children)
+                && directory.leaves.as_ref().is_none_or(|leaves| {
+                    let children: HashSet<_> = directory.children.iter().collect();
+                    valid_children(leaves)
+                        && leaves.iter().all(|name| !name.eq_ignore_ascii_case(".git") && !children.contains(name))
+                })
         })
     {
         return None;
@@ -735,7 +824,7 @@ fn valid_directory_path(path: &str) -> bool {
 }
 
 fn valid_child_name(name: &str) -> bool {
-    !name.is_empty() && name != "." && name != ".." && name != ".git" && !name.contains('/')
+    !name.is_empty() && name != "." && name != ".." && name != ".git" && !name.contains('/') && !name.contains('\0')
 }
 
 fn valid_children(children: &[String]) -> bool {
@@ -1049,11 +1138,11 @@ mod tests {
         let root = crate::tests::fixture();
         let observed_at = SystemTime::now();
         let metadata = fs::metadata(&root).unwrap();
-        let cached = cached_directory(&metadata, false, Vec::new(), observed_at);
+        let cached = cached_directory(&metadata, false, Vec::new(), Some(Vec::new()), observed_at);
         assert!(cached.racy);
         // 模拟完成扫描已越过窗口，原记录仍不能随时间推移自动取得复用资格。
         let after_window = observed_at + std::time::Duration::from_secs(3);
-        let later = cached_directory(&metadata, false, Vec::new(), after_window);
+        let later = cached_directory(&metadata, false, Vec::new(), Some(Vec::new()), after_window);
         if metadata.mtime_nsec() != 0 && metadata.ctime_nsec() != 0 {
             assert!(!later.racy);
         }
@@ -1093,6 +1182,19 @@ mod tests {
         .unwrap();
         let opened = Directory::open(&root).unwrap();
         assert!(load_cache(&cache_path, &opened, &root).is_some());
+        let original = fs::read(&cache_path).unwrap();
+        // 旧 schema 缺少叶子清单，不能把它解释成空目录；损坏叶子名也不得复用。
+        for leaves in [serde_json::json!(["../escape"]), serde_json::json!(["same", "same"]), serde_json::json!(["child"])] {
+            let mut corrupt: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            corrupt["directories"][""]["leaves"] = leaves;
+            fs::write(&cache_path, serde_json::to_vec(&corrupt).unwrap()).unwrap();
+            assert!(load_cache(&cache_path, &opened, &root).is_none());
+        }
+        let mut old: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        old["schemaVersion"] = serde_json::json!(2);
+        fs::write(&cache_path, serde_json::to_vec(&old).unwrap()).unwrap();
+        assert!(load_cache(&cache_path, &opened, &root).is_none());
+        fs::write(&cache_path, original).unwrap();
 
         let other = crate::tests::fixture();
         assert!(load_cache(&cache_path, &Directory::open(&other).unwrap(), &other).is_none());
@@ -1105,6 +1207,49 @@ mod tests {
 
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn cached_leaves_follow_deep_changes_and_preserve_symlinks() {
+        let root = crate::tests::fixture();
+        fs::create_dir_all(root.join("deps/a/deep")).unwrap();
+        fs::write(root.join("deps/a/deep/old"), "x").unwrap();
+        symlink("/outside", root.join("deps/link")).unwrap();
+        let mut cache = verified_cache(&root);
+        let roots = vec![String::from("deps")];
+        assert_eq!(collect_leaves(&cache.directories, &roots).unwrap(), ["deps/a/deep/old", "deps/link"]);
+        fs::remove_file(root.join("deps/a/deep/old")).unwrap();
+        fs::write(root.join("deps/a/deep/新\n文件"), "x").unwrap();
+        let (_, next, removed, _) = scan_changed(
+            &Directory::open(&root).unwrap(),
+            &HashSet::from([String::from("deps/a/deep")]),
+            &cache.directories,
+        ).unwrap();
+        assert!(removed.is_empty());
+        cache.directories.extend(next);
+        assert_eq!(collect_leaves(&cache.directories, &roots).unwrap(), ["deps/a/deep/新\n文件", "deps/link"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn leaf_cache_rejects_incomplete_special_and_overlapping_subtrees() {
+        let root = crate::tests::fixture();
+        fs::create_dir_all(root.join("deps/a")).unwrap();
+        fs::write(root.join("deps/a/file"), "x").unwrap();
+        let mut cache = verified_cache(&root);
+        assert!(collect_leaves(&cache.directories, &["deps".into(), "deps/a".into()]).is_err());
+        assert!(collect_leaves(&cache.directories, &["../deps".into()]).is_err());
+        let device = cache.directories["deps/a"].dev;
+        cache.directories.get_mut("deps/a").unwrap().dev = device.wrapping_add(1);
+        assert!(collect_leaves(&cache.directories, &["deps".into()]).is_err());
+        cache.directories.get_mut("deps/a").unwrap().dev = device;
+        cache.directories.get_mut("deps/a").unwrap().leaves = None;
+        assert!(collect_leaves(&cache.directories, &["deps".into()]).is_err());
+        cache.directories.remove("deps/a");
+        assert!(collect_leaves(&cache.directories, &["deps".into()]).is_err());
+        fs::write(root.join("deps/a/.git"), "invalid").unwrap();
+        assert!(collect_leaves(&verified_cache(&root).directories, &["deps".into()]).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

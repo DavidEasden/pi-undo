@@ -72,6 +72,7 @@ impl Inner {
             // 同一 inode 已在其他路径下被监听（如 bind mount）：路径归属不再可信。
             if existing != relative {
                 self.by_path.remove(&existing);
+                self.degraded = true;
                 self.pending.uncertain = true;
             }
         }
@@ -103,15 +104,14 @@ impl Inner {
             Err(error) => return Err(error.to_string()),
         };
         for entry in entries {
-            let Ok(entry) = entry else { continue };
+            let entry = entry.map_err(|error| error.to_string())?;
             // DirEntry::file_type 不跟随符号链接，与扫描器的 O_NOFOLLOW 语义一致。
-            let Ok(kind) = entry.file_type() else { continue };
+            let kind = entry.file_type().map_err(|error| error.to_string())?;
             if !kind.is_dir() {
                 continue;
             }
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                self.pending.uncertain = true;
-                continue;
+                return Err("目录监听遇到非 UTF-8 路径".into());
             };
             if name == ".git" {
                 continue;
@@ -170,7 +170,7 @@ impl Inner {
                 };
                 let name_end = offset + header + event.len as usize;
                 if name_end > bytes.len() {
-                    self.pending.uncertain = true;
+                    self.degraded = true;
                     return;
                 }
                 let raw = &bytes[offset + header..name_end];
@@ -184,6 +184,9 @@ impl Inner {
 
     fn handle(&mut self, wd: i32, mask: u32, name: &[u8]) {
         if mask & (libc::IN_Q_OVERFLOW | libc::IN_UNMOUNT) != 0 {
+            // 丢失创建事件也会丢失新目录的 watch；一次重扫无法修补监听覆盖。
+            // 本进程持续报告不确定，让客户端丢弃进程并重新建立整棵树的监听。
+            self.degraded = true;
             self.pending.uncertain = true;
             return;
         }
@@ -192,9 +195,8 @@ impl Inner {
                 if self.by_path.get(&path) == Some(&wd) {
                     self.by_path.remove(&path);
                 }
-                if path.is_empty() {
-                    self.degraded = true;
-                }
+                // 正常 remove_tree 已先删除映射；仍有映射说明监听意外消失。
+                self.degraded = true;
             }
             return;
         }
@@ -207,6 +209,10 @@ impl Inner {
                 self.degraded = true;
             } else {
                 insert_changed(&mut self.pending, parent_of(&directory));
+                if mask & libc::IN_DELETE_SELF != 0 {
+                    // 已知的删除先移除映射，随后 IN_IGNORED 不属于意外监听丢失。
+                    self.remove_tree(&directory);
+                }
             }
             return;
         }
@@ -216,6 +222,7 @@ impl Inner {
             return;
         }
         let Some(name) = std::str::from_utf8(name).ok() else {
+            self.degraded = true;
             self.pending.uncertain = true;
             return;
         };
@@ -305,6 +312,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::canonicalize(root).unwrap()
+    }
+
+    #[test]
+    fn lost_watch_coverage_never_becomes_a_quiet_cache_hit() {
+        let root = temp_root("overflow");
+        std::fs::create_dir_all(root.join("old")).unwrap();
+        let watch = Watch::create(&root).unwrap();
+        watch.drain(true);
+        watch.inner.borrow_mut().handle(-1, libc::IN_Q_OVERFLOW, b"");
+        // 即使队列已排空，丢失的新目录 watch 也不会凭空恢复。
+        assert!(watch.drain(true).uncertain);
+        assert!(watch.drain(true).uncertain);
+        drop(watch);
+        assert!(!Watch::create(&root).unwrap().drain(true).uncertain);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unexpected_watch_removal_stays_uncertain() {
+        let root = temp_root("lost-watch");
+        std::fs::create_dir_all(root.join("child")).unwrap();
+        let watch = Watch::create(&root).unwrap();
+        watch.drain(true);
+        let wd = watch.inner.borrow().by_path["child"];
+        watch.inner.borrow_mut().handle(wd, libc::IN_IGNORED, b"");
+        assert!(watch.drain(true).uncertain);
+        assert!(watch.drain(true).uncertain);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

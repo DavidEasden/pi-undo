@@ -1590,7 +1590,9 @@ export class SnapshotStore {
 		], { ...gitOptions, stdoutLimit: 64 * 1024 })).length !== 0;
 		if (await hasIndexedEntries()) return undefined;
 		const rest = root.names.filter((name) => !ignored.has(name));
-		const leaves = await scanIgnoredDirectories(cwd, [...ignored], this.discovery.listingCache);
+		// 只复用本次请求已复核的目录叶子；忽略规则、index 与分区绑定仍在前后检查。
+		const leaves = await this.discovery.scanIgnoredLeaves(cwd, [...ignored]) ??
+			await scanIgnoredDirectories(cwd, [...ignored], this.discovery.listingCache);
 		const isCurrent = async () => {
 			const after = await ignoredScanRoots(cwd, hints);
 			return after !== undefined && samePathList(root.names, after.names) && samePathList(root.directories, after.directories) &&

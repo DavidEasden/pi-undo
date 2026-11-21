@@ -6,7 +6,7 @@
 
 use crate::directory::Directory;
 use crate::scan_directories::{
-    CachedDirectory, Repository, Response, ScanState, load_cache, scan, scan_changed, write_cache,
+    CachedDirectory, Repository, Response, ScanState, collect_leaves, load_cache, scan, scan_changed, write_cache,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
@@ -183,7 +183,7 @@ fn main_loop(
             busy.store(false, Ordering::Relaxed);
             continue;
         }
-        let _request: ScanRequest = match serde_json::from_slice(&line) {
+        let request: ScanRequest = match serde_json::from_slice(&line) {
             Ok(request) => request,
             Err(error) => {
                 write_error(&mut output, &format!("解析 scan 请求失败：{error}"))?;
@@ -191,6 +191,11 @@ fn main_loop(
                 continue;
             }
         };
+        if request.schema_version != SERVE_PROTOCOL_VERSION {
+            write_error(&mut output, "scan 协议版本不受支持")?;
+            output.flush().map_err(|error| error.to_string())?;
+            continue;
+        }
         let pending = state.watch.drain(false);
         let local_generation = pending.generation;
         let result = if pending.uncertain {
@@ -227,12 +232,19 @@ fn main_loop(
         };
         match result {
             Ok(response) => {
-                let payload = serde_json::json!({
+                let mut payload = serde_json::json!({
                     "ok": true,
                     "directories": response.directories,
                     "cacheHits": response.cache_hits,
                     "repositories": response.repositories,
                 });
+                if let Some(roots) = &request.leaf_roots {
+                    // 叶子与拓扑来自同一次事件排空和复核；无法给出完整列表时拒绝复用。
+                    payload["leaves"] = match collect_leaves(&state.directories, roots) {
+                        Ok(leaves) => serde_json::json!(leaves),
+                        Err(_) => serde_json::Value::Null,
+                    };
+                }
                 writeln!(output, "{payload}")
                     .map_err(|error| format!("写 serve 响应失败：{error}"))?;
             }
@@ -254,8 +266,9 @@ fn write_error(output: &mut impl std::io::Write, error: &str) -> Result<(), Stri
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ScanRequest {
-    #[allow(dead_code)]
     schema_version: u32,
+    #[serde(default)]
+    leaf_roots: Option<Vec<String>>,
 }
 
 /// 无事件时只返回已建缓存；workspace 身份仍在每次响应前验证。
@@ -316,8 +329,9 @@ fn assert_workspace_identity(state: &ResidentState) -> Result<(), String> {
     let current = fs::symlink_metadata(&state.workspace).map_err(|error| error.to_string())?;
     if !(current.is_dir()
         && current.dev() == state.workspace_dev
-        && current.ino() == state.workspace_ino)
-    {
+        && current.ino() == state.workspace_ino
+        && fs::canonicalize(&state.workspace).map_err(|error| error.to_string())? == state.workspace
+    ) {
         return Err("workspace 身份已变化".into());
     }
     Ok(())
@@ -642,13 +656,12 @@ mod watch_impl {
                 changed_paths: HashSet::new(),
                 uncertain: false,
             };
-            record_event_path(
-                &mut batch,
-                "/workspace",
-                "/workspace/repo",
-                EVENT_KERNEL_DROPPED,
-            );
-            assert!(batch.uncertain);
+            for flags in [EVENT_MUST_SCAN_SUBDIRS, EVENT_USER_DROPPED, EVENT_KERNEL_DROPPED,
+                EVENT_IDS_WRAPPED, EVENT_ROOT_CHANGED, EVENT_MOUNT, EVENT_UNMOUNT] {
+                batch.uncertain = false;
+                record_event_path(&mut batch, "/workspace", "/workspace/repo", flags);
+                assert!(batch.uncertain);
+            }
 
             let mut batch = EventBatch {
                 generation: 0,
@@ -656,6 +669,12 @@ mod watch_impl {
                 uncertain: false,
             };
             record_event_path(&mut batch, "/workspace", "/outside/repo", EVENT_ITEM_IS_DIR);
+            assert!(batch.uncertain);
+            batch.uncertain = false;
+            batch.changed_paths.clear();
+            for index in 0..=MAX_CHANGED_PATHS {
+                insert_changed_path(&mut batch, format!("dir-{index}"));
+            }
             assert!(batch.uncertain);
         }
     }

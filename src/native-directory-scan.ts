@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { GitRunError, runSupervisedProcess } from "./git-runner.ts";
-import { allowsNativeMountFastPaths, probeNativeCapabilities } from "./native-capabilities.ts";
+import { allowsNativeLeafCache, allowsNativeMountFastPaths, probeNativeCapabilities } from "./native-capabilities.ts";
 import { nativeExecutable } from "./native-restore.ts";
 import { checkOperation, configuredTimeout, OperationError, operationProcessOptions } from "./operation-context.ts";
 import { ResidentScanClient } from "./resident-scan-client.ts";
@@ -22,6 +22,8 @@ export interface NativeDirectoryScan {
 
 export interface NativeDirectoryScanPort {
 	scan(workspaceRoot: string): Promise<NativeDirectoryScan | undefined>;
+	/** 重新排空事件并核验缓存后，返回指定子树的完整文件/符号链接名。 */
+	scanLeaves?(workspaceRoot: string, roots: readonly string[]): Promise<string[] | undefined>;
 	/** 可选的会话级预热；测试替身和旧调用方无需实现。 */
 	prewarm?(workspaceRoot: string): void;
 	/** 运行时销毁时关闭常驻 helper，避免跨会话遗留进程。 */
@@ -179,6 +181,37 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 		} finally {
 			await rm(requestDirectory, { recursive: true, force: true }).catch(() => {});
 		}
+	}
+
+	async scanLeaves(workspaceRoot: string, roots: readonly string[]): Promise<string[] | undefined> {
+		checkOperation();
+		const resident = this.resident;
+		// 复用 discovery 已建立的监听；旧 helper、其他根和不可靠挂载保持原枚举。
+		if (resident?.workspaceRoot !== workspaceRoot ||
+			!await allowsNativeMountFastPaths(workspaceRoot) || !await allowsNativeLeafCache(workspaceRoot) ||
+			!(await this.capabilities)?.has("scan-serve-leaves-v1")) return undefined;
+		const response = await resident.client.scan(undefined, roots);
+		checkOperation();
+		if (response === undefined) return undefined;
+		if (parseResidentResponse(response) === undefined) {
+			resident.client.reset();
+			return undefined;
+		}
+		// null 表示子树含仓库标记、特殊项或超过预算，必须改由 Git 精确枚举。
+		if (response.leaves === null) return undefined;
+		const paths = response.leaves;
+		const seen = new Set<string>();
+		if (!Array.isArray(paths) || paths.length > 262_144 || paths.some((path) => {
+			if (typeof path !== "string" || path.includes("\0") ||
+				path.split("/").some((part) => part === "" || part === "." || part === ".." || part.toLowerCase() === ".git") ||
+				!roots.some((root) => path.startsWith(`${root}/`)) || seen.has(path)) return true;
+			seen.add(path);
+			return false;
+		})) {
+			resident.client.reset();
+			return undefined;
+		}
+		return paths as string[];
 	}
 
 	private async probeCapabilities(directory: string): Promise<ReadonlySet<string>> {

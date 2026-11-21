@@ -129,12 +129,12 @@ fn run() -> Result<(), String> {
     if first == "--capabilities" {
         #[cfg(target_os = "macos")]
         {
-            let capabilities = r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","inspect-batches-v1","scan-directories-v1","scan-directories-v2","scan-serve-v1","scan-serve-cache-v1","restore-files-v2","restore-files-v3"]}"#;
+            let capabilities = r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","inspect-batches-v1","scan-directories-v1","scan-directories-v2","scan-serve-v1","scan-serve-cache-v1","scan-serve-leaves-v1","restore-files-v2","restore-files-v3"]}"#;
             println!("{capabilities}");
         }
         #[cfg(target_os = "linux")]
         {
-            let capabilities = r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","inspect-batches-v1","scan-directories-v1","scan-directories-v2","scan-serve-v1","scan-serve-cache-v1","restore-files-v2","restore-files-v3"]}"#;
+            let capabilities = r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","inspect-batches-v1","scan-directories-v1","scan-directories-v2","scan-serve-v1","scan-serve-cache-v1","scan-serve-leaves-v1","restore-files-v2","restore-files-v3"]}"#;
             println!("{capabilities}");
         }
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]

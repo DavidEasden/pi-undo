@@ -1,5 +1,65 @@
 # 原生目录扫描与普通文件恢复性能验证
 
+## 精确忽略叶子复用（以 5bf6b54a 为基线）
+
+这次把常驻目录扫描已读取的文件/符号链接名称保存到 cache，并通过 `scan-serve-leaves-v1` 按需返回。持久 cache schema 升到 3；旧 schema 丢弃后重建，旧 helper 不接收新字段。每次获取叶子都重新排空事件、核验 workspace 身份、更新发生变化的目录；没有用操作作用域、根目录时间戳或过期时间代替子树变化检查。
+
+叶子复用只用于 Git 本次确认“整个目录忽略且没有 index 条目”的分区。分区祖先清单、目录绑定、忽略规则和 index 在前后继续核验；部分忽略目录、范围捕获和未分出的路径仍使用 Git 精确查询。符号链接只记录自身，不跟随目标。仓库标记、特殊项、重复路径、跨设备子树、协议错误、数量或字节预算超限都放弃叶子复用。只在本次验证的 macOS APFS 和 Linux ext 文件系统启用；其他文件系统、旧 helper、禁用 native 时沿用原枚举。
+
+### 先验证事件失效边界
+
+以下操作完成后立即请求扫描，没有为变化增加等待；结果对照实际目录树。叶子接入后的集成测试另把每次 manifest 的 `ignoredPresentPaths` 与 `git ls-files --others --ignored --exclude-standard -z` 逐项比较。
+
+| 场景 | macOS APFS | Linux ext4 |
+| --- | --- | --- |
+| 无变化 | 复用缓存 | 复用缓存 |
+| 深层文件增删、深层 Git 标记增删 | 更新受影响目录 | 更新受影响目录 |
+| 移入已有子树、移动后继续变化、移出、重命名 | 检测变化 | 检测变化 |
+| 目录替换为外部符号链接 | 只返回链接自身 | 只返回链接自身 |
+| helper 重启期间发生变化 | 先逐目录校验持久 cache | 先逐目录校验持久 cache |
+| 同一操作作用域内两次捕获之间新增深层文件 | 第二份证明包含新路径 | 第二份证明包含新路径 |
+| 叶子返回后改变忽略规则或 index | 原分区失效，重新取证 | 原分区失效，重新取证 |
+| 事件丢失/覆盖不完整 | loss flags、路径预算等注入测试要求完整校验 | 实际队列溢出后拒绝旧进程，重建监听 |
+
+Linux 队列溢出暴露了旧实现的正确性问题：暂停 helper 后创建/删除 18,000 次文件，再创建新子树，第一次请求会完整重扫，但新子树没有 watch；随后新增 `.git` 会错误命中旧缓存。现在队列溢出、卸载、意外 watch 丢失、监听遍历失败等状态不再恢复成“无事件”，客户端丢弃进程并重建完整监听。复测包含溢出后的第二次变化，已检测到新增标记。已知的目录删除会先清理 watch 映射，正常删除不会被误判成永久丢失。
+
+共享盘另做宿主机写入实验：macOS 创建深层文件后，Linux 能立即读取文件，inotify 事件字节数为 0。因此 FUSE 继续禁用常驻快路径，不能把“没收到事件”解释成“文件没变化”。
+
+### 同机交替 A/B
+
+macOS arm64 / APFS / Node 23.11.1；Ubuntu 24.04.3 arm64 虚拟机 / ext4 / Node 24；Pi SDK 1.4.0。两侧 helper 均用各平台同一工具链从对应源码构建，顺序执行三组，交换先后顺序。工作区含 10,000 个忽略文件、20,002 个目录。热捕获和 baseline 每组取五轮中位数，再取三组中位数；SDK 每组修改 1 个文件，执行三次 undo/redo 并断言内容和历史。
+
+| 指标 | macOS 基线 → 本轮 | Linux ext4 基线 → 本轮 |
+| --- | ---: | ---: |
+| 热完整捕获（不含目录发现） | 368 → 137 ms | 393 → 51 ms |
+| 热 baseline 检查（不含目录发现） | 344 → 113 ms | 383 → 45 ms |
+| SDK `agentSettled()` 到检查点可用 | 1,402 → 1,125 ms | 2,994 → 218 ms |
+| undo（每组三次的中位数） | 326 → 320 ms | 218 → 217 ms |
+| redo（每组三次的中位数） | 531 → 532 ms | 328 → 328 ms |
+| 首次完整捕获（不含目录发现） | 1,711 → 1,715 ms | 2,902 → 2,899 ms |
+
+热完整捕获的三组中位数分别为：macOS 基线 `[377,365,368]`、本轮 `[138,137,135]`；Linux 基线 `[382,400,393]`、本轮 `[50,53,51]`。baseline 分别为 macOS `[353,344,344]` → `[113,110,113]`、Linux `[376,393,383]` → `[44,46,45]`。检查点等待分别为 macOS `[1405,1402,1386]` → `[1124,1125,1129]`、Linux `[2994,3007,2969]` → `[209,226,218]`。
+
+主要收益是检查点证明，未证明 undo 或稳态 redo 提速。Linux 每组首次 redo 从 `[336,319,319]` ms 增至 `[435,446,423]` ms，增加约 100 ms；后两次 redo 的合并中位数约 329 → 325 ms。保留这项回归，不把后三次中位数当作所有操作都没有代价。首次捕获仍要建立精确证明，未见改善。
+
+Linux Parallels FUSE 上另做一次 3,000 包、修改 1 文件的同挂载回退对照：检查点 608 → 624 ms，undo 651 → 632 ms，redo 527 → 531 ms；这些差异不足以证明提速。该夹具的工作区和会话目录都在共享盘，运行代码在虚拟机本地盘。
+
+10,000 叶子的独立 helper 稳态 RSS 单次采样：macOS 23.17 → 26.91 MiB，Linux 19.73 → 23.88 MiB；持久目录 cache 分别从 3.38 → 3.71 MiB、3.26 → 3.58 MiB。新增叶子清单约增加 4 MiB 驻留内存，不涉及文件内容缓存。
+
+### 验证与复现
+
+macOS 完整套件通过 725 项、禁用 native 通过 675 项；Linux 完整套件通过 728 项、禁用 native 通过 677 项。平台能力和按需基准导致跳过数不同。新增 benchmark 默认跳过；最终边界修正另跑受影响测试。Rust 测试 macOS 23 项、Linux 26 项全部通过；两平台类型检查、打包检查通过。共享盘额外执行规则/index 变化和嵌套分区的两个回归用例，均通过。
+
+```sh
+npm run build:native
+# 将产物复制到本平台对应的 native/bin/pi-undo-fs-<平台>-<架构> 后运行。
+npx vitest run test/ignored-leaves.test.ts test/native-directory-scan.test.ts
+PI_UNDO_IGNORED_BENCHMARK=1 npx vitest run test/ignored-proof-benchmark.test.ts
+PI_UNDO_LARGE_WORKSPACE=1 npx vitest run test/large-workspace.test.ts -t '10000 个依赖包，修改 1 个文件'
+```
+
+两类基准均支持 `PI_UNDO_BENCH_REPORT` 追加 JSONL；忽略证明基准可用 `PI_UNDO_BENCH_PACKAGES=3000` 调整规模。通过 `TMPDIR` 控制夹具挂载，临时目录必须位于工作区之外。本轮更新仓库已有的 macOS/Linux arm64 二进制；其他架构和 Windows 未在本机执行，继续由发布矩阵构建。
+
 ## Linux 共享盘
 
 Linux arm64、Node 23.11.1、Pi 1.4.0 SDK。工作区和会话目录均放在同一 Parallels `fuse.prl_fsd` 挂载上。3,000 个 ignored 依赖包（6,002 个目录），每次只覆盖一个根目录文件。表中为每组连续三次操作的中位数；成功的用例同时断言文件内容与 undo/redo 栈。
@@ -354,7 +414,7 @@ restore 成功后 2 s 内的 racy-clean 窗口内，文件 ctime 尚未稳定，
 
 ### 仍未处理：ignored-present proof 的全量枚举
 
-`captureIgnoredPresentPaths` 每次完整 capture 仍执行 `git ls-files --others --ignored --exclude-standard`。本机 10,000 个 `node_modules` 忽略文件约 363 ms（`--directory` 可降到约 30 ms，但会丢失具体路径，无法直接替代 proof）。复用旧 proof 需要证明 ignored 子树的目录项集合未变，即把目录扫描的 cache 复用证据（或 FSEvents 代数）传递到 capture；这需要新的 helper 协议和缓存 schema 变更，本轮未实现，避免在恢复安全判定上引入未经复核的信任路径。当前只完成了同一条路径上 native inspect 部分的优化。
+当时 `captureIgnoredPresentPaths` 每次完整 capture 仍执行 `git ls-files --others --ignored --exclude-standard`。本机 10,000 个 `node_modules` 忽略文件约 363 ms（`--directory` 可降到约 30 ms，但会丢失具体路径，无法直接替代 proof）。复用旧 proof 需要证明 ignored 子树的目录项集合未变，因此该轮只完成了 native inspect 优化。本文开头的“精确忽略叶子复用”现已通过新 helper 能力与 cache schema 实现此方向；忽略规则和 index 仍实时复核。
 
 ### 测试与复现
 

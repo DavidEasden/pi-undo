@@ -100,6 +100,63 @@ if (process.argv[2] === "--capabilities") {
 		expect(requests[1].cachePath).toBe(requests[0].cachePath);
 	});
 
+	it.each([
+		undefined, null, ["../escape"], ["other/file"], ["deps/.git/config"], ["deps/one", "deps/one"],
+	])("叶子协议对不完整或越界响应回退：%j", async (leaves) => {
+		const value = await helper(`console.log(JSON.stringify({ ok: true, capabilities: ["scan-directories-v2", "scan-serve-v1", "scan-serve-leaves-v1"] }));`);
+		const mount = vi.spyOn(nativeCapabilities, "allowsNativeLeafCache").mockResolvedValue(true);
+		const response = { ok: true, directories: 1, repositories: [], leaves };
+		const scan = vi.spyOn(ResidentScanClient.prototype, "scan").mockResolvedValue(response);
+		const reset = vi.spyOn(ResidentScanClient.prototype, "reset");
+		const scanner = new NativeDirectoryScanner(value.path);
+		try {
+			await scanner.scan(value.directory);
+			await expect(scanner.scanLeaves(value.directory, ["deps"])).resolves.toBeUndefined();
+			expect(scan).toHaveBeenLastCalledWith(undefined, ["deps"]);
+			expect(reset).toHaveBeenCalledTimes(leaves === null ? 0 : 1);
+		} finally {
+			await scanner.dispose();
+			scan.mockRestore();
+			reset.mockRestore();
+			mount.mockRestore();
+		}
+	});
+
+	it("未验证的文件系统不请求叶子缓存", async () => {
+		const value = await helper(`console.log(JSON.stringify({ ok: true, capabilities: ["scan-directories-v2", "scan-serve-v1", "scan-serve-leaves-v1"] }));`);
+		const scan = vi.spyOn(ResidentScanClient.prototype, "scan").mockResolvedValue({ ok: true, directories: 1, repositories: [] });
+		const mount = vi.spyOn(nativeCapabilities, "allowsNativeLeafCache").mockResolvedValue(false);
+		const scanner = new NativeDirectoryScanner(value.path);
+		try {
+			await scanner.scan(value.directory);
+			await expect(scanner.scanLeaves(value.directory, ["deps"])).resolves.toBeUndefined();
+			expect(scan).toHaveBeenCalledTimes(1);
+		} finally {
+			await scanner.dispose();
+			scan.mockRestore();
+			mount.mockRestore();
+		}
+	});
+
+	it("旧 helper 不接收新叶子字段；挂载失去支持时也不继续请求缓存", async () => {
+		const value = await helper(`console.log(JSON.stringify({ ok: true, capabilities: ["scan-directories-v2", "scan-serve-v1"] }));`);
+		const scan = vi.spyOn(ResidentScanClient.prototype, "scan").mockResolvedValue({ ok: true, directories: 1, repositories: [] });
+		const scanner = new NativeDirectoryScanner(value.path);
+		try {
+			await scanner.scan(value.directory);
+			await expect(scanner.scanLeaves(value.directory, ["deps"])).resolves.toBeUndefined();
+			expect(scan).toHaveBeenCalledTimes(1);
+			const mount = vi.spyOn(nativeCapabilities, "allowsNativeMountFastPaths").mockResolvedValue(false);
+			try {
+				await expect(scanner.scanLeaves(value.directory, ["deps"])).resolves.toBeUndefined();
+				expect(scan).toHaveBeenCalledTimes(1);
+			} finally { mount.mockRestore(); }
+		} finally {
+			await scanner.dispose();
+			scan.mockRestore();
+		}
+	});
+
 	it.for([false, true])("临时目录位于工作区内时安全回退（符号链接=%s）", async (useSymlink) => {
 		const workspace = await root();
 		const temporaryRoot = join(workspace, "temporary");

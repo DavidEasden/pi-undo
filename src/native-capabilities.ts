@@ -15,6 +15,17 @@ export async function allowsNativeMountFastPaths(directory: string): Promise<boo
 	}
 }
 
+/** 叶子缓存目前只在已验证事件行为的本地 APFS/ext 文件系统上启用。 */
+export async function allowsNativeLeafCache(directory: string): Promise<boolean> {
+	try {
+		const { type } = await statfs(directory);
+		return (process.platform === "darwin" && type === 0x1a) ||
+			(process.platform === "linux" && type === 0xef53);
+	} catch {
+		return false;
+	}
+}
+
 /** 在私有目录探测，防止旧 helper 把 --capabilities 当成工作区里的请求文件。 */
 export async function probeNativeCapabilities(
 	executable: string,

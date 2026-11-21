@@ -92,6 +92,11 @@ export class RootDiscovery {
 		this.nativeScan.prewarm?.(workspaceRoot);
 	}
 
+	/** ignored 分区与拓扑发现共享常驻目录缓存，但每次请求都重新核验事件。 */
+	async scanIgnoredLeaves(workspaceRoot: string, roots: readonly string[]): Promise<string[] | undefined> {
+		return this.nativeScan.scanLeaves?.(workspaceRoot, roots);
+	}
+
 	/** 关闭 native 常驻扫描客户端。 */
 	async dispose(): Promise<void> {
 		await this.nativeScan.dispose?.();

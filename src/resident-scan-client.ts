@@ -45,12 +45,12 @@ export class ResidentScanClient {
 		return this.scan(5_000).then(() => undefined, () => undefined);
 	}
 
-	scan(timeoutMs = this.timeoutMs): Promise<JsonObject | undefined> {
+	scan(timeoutMs = this.timeoutMs, leafRoots?: readonly string[]): Promise<JsonObject | undefined> {
 		if (this.idleTimer !== undefined) clearTimeout(this.idleTimer);
 		this.pendingScans += 1;
 		const result = this.queue.then(
-			() => this.scanOne(timeoutMs),
-			() => this.scanOne(timeoutMs),
+			() => this.scanOne(timeoutMs, leafRoots),
+			() => this.scanOne(timeoutMs, leafRoots),
 		);
 		const settled = result.finally(() => {
 			this.pendingScans -= 1;
@@ -60,11 +60,14 @@ export class ResidentScanClient {
 		return settled;
 	}
 
-	private async scanOne(timeoutMs: number): Promise<JsonObject | undefined> {
+	private async scanOne(timeoutMs: number, leafRoots?: readonly string[]): Promise<JsonObject | undefined> {
 		if (this.closed) return undefined;
 		const child = await this.ensureChild(timeoutMs);
 		if (child === undefined) return undefined;
-		const line = await this.requestLine(child, JSON.stringify({ schemaVersion: 1 }), timeoutMs);
+		const line = await this.requestLine(child, JSON.stringify({
+			schemaVersion: 1,
+			...(leafRoots === undefined ? {} : { leafRoots }),
+		}), timeoutMs);
 		if (line === undefined) return undefined;
 		try {
 			return parseObject(line);
