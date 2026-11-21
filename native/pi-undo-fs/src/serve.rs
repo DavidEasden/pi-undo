@@ -38,6 +38,8 @@ struct EventBatch {
     generation: u64,
     changed_paths: HashSet<String>,
     uncertain: bool,
+    /// 仅普通文件目录项或明确的目录元数据事件，允许核验后复用无事件的近期子树。
+    file_entries_only: bool,
 }
 
 impl EventBatch {
@@ -46,6 +48,7 @@ impl EventBatch {
             generation: 0,
             changed_paths: HashSet::new(),
             uncertain: true,
+            file_entries_only: false,
         }
     }
 }
@@ -203,7 +206,7 @@ fn main_loop(
         } else if pending.changed_paths.is_empty() {
             serve_cached(&state).or_else(|_| serve_rescan(&mut state, &root))
         } else {
-            serve_local(&mut state, &root, &pending.changed_paths)
+            serve_local(&mut state, &root, &pending)
                 .or_else(|_| serve_rescan(&mut state, &root))
         };
         let late = state.watch.drain(true);
@@ -214,7 +217,7 @@ fn main_loop(
             let retry = if late.uncertain || late.changed_paths.is_empty() {
                 serve_rescan(&mut state, &root)
             } else {
-                serve_local(&mut state, &root, &late.changed_paths)
+                serve_local(&mut state, &root, &late)
                     .or_else(|_| serve_rescan(&mut state, &root))
             };
             if retry.is_ok() {
@@ -294,11 +297,12 @@ fn serve_cached(state: &ResidentState) -> Result<HitResponse, String> {
 fn serve_local(
     state: &mut ResidentState,
     root: &Directory,
-    changed_paths: &HashSet<String>,
+    events: &EventBatch,
 ) -> Result<HitResponse, String> {
     assert_workspace_identity(state)?;
     let (response, changed_cache, removed, reused) =
-        scan_changed(root, changed_paths, &state.directories).map_err(|error| error.to_string())?;
+        scan_changed(root, &events.changed_paths, &state.directories, events.file_entries_only && !events.uncertain)
+            .map_err(|error| error.to_string())?;
     for removed_path in removed {
         let prefix = format!("{removed_path}/");
         state
@@ -465,10 +469,18 @@ mod watch_impl {
     const EVENT_UNMOUNT: u32 = 0x00000080;
     const EVENT_ITEM_CREATED: u32 = 0x00000100;
     const EVENT_ITEM_REMOVED: u32 = 0x00000200;
+    const EVENT_ITEM_INODE_META_MOD: u32 = 0x00000400;
     const EVENT_ITEM_RENAMED: u32 = 0x00000800;
+    const EVENT_ITEM_MODIFIED: u32 = 0x00001000;
+    const EVENT_ITEM_FINDER_INFO_MOD: u32 = 0x00002000;
+    const EVENT_ITEM_CHANGE_OWNER: u32 = 0x00004000;
+    const EVENT_ITEM_XATTR_MOD: u32 = 0x00008000;
     const EVENT_ITEM_IS_FILE: u32 = 0x00010000;
     const EVENT_ITEM_IS_DIR: u32 = 0x00020000;
     const EVENT_ITEM_IS_SYMLINK: u32 = 0x00040000;
+    const EVENT_ITEM_IS_HARDLINK: u32 = 0x00100000;
+    const EVENT_ITEM_IS_LAST_HARDLINK: u32 = 0x00200000;
+    const EVENT_ITEM_CLONED: u32 = 0x00400000;
     const MAX_CHANGED_PATHS: usize = 8192;
 
     struct SharedEvents {
@@ -510,16 +522,21 @@ mod watch_impl {
             return;
         }
         let paths = event_paths as *const std::ffi::c_void;
+        let mut invalidates = false;
         for index in 0..num_events {
             let flags = unsafe { *event_flags.add(index) };
             let value = unsafe { CFArrayGetValueAtIndex(paths, index as isize) };
             let Some(event_path) = cf_string_to_string(value) else {
                 pending.uncertain = true;
+                invalidates = true;
                 continue;
             };
-            record_event_path(&mut pending, &events.workspace, &event_path, flags);
+            invalidates |= record_event_path(&mut pending, &events.workspace, &event_path, flags);
         }
-        events.generation.fetch_add(1, Ordering::Release);
+        // 代数只追踪会影响目录缓存的事件，否则 late drain 仍会把纯内容修改升级为全量重扫。
+        if invalidates {
+            events.generation.fetch_add(1, Ordering::Release);
+        }
     }
 
     fn cf_string_to_string(value: *const std::ffi::c_void) -> Option<String> {
@@ -548,7 +565,8 @@ mod watch_impl {
         String::from_utf8(buffer[..length].to_vec()).ok()
     }
 
-    fn record_event_path(batch: &mut EventBatch, workspace: &str, path: &str, flags: u32) {
+    /// 返回该事件是否使目录缓存失效；纯文件内容由上层快照捕获独立校验。
+    fn record_event_path(batch: &mut EventBatch, workspace: &str, path: &str, flags: u32) -> bool {
         const LOSS_FLAGS: u32 = EVENT_MUST_SCAN_SUBDIRS
             | EVENT_USER_DROPPED
             | EVENT_KERNEL_DROPPED
@@ -558,13 +576,13 @@ mod watch_impl {
             | EVENT_UNMOUNT;
         if flags & LOSS_FLAGS != 0 {
             batch.uncertain = true;
-            return;
+            return true;
         }
         let event_path = std::path::Path::new(path);
         let workspace_path = std::path::Path::new(workspace);
         let Ok(relative) = event_path.strip_prefix(workspace_path) else {
             batch.uncertain = true;
-            return;
+            return true;
         };
         let mut components = Vec::new();
         for component in relative.components() {
@@ -572,23 +590,44 @@ mod watch_impl {
                 std::path::Component::Normal(value) => {
                     let Some(value) = value.to_str() else {
                         batch.uncertain = true;
-                        return;
+                        return true;
                     };
                     components.push(value);
                 }
                 std::path::Component::CurDir => {}
                 _ => {
                     batch.uncertain = true;
-                    return;
+                    return true;
                 }
             }
         }
         let relative_path = components.join("/");
+        // 普通文件覆盖可同时携带 inode 元数据标志；它不改变目录项名称或类型。
+        // 只接受这两个确切组合，合并的结构变化、其他元数据变化和未知位均保留复核。
+        // 忽略规则、仓库指针、内容及权限仍由调用方实时读取，不依赖这里的目录缓存。
+        let content_flags = EVENT_ITEM_IS_FILE | EVENT_ITEM_MODIFIED;
+        if !relative_path.is_empty()
+            && (flags == content_flags || flags == (content_flags | EVENT_ITEM_INODE_META_MOD))
+        {
+            return false;
+        }
+        // 即使文件的 Created 与 Modified 合并，也必须重读父目录；只有其无事件子树可复用。
+        // 不接受未知位、符号链接或目录结构事件，避免把类型变化误判为普通文件变化。
+        const FILE_FLAGS: u32 = EVENT_ITEM_IS_FILE | EVENT_ITEM_CREATED | EVENT_ITEM_REMOVED
+            | EVENT_ITEM_RENAMED | EVENT_ITEM_MODIFIED | EVENT_ITEM_INODE_META_MOD
+            | EVENT_ITEM_FINDER_INFO_MOD | EVENT_ITEM_CHANGE_OWNER | EVENT_ITEM_XATTR_MOD
+            | EVENT_ITEM_IS_HARDLINK | EVENT_ITEM_IS_LAST_HARDLINK | EVENT_ITEM_CLONED;
+        let file_entry = !relative_path.is_empty()
+            && flags & EVENT_ITEM_IS_FILE != 0
+            && flags & (FILE_FLAGS & !(EVENT_ITEM_IS_FILE | EVENT_ITEM_IS_HARDLINK | EVENT_ITEM_IS_LAST_HARDLINK)) != 0
+            && flags & !FILE_FLAGS == 0;
+        let directory_metadata = flags == (EVENT_ITEM_IS_DIR | EVENT_ITEM_INODE_META_MOD);
+        batch.file_entries_only &= file_entry || directory_metadata;
         let is_directory = flags & EVENT_ITEM_IS_DIR != 0;
         let is_file_like = flags & (EVENT_ITEM_IS_FILE | EVENT_ITEM_IS_SYMLINK) != 0;
         if !is_directory && !is_file_like {
             batch.uncertain = true;
-            return;
+            return true;
         }
         let parent = std::path::Path::new(&relative_path)
             .parent()
@@ -601,9 +640,10 @@ mod watch_impl {
             if flags & (EVENT_ITEM_CREATED | EVENT_ITEM_REMOVED | EVENT_ITEM_RENAMED) != 0 {
                 insert_changed_path(batch, parent);
             }
-            return;
+            return true;
         }
         insert_changed_path(batch, parent);
+        true
     }
 
     fn insert_changed_path(batch: &mut EventBatch, path: String) {
@@ -619,12 +659,135 @@ mod watch_impl {
     mod tests {
         use super::*;
 
+        fn shared_events() -> SharedEvents {
+            SharedEvents {
+                workspace: "/workspace".into(),
+                pending: Mutex::new(EventBatch {
+                    generation: 0,
+                    changed_paths: HashSet::new(),
+                    uncertain: false,
+                    file_entries_only: true,
+                }),
+                generation: AtomicU64::new(0),
+                running: AtomicBool::new(true),
+            }
+        }
+
+        /// 经实际 FSEvents 回调注入批次，覆盖路径分类与代数更新的组合行为。
+        fn emit_events(events: &SharedEvents, items: &[(&str, u32)]) {
+            let paths = items.iter().map(|(path, _)| {
+                let path = CString::new(*path).unwrap();
+                let value = unsafe {
+                    CFStringCreateWithCString(std::ptr::null(), path.as_ptr(), K_CFSTRINGENCODING_UTF8)
+                };
+                assert!(!value.is_null());
+                value
+            }).collect::<Vec<_>>();
+            let array = unsafe {
+                CFArrayCreate(std::ptr::null(), paths.as_ptr(), paths.len() as isize, std::ptr::null())
+            };
+            assert!(!array.is_null());
+            let flags = items.iter().map(|(_, flags)| *flags).collect::<Vec<_>>();
+            on_events(
+                std::ptr::null(), events as *const SharedEvents as *mut _,
+                paths.len(), array, flags.as_ptr(), std::ptr::null(),
+            );
+            unsafe {
+                CFRelease(array);
+                for path in paths { CFRelease(path); }
+            }
+        }
+
+        #[test]
+        fn content_only_events_preserve_directory_cache_generation() {
+            let events = shared_events();
+            emit_events(&events, &[
+                ("/workspace/value.txt", EVENT_ITEM_IS_FILE | EVENT_ITEM_MODIFIED),
+                ("/workspace/deep/file", EVENT_ITEM_IS_FILE | EVENT_ITEM_MODIFIED | EVENT_ITEM_INODE_META_MOD),
+            ]);
+            assert_eq!(events.generation.load(Ordering::Acquire), 0);
+            let pending = events.pending.lock().unwrap();
+            assert!(pending.changed_paths.is_empty());
+            assert!(!pending.uncertain);
+        }
+
+        #[test]
+        fn coalesced_or_unknown_flags_never_take_the_content_only_path() {
+            let pure = EVENT_ITEM_IS_FILE | EVENT_ITEM_MODIFIED;
+            for flags in [pure, pure | EVENT_ITEM_INODE_META_MOD] {
+                for bit in 0..32 {
+                    let extra = 1u32 << bit;
+                    if extra & (pure | EVENT_ITEM_INODE_META_MOD) != 0 { continue; }
+                    let events = shared_events();
+                    emit_events(&events, &[("/workspace/repo/file", flags | extra)]);
+                    assert_eq!(events.generation.load(Ordering::Acquire), 1);
+                    let pending = events.pending.lock().unwrap();
+                    assert!(pending.uncertain || !pending.changed_paths.is_empty());
+                }
+            }
+            for flags in [EVENT_ITEM_MODIFIED, EVENT_ITEM_IS_FILE, EVENT_ITEM_IS_FILE | EVENT_ITEM_INODE_META_MOD,
+                EVENT_ITEM_IS_DIR | EVENT_ITEM_MODIFIED, EVENT_ITEM_IS_SYMLINK | EVENT_ITEM_MODIFIED] {
+                let events = shared_events();
+                emit_events(&events, &[("/workspace/repo/file", flags)]);
+                assert_eq!(events.generation.load(Ordering::Acquire), 1);
+            }
+        }
+
+        #[test]
+        fn content_events_do_not_hide_structural_events_or_unsafe_paths() {
+            let events = shared_events();
+            let modified = EVENT_ITEM_IS_FILE | EVENT_ITEM_MODIFIED;
+            let created = EVENT_ITEM_IS_FILE | EVENT_ITEM_CREATED;
+            emit_events(&events, &[
+                ("/workspace/value.txt", modified),
+                ("/workspace/deps/new", created),
+            ]);
+            assert_eq!(events.generation.load(Ordering::Acquire), 1);
+            assert_eq!(events.pending.lock().unwrap().changed_paths, HashSet::from(["deps".into()]));
+            // 同一路径再次变化仍推进代数；纯内容事件不得清除尚未消费的变化。
+            emit_events(&events, &[("/workspace/deps/new", created)]);
+            emit_events(&events, &[("/workspace/value.txt", modified)]);
+            assert_eq!(events.generation.load(Ordering::Acquire), 2);
+            assert!(events.pending.lock().unwrap().changed_paths.contains("deps"));
+            for path in ["/outside/value.txt", "/workspace/../outside/value.txt"] {
+                let events = shared_events();
+                emit_events(&events, &[(path, modified)]);
+                assert!(events.pending.lock().unwrap().uncertain);
+                assert_eq!(events.generation.load(Ordering::Acquire), 1);
+            }
+        }
+
+        #[test]
+        fn only_known_file_batches_allow_racy_sibling_reuse() {
+            let known = EVENT_ITEM_IS_FILE | EVENT_ITEM_CREATED | EVENT_ITEM_MODIFIED | EVENT_ITEM_INODE_META_MOD;
+            let events = shared_events();
+            emit_events(&events, &[
+                ("/workspace/value.txt", known),
+                ("/workspace", EVENT_ITEM_IS_DIR | EVENT_ITEM_INODE_META_MOD),
+                ("/workspace/other", EVENT_ITEM_IS_FILE | EVENT_ITEM_RENAMED | EVENT_ITEM_IS_HARDLINK),
+            ]);
+            assert!(events.pending.lock().unwrap().file_entries_only);
+            assert!(events.pending.lock().unwrap().changed_paths.contains(""));
+            for flags in [EVENT_ITEM_IS_DIR | EVENT_ITEM_CREATED,
+                EVENT_ITEM_IS_DIR | EVENT_ITEM_RENAMED,
+                EVENT_ITEM_IS_DIR | EVENT_ITEM_MODIFIED,
+                EVENT_ITEM_IS_SYMLINK | EVENT_ITEM_CREATED,
+                known | 0x80000000, EVENT_ITEM_IS_FILE, EVENT_USER_DROPPED] {
+                let events = shared_events();
+                emit_events(&events, &[("/workspace/value.txt", known), ("/workspace/deps", flags)]);
+                emit_events(&events, &[("/workspace/value.txt", known)]);
+                let pending = events.pending.lock().unwrap();
+                assert!(pending.uncertain || !pending.file_entries_only);
+            }
+        }
+
         #[test]
         fn file_and_directory_events_invalidate_their_parent_chain() {
             let mut batch = EventBatch {
                 generation: 0,
                 changed_paths: HashSet::new(),
                 uncertain: false,
+                file_entries_only: true,
             };
             record_event_path(
                 &mut batch,
@@ -655,6 +818,7 @@ mod watch_impl {
                 generation: 0,
                 changed_paths: HashSet::new(),
                 uncertain: false,
+                file_entries_only: true,
             };
             for flags in [EVENT_MUST_SCAN_SUBDIRS, EVENT_USER_DROPPED, EVENT_KERNEL_DROPPED,
                 EVENT_IDS_WRAPPED, EVENT_ROOT_CHANGED, EVENT_MOUNT, EVENT_UNMOUNT] {
@@ -667,6 +831,7 @@ mod watch_impl {
                 generation: 0,
                 changed_paths: HashSet::new(),
                 uncertain: false,
+                file_entries_only: true,
             };
             record_event_path(&mut batch, "/workspace", "/outside/repo", EVENT_ITEM_IS_DIR);
             assert!(batch.uncertain);
@@ -687,6 +852,7 @@ mod watch_impl {
                     generation: 0,
                     changed_paths: HashSet::new(),
                     uncertain: false,
+                    file_entries_only: true,
                 }),
                 generation: AtomicU64::new(0),
                 running: AtomicBool::new(false),
@@ -813,10 +979,12 @@ mod watch_impl {
             };
             let changed_paths = std::mem::take(&mut pending.changed_paths);
             let uncertain = std::mem::replace(&mut pending.uncertain, false);
+            let file_entries_only = std::mem::replace(&mut pending.file_entries_only, true);
             EventBatch {
                 generation,
                 changed_paths,
                 uncertain,
+                file_entries_only,
             }
         }
     }

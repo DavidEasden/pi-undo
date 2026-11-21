@@ -405,6 +405,7 @@ pub(crate) fn scan_changed(
     root: &Directory,
     changed: &HashSet<String>,
     previous: &BTreeMap<String, CachedDirectory>,
+    file_entries_only: bool,
 ) -> std::io::Result<(
     Response,
     BTreeMap<String, CachedDirectory>,
@@ -429,6 +430,7 @@ pub(crate) fn scan_changed(
         &mut next,
         &mut removed,
         &mut reused,
+        file_entries_only,
     )?;
     Ok((response, next, removed, reused))
 }
@@ -469,6 +471,7 @@ fn scan_changed_inner(
     next: &mut BTreeMap<String, CachedDirectory>,
     removed: &mut HashSet<String>,
     reused: &mut usize,
+    file_entries_only: bool,
 ) -> std::io::Result<()> {
     if depth > 128 {
         return Err(std::io::Error::new(
@@ -479,16 +482,16 @@ fn scan_changed_inner(
     let cached = previous.get(path);
     match local_scan_relation(path, changed) {
         LocalScanRelation::Unchanged => {
-            if let Some(count) = validate_cached_subtree(path, previous)? {
+            if let Some(count) = validate_cached_subtree(path, previous, file_entries_only.then_some(directory))? {
                 *reused += count;
                 return Ok(());
             }
         }
         LocalScanRelation::Ancestor => {
-            if let Some(cached) = cached.filter(|entry| !entry.racy) {
+            if let Some(cached) = cached.filter(|entry| !entry.racy || file_entries_only) {
                 return scan_cached_ancestor(
                     directory, path, depth, cached, changed, previous, response, next, removed,
-                    reused,
+                    reused, file_entries_only,
                 );
             }
         }
@@ -530,8 +533,8 @@ fn scan_changed_inner(
         } else {
             format!("{path}/{name}")
         };
-        if local_scan_relation(&child_path, changed) == LocalScanRelation::Unchanged {
-            if let Some(count) = validate_cached_subtree(&child_path, previous)? {
+        if !file_entries_only && local_scan_relation(&child_path, changed) == LocalScanRelation::Unchanged {
+            if let Some(count) = validate_cached_subtree(&child_path, previous, None)? {
                 *reused += count;
                 children.push(name);
                 continue;
@@ -548,6 +551,7 @@ fn scan_changed_inner(
             next,
             removed,
             reused,
+            file_entries_only,
         )?;
         directory.assert_child(name_os, &child)?;
         children.push(name);
@@ -584,6 +588,7 @@ fn scan_cached_ancestor(
     next: &mut BTreeMap<String, CachedDirectory>,
     removed: &mut HashSet<String>,
     reused: &mut usize,
+    file_entries_only: bool,
 ) -> std::io::Result<()> {
     let observed_at = SystemTime::now();
     let before = directory.file.metadata()?;
@@ -608,8 +613,8 @@ fn scan_cached_ancestor(
         } else {
             format!("{path}/{name}")
         };
-        if local_scan_relation(&child_path, changed) == LocalScanRelation::Unchanged {
-            if let Some(count) = validate_cached_subtree(&child_path, previous)? {
+        if !file_entries_only && local_scan_relation(&child_path, changed) == LocalScanRelation::Unchanged {
+            if let Some(count) = validate_cached_subtree(&child_path, previous, None)? {
                 *reused += count;
                 continue;
             }
@@ -625,6 +630,7 @@ fn scan_cached_ancestor(
             next,
             removed,
             reused,
+            file_entries_only,
         )?;
         directory.assert_child(OsStr::new(name), &child)?;
     }
@@ -640,11 +646,17 @@ fn scan_cached_ancestor(
 fn validate_cached_subtree(
     path: &str,
     previous: &BTreeMap<String, CachedDirectory>,
+    bound: Option<&Directory>,
 ) -> std::io::Result<Option<usize>> {
     let Some(root) = previous.get(path) else {
         return Ok(None);
     };
-    // 直接命中的 racy 目录重新枚举；无事件子树依赖 FSEvents 完整性并按整体复用。
+    if let Some(directory) = bound {
+        // 仅用于完整的普通文件事件批次：无事件子树先核验句柄身份和元数据。
+        // 近期时间戳无法独自证明未变；这里同时依赖已持续监听的完整事件覆盖。
+        return Ok(metadata_matches(root, &directory.file.metadata()?).then_some(1));
+    }
+    // 目录结构变化、未知标志和旧调用仍保留 racy 复核。
     if root.racy { Ok(None) } else { Ok(Some(1)) }
 }
 
@@ -982,6 +994,7 @@ mod tests {
             &Directory::open(&root).unwrap(),
             &changed,
             &cache.directories,
+            false,
         )
         .unwrap();
         assert!(
@@ -999,6 +1012,41 @@ mod tests {
     }
 
     #[test]
+    fn file_events_reuse_verified_racy_siblings_but_detect_binding_and_deep_changes() {
+        let root = crate::tests::fixture();
+        fs::create_dir_all(root.join("deps/a/deep")).unwrap();
+        fs::create_dir_all(root.join("other/deep")).unwrap();
+        let mut cache = verified_cache(&root);
+        for directory in cache.directories.values_mut() { directory.racy = true; }
+        let opened = Directory::open(&root).unwrap();
+        fs::write(root.join("new.txt"), "new").unwrap();
+        let changed = HashSet::from([String::new()]);
+        let (response, next, _, reused) = scan_changed(&opened, &changed, &cache.directories, true).unwrap();
+        assert_eq!(response.directories, 1);
+        assert_eq!(reused, 2);
+        assert_eq!(next.len(), 1);
+        assert!(next[""].leaves.as_ref().unwrap().contains(&"new.txt".into()));
+        let (conservative, _, _, _) = scan_changed(&opened, &changed, &cache.directories, false).unwrap();
+        assert!(conservative.directories > 1);
+        cache.directories.extend(next);
+        // 同批次深层文件新增必须重读实际父目录；其他近期子树仍可复用。
+        fs::write(root.join("deps/a/deep/new"), "new").unwrap();
+        let deep = HashSet::from([String::new(), "deps/a/deep".into()]);
+        let (_, next, _, _) = scan_changed(&opened, &deep, &cache.directories, true).unwrap();
+        assert!(next.contains_key("deps/a/deep"));
+        assert!(!next.contains_key("other"));
+        cache.directories.extend(next);
+        assert_eq!(collect_leaves(&cache.directories, &["deps".into()]).unwrap(), ["deps/a/deep/new"]);
+        // 即使调用方只传父目录变化，子目录绑定替换也不能沿用旧子树。
+        fs::rename(root.join("deps"), root.join("old-deps")).unwrap();
+        fs::create_dir_all(root.join("deps/replacement/.git")).unwrap();
+        let (response, next, _, _) = scan_changed(&opened, &changed, &cache.directories, true).unwrap();
+        assert!(response.repositories.iter().any(|repository| repository.path == "deps/replacement"));
+        assert!(next.contains_key("deps"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn changed_scan_detects_deleted_directory_in_event_parent() {
         let root = crate::tests::fixture();
         fs::create_dir_all(root.join("repo/old/.git")).unwrap();
@@ -1009,6 +1057,7 @@ mod tests {
             &Directory::open(&root).unwrap(),
             &changed,
             &cache.directories,
+            false,
         )
         .unwrap();
         assert!(
@@ -1224,6 +1273,7 @@ mod tests {
             &Directory::open(&root).unwrap(),
             &HashSet::from([String::from("deps/a/deep")]),
             &cache.directories,
+            false,
         ).unwrap();
         assert!(removed.is_empty());
         cache.directories.extend(next);

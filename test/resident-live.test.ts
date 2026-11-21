@@ -1,10 +1,11 @@
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { NativeDirectoryScanner } from "../src/native-directory-scan.ts";
+import { ResidentScanClient } from "../src/resident-scan-client.ts";
 import { nativeExecutable } from "../src/native-restore.ts";
 
 // 本地开发优先使用 cargo 产物；CI 的 package job 只有 native/bin 下的发布二进制。
@@ -12,6 +13,51 @@ const localBinary = join(process.cwd(), "native/pi-undo-fs/target/release/pi-und
 const binary = existsSync(localBinary) ? localBinary : nativeExecutable() ?? localBinary;
 
 describe.skipIf(process.env.PI_UNDO_RUN_RESIDENT_LIVE !== "1" || (process.platform !== "darwin" && process.platform !== "linux") || !existsSync(binary))("resident scan smoke", () => {
+	it.skipIf(process.platform !== "darwin")("近期目录缓存上的内容覆盖与合并结构事件仍更新叶子和仓库候选", async () => {
+		const base = await realpath(await mkdtemp(join(tmpdir(), "pi-undo-content-events-")));
+		const workspace = join(base, "workspace");
+		const cachePath = join(base, "directories.json");
+		const client = new ResidentScanClient(binary, workspace, 5_000, cachePath);
+		try {
+			await mkdir(join(workspace, "deps/p0/deep"), { recursive: true });
+			await writeFile(join(workspace, "value.txt"), "before\n");
+			await writeFile(join(workspace, "deps/p0/deep/file"), "before\n");
+			await Promise.all(Array.from({ length: 64 }, (_, index) =>
+				mkdir(join(workspace, "deps", `p${index}`, "deep"), { recursive: true })));
+			const scan = () => client.scan(undefined, ["deps"]);
+			expect(await scan()).toMatchObject({ ok: true, leaves: ["deps/p0/deep/file"] });
+			const cache = JSON.parse(await readFile(cachePath, "utf8"));
+			// 保留真实的近期缓存，防止测试只在 settled 目录上通过而漏掉原性能问题。
+			expect(cache.directories.deps.racy).toBe(true);
+			for (const content of ["after\n", "again\n"]) {
+				await writeFile(join(workspace, "value.txt"), content);
+				await writeFile(join(workspace, "deps/p0/deep/file"), content);
+				// 新文件的 Created 可能合并进来；这里验证结果，确切标志的命中行为由回调测试覆盖。
+				expect(await scan()).toMatchObject({ ok: true, leaves: ["deps/p0/deep/file"] });
+			}
+			// 同一批次同时包含内容覆盖和结构变化，结构变化不得被前者吞掉。
+			await writeFile(join(workspace, "value.txt"), "changed\n");
+			await writeFile(join(workspace, "deps/p1/deep/new"), "new\n");
+			await rm(join(workspace, "deps/p0/deep/file"));
+			expect(await scan()).toMatchObject({ ok: true, leaves: ["deps/p1/deep/new"] });
+			await rename(join(workspace, "deps/p1"), join(workspace, "deps/moved"));
+			expect(await scan()).toMatchObject({ ok: true, leaves: ["deps/moved/deep/new"] });
+			await rm(join(workspace, "deps/moved"), { recursive: true });
+			await mkdir(join(base, "outside/.git"), { recursive: true });
+			await symlink(join(base, "outside"), join(workspace, "deps/moved"));
+			expect(await scan()).toMatchObject({ ok: true, leaves: ["deps/moved"], repositories: [] });
+			await writeFile(join(workspace, "deps/p2/deep/.git"), "invalid\n");
+			const marked = await scan();
+			expect(marked).toMatchObject({ ok: true, leaves: null,
+				repositories: [expect.objectContaining({ path: "deps/p2/deep" })] });
+			await rm(join(workspace, "deps/p2/deep/.git"));
+			expect(await scan()).toMatchObject({ ok: true, leaves: ["deps/moved"], repositories: [] });
+		} finally {
+			await client.close();
+			await rm(base, { recursive: true, force: true });
+		}
+	});
+
 	it("预热后复用缓存并在目录事件后重扫", async () => {
 		const root = await realpath(await mkdtemp(join(tmpdir(), "pi-undo-resident-live-")));
 		const scanner = new NativeDirectoryScanner(binary);

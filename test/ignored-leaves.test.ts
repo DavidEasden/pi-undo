@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -56,6 +56,39 @@ describe.skipIf(process.env.PI_UNDO_DISABLE_NATIVE === "1" || binary === undefin
 			await expect(leaves()).resolves.toEqual(["deps/b", "deps/link"]);
 		} finally {
 			await scanner.dispose();
+			await rm(base, { recursive: true, force: true });
+		}
+	});
+
+	it("目录结构复用后仍捕获同长度内容覆盖、执行权限和忽略规则变化", async (context) => {
+		const base = await realpath(await mkdtemp(join(tmpdir(), "pi-undo-content-capture-")));
+		const workspace = join(base, "workspace");
+		await createGitRepo(workspace);
+		const scanner = new NativeDirectoryScanner(binary);
+		const discovery = new RootDiscovery(new GitRunner(), scanner);
+		const store = new SnapshotStore({ storeRoot: join(base, "store"), discovery });
+		try {
+			if (!await allowsNativeLeafCache(workspace)) return context.skip();
+			await writeFixtureFile(workspace, ".gitignore", "deps/\n*.log\n");
+			await writeFixtureFile(workspace, "value.txt", "before\n");
+			await writeFixtureFile(workspace, "output.log", "ignored\n");
+			await Promise.all(Array.from({ length: 64 }, (_, index) =>
+				mkdir(join(workspace, "deps", `p${index}`), { recursive: true })));
+			let baseline = await store.capture(await discovery.discover(workspace));
+			await writeFile(join(workspace, "value.txt"), "after!\n");
+			await chmod(join(workspace, "value.txt"), 0o755);
+			const after = await store.captureBaseline(await discovery.discover(workspace), baseline);
+			const entry = (await store.listTree(after.manifestId, ".")).find((entry) => entry.relativePath === "value.txt");
+			expect(entry).toMatchObject({ kind: "file", mode: 0o100755 });
+			expect(Buffer.from(await store.readBlob(after.manifestId, ".", entry!.blobId!)).toString("utf8")).toBe("after!\n");
+			expect(after.roots[0]?.ignoredPresentPaths).toContain("output.log");
+			baseline = after;
+			await writeFile(join(workspace, ".gitignore"), "deps/\n*.tmp\n");
+			const reclassified = await store.captureBaseline(await discovery.discover(workspace), baseline);
+			expect(reclassified.roots[0]?.ignoredPresentPaths).not.toContain("output.log");
+			expect((await store.listTree(reclassified.manifestId, ".")).map((entry) => entry.relativePath)).toContain("output.log");
+		} finally {
+			await discovery.dispose();
 			await rm(base, { recursive: true, force: true });
 		}
 	});

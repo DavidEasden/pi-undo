@@ -1,6 +1,7 @@
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -19,6 +20,14 @@ describe.skipIf(process.env.PI_UNDO_LARGE_WORKSPACE !== "1")("大型工作区真
 	])("$packages 个依赖包，修改 $changedFiles 个文件", async ({ packages, changedFiles }) => {
 		const temp = await createTempRoot();
 		await writeFile(join(temp.workspace, ".gitignore"), "node_modules/\n");
+		const paths = Array.from({ length: changedFiles }, (_, index) => `value-${index}.txt`);
+		const createVisibleFiles = () => Promise.all(paths.map((path) => writeFile(join(temp.workspace, path), "before\n")));
+		const existingFiles = process.env.PI_UNDO_BENCH_EXISTING_FILES === "1";
+		if (existingFiles) {
+			await createVisibleFiles();
+			// 另测已有文件覆盖；避开 Created 合并事件后再建依赖，保留近期目录缓存。
+			await delay(2_100);
+		}
 		for (let offset = 0; offset < packages; offset += 64) {
 			await Promise.all(Array.from({ length: Math.min(64, packages - offset) }, async (_, index) => {
 				const directory = join(temp.workspace, "node_modules", `package-${offset + index}`, "lib");
@@ -26,8 +35,7 @@ describe.skipIf(process.env.PI_UNDO_LARGE_WORKSPACE !== "1")("大型工作区真
 				await writeFile(join(directory, "index.js"), "依赖内容\n");
 			}));
 		}
-		const paths = Array.from({ length: changedFiles }, (_, index) => `value-${index}.txt`);
-		await Promise.all(paths.map((path) => writeFile(join(temp.workspace, path), "before\n")));
+		if (!existingFiles) await createVisibleFiles();
 		const harness = await createHarness({
 			workspace: temp.workspace, agentDir: temp.agentDir,
 			sessionManager: SessionManager.create(temp.workspace, temp.sessionDir),
@@ -92,7 +100,7 @@ describe.skipIf(process.env.PI_UNDO_LARGE_WORKSPACE !== "1")("大型工作区真
 				expect(scan).toBeLessThanOrEqual(maxScans);
 			}
 			const report = JSON.stringify({
-				packages, changedFiles, checkpointMs, timingsMs: timings, redoTimingsMs: redoTimings, scans,
+				packages, changedFiles, existingFiles, checkpointMs, timingsMs: timings, redoTimingsMs: redoTimings, scans,
 				nativeDisabled: process.env.PI_UNDO_DISABLE_NATIVE === "1",
 				medianMs: [...timings].sort((a, b) => a - b)[1],
 				peakRssMiB: Math.round(peakRss / 1024 / 1024),
