@@ -1,13 +1,19 @@
-import { describe, expect, it } from "vitest";
+import { generateDiffString, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { describe, expect, it, vi } from "vitest";
+
+import { compareDiffText } from "../src/diff-text.ts";
+import { browseDiff } from "../src/diff-ui.ts";
 
 import {
 	buildFileLabel,
 	computeCheckpointDiff,
 	formatDiffSummary,
+	prepareCheckpointDiff,
 	sanitizeDisplayText,
 	type DiffSource,
 } from "../src/diff-view.ts";
 import type { ManifestId, RestorePath, SnapshotManifest, SnapshotRoot } from "../src/model.ts";
+import { SnapshotStore } from "../src/snapshot-store.ts";
 
 const beforeId = "a".repeat(64) as ManifestId;
 const afterId = "b".repeat(64) as ManifestId;
@@ -111,6 +117,103 @@ describe("computeCheckpointDiff", () => {
 		expect(diffs.find((diff) => diff.path === "modified.ts")?.diff).toContain("-1 const value = 1;");
 		expect(diffs.find((diff) => diff.path === "modified.ts")?.diff).toContain("+1 const value = 2;");
 		expect(diffs.some((diff) => diff.path === "empty-dir")).toBe(false);
+	});
+
+	it("按所属 root 查询变更，浏览列表只在选中文件时读取该文件", async () => {
+		const base = source();
+		const reads = vi.spyOn(base, "readBlob");
+		const lists = vi.spyOn(base, "listTree");
+		const view = await prepareCheckpointDiff(base, {
+			beforeManifestId: beforeId, afterManifestId: afterId, changedPaths: ["nested/child.ts", "added.ts"],
+		});
+		expect(lists.mock.calls).toEqual(expect.arrayContaining([
+			[beforeId, ".", ["added.ts"]], [afterId, ".", ["added.ts"]],
+			[beforeId, "nested", ["child.ts"]], [afterId, "nested", ["child.ts"]],
+		]));
+		expect(reads).not.toHaveBeenCalled();
+		const select = vi.fn().mockResolvedValueOnce("M nested/child.ts").mockResolvedValueOnce("M nested/child.ts")
+			.mockResolvedValueOnce(undefined);
+		const custom = vi.fn();
+		await browseDiff({ ui: { select, custom } } as unknown as ExtensionCommandContext, "Run", view, () => true);
+		expect(custom).toHaveBeenCalledTimes(2);
+		expect(reads.mock.calls).toEqual([
+			[beforeId, "nested", "old-child", "child.ts"], [afterId, "nested", "new-child", "child.ts"],
+		]);
+	});
+
+	it("超过字节预算分批，超大单文件独占一批，保留 checkpoint 路径顺序", async () => {
+		const paths = ["z", "a", "huge", "b"];
+		const entries = paths.map((p) => file(p, p, (p === "huge" ? 20 : 5) * 1024 * 1024));
+		const base = source();
+		base.listTree = async () => entries;
+		base.readBlob = async () => Buffer.from("短正文");
+		const batches = vi.spyOn(SnapshotStore, "readBlobs");
+		try {
+			const diffs = await computeCheckpointDiff(base, {
+				beforeManifestId: beforeId, afterManifestId: afterId, changedPaths: paths,
+			});
+			expect(diffs.map((diff) => diff.path)).toEqual(paths);
+			for (const id of [beforeId, afterId]) {
+				expect(batches.mock.calls.filter(([, manifest]) => manifest === id)
+					.map(([, , requests]) => requests.map((r) => r.relativePath))).toEqual([["z"], ["a"], ["huge"], ["b"]]);
+			}
+		} finally {
+			batches.mockRestore();
+		}
+	});
+
+	it("空范围无需列树，损坏的正文在实际打开时报告错误", async () => {
+		const base = source();
+		const lists = vi.spyOn(base, "listTree");
+		const request = { beforeManifestId: beforeId, afterManifestId: afterId, changedPaths: [] };
+		expect(await computeCheckpointDiff(base, request)).toEqual([]);
+		expect(lists).not.toHaveBeenCalled();
+		vi.spyOn(base, "readBlob").mockRejectedValue(new Error("缺少 blob"));
+		const view = await prepareCheckpointDiff(base, { ...request, changedPaths: ["added.ts"] });
+		await expect(view.loadFile(view.files[0]!)).rejects.toThrow("缺少 blob");
+	});
+
+	it("按有效字节范围解码，保留 BOM，并将无效 UTF-8 视为二进制", async () => {
+		const base = source();
+		const read = vi.spyOn(base, "readBlob");
+		const request = { beforeManifestId: beforeId, afterManifestId: afterId, changedPaths: ["added.ts"] };
+		read.mockResolvedValueOnce(Buffer.from("\0\uFEFF新增\n\0").subarray(1, -1));
+		expect((await computeCheckpointDiff(base, request))[0]?.diff).toBe("+1 \uFEFF新增");
+		read.mockResolvedValueOnce(Uint8Array.of(0xc0, 0xaf));
+		expect((await computeCheckpointDiff(base, request))[0]?.kind).toBe("binary");
+	});
+
+	it("匹配普通变更的 Pi 输出，包括换行、重复行、行号宽度与多段上下文", () => {
+		const context = Array.from({ length: 18 }, (_, i) => i + "\n").join("");
+		for (const [left, right] of [
+			["", "\n\n"], ["abc", ""], ["a\r\n", "a\n"], ["a", "a\n"], ["a\na\nb\n", "a\nb\na\n"],
+			[context, "A\n" + context + "B"], [context + "x\n" + context, context + "y\n" + context],
+		]) {
+			const expected = generateDiffString(left!, right!).diff;
+			const actual = compareDiffText(left!, right!);
+			expect(actual.diff).toBe(expected);
+			expect(actual.additions).toBe(expected.split("\n").filter((line) => line.startsWith("+")).length);
+			expect(actual.deletions).toBe(expected.split("\n").filter((line) => line.startsWith("-")).length);
+		}
+	});
+
+	it("超出搜索预算只替换变化区间，整块统计在摘要中带标记", async () => {
+		const base = source();
+		const common = "相同\n".repeat(8);
+		const block = (value: string) => common + (value + "\n").repeat(400) + common;
+		vi.spyOn(base, "readBlob").mockImplementation(async (id) => Buffer.from(block(id === beforeId ? "甲" : "乙")));
+		const view = await prepareCheckpointDiff(base, {
+			beforeManifestId: beforeId, afterManifestId: afterId, changedPaths: ["modified.ts"],
+		});
+		const file = await view.loadFile(view.files[0]!);
+		expect(file).toMatchObject({ simplified: true, additions: 400, deletions: 400 });
+		expect(file.diff).toContain("-  9 甲");
+		expect(file.diff).toContain("+408 乙");
+		expect(await view.summary()).toBe(formatDiffSummary([file]));
+		expect(await view.summary()).toContain("block replacement");
+		expect(compareDiffText(common, "插入\n".repeat(800) + common)).toMatchObject({
+			additions: 800, deletions: 0, simplified: false,
+		});
 	});
 
 	it("格式化文件标签与非 TUI 摘要", async () => {

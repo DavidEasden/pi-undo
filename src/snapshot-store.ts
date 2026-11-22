@@ -395,13 +395,13 @@ export class SnapshotStore {
 	}
 
 	static async readBlobs(
-		store: SnapshotStore,
+		store: Pick<SnapshotStore, "readBlob">,
 		id: ManifestId,
 		requests: readonly SnapshotBlobRequest[],
 	): Promise<readonly Uint8Array[]> {
 		if (requests.length === 0) return [];
-		if (SnapshotStore.supportsValidatedBlobBatch(store)) {
-			return (store as SnapshotStore).readBlobsValidated(id, requests);
+		if (store instanceof SnapshotStore && SnapshotStore.supportsValidatedBlobBatch(store)) {
+			return store.readBlobsValidated(id, requests);
 		}
 		const result: Uint8Array[] = [];
 		for (const request of requests) {

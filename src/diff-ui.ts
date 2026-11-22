@@ -1,8 +1,8 @@
 import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { renderDiff } from "@earendil-works/pi-coding-agent";
-import { type Component, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 
-import { buildFileLabel, type FileDiff, sanitizeDisplayText } from "./diff-view.ts";
+import { buildFileLabel, type CheckpointDiff, type FileDiff, sanitizeDisplayText } from "./diff-view.ts";
 
 const CLOSE_LABEL = "← Close";
 
@@ -10,26 +10,28 @@ const CLOSE_LABEL = "← Close";
  * 在 TUI 中交互浏览一次 Agent run 的逐文件 diff：
  * 上层 select 列出改动文件，选中后用可滚动彩色查看器展示该文件 diff，返回后回到列表。
  */
-export async function browseDiff(context: ExtensionCommandContext, title: string, diffs: readonly FileDiff[]): Promise<void> {
-	const labels = new Map<string, FileDiff>();
-	const options: string[] = [];
-	for (const diff of diffs) {
-		const label = uniqueLabel(buildFileLabel(diff), labels);
-		labels.set(label, diff);
-		options.push(label);
-	}
-	options.push(CLOSE_LABEL);
+export async function browseDiff(
+	context: ExtensionCommandContext,
+	title: string,
+	view: CheckpointDiff,
+	isActive: () => boolean,
+): Promise<void> {
+	const labels = new Map<string, CheckpointDiff["files"][number]>();
+	for (const file of view.files) labels.set(uniqueLabel(buildFileLabel(file), labels), file);
+	const options = [...labels.keys(), CLOSE_LABEL];
+	let last: FileDiff | undefined;
 
-	for (;;) {
+	while (isActive()) {
 		const choice = await context.ui.select(title, options);
-		if (choice === undefined || choice === CLOSE_LABEL) return;
-		const diff = labels.get(choice);
-		if (diff === undefined) return;
-		await showFileDiff(context, diff);
+		if (!isActive() || choice === undefined || choice === CLOSE_LABEL) return;
+		const file = labels.get(choice);
+		if (file === undefined) return;
+		if (last?.path !== file.path) last = await view.loadFile(file);
+		if (isActive()) await showFileDiff(context, last);
 	}
 }
 
-function uniqueLabel(label: string, used: ReadonlyMap<string, FileDiff>): string {
+function uniqueLabel(label: string, used: ReadonlyMap<string, unknown>): string {
 	if (!used.has(label)) return label;
 	let index = 2;
 	while (used.has(`${label} (${index})`)) index += 1;
@@ -47,6 +49,7 @@ async function showFileDiff(context: ExtensionCommandContext, diff: FileDiff): P
 class DiffViewer implements Component {
 	private readonly lines: readonly string[];
 	private offset = 0;
+	private readonly colorVisibleLines: boolean;
 
 	constructor(
 		private readonly tui: { requestRender(force?: boolean): void },
@@ -54,6 +57,8 @@ class DiffViewer implements Component {
 		private readonly diff: FileDiff,
 		private readonly done: (result: void) => void,
 	) {
+		// 大 patch 只给视口内的行着色；超长单行跳过昂贵的词级对齐。
+		this.colorVisibleLines = diff.diff.length > 32_768 || /[^\n]{1025}/.test(diff.diff);
 		this.lines = this.buildLines();
 	}
 
@@ -62,7 +67,7 @@ class DiffViewer implements Component {
 	private buildLines(): string[] {
 		if (this.diff.kind === "binary") return [this.theme.fg("dim", "Binary file changed; line-by-line diff unavailable.")];
 		if (this.diff.diff === "") return [this.theme.fg("dim", "No textual change (mode or type only).")];
-		return renderDiff(this.diff.diff).split("\n");
+		return (this.colorVisibleLines ? this.diff.diff : renderDiff(this.diff.diff)).split("\n");
 	}
 
 	private viewportRows(): number {
@@ -98,13 +103,18 @@ class DiffViewer implements Component {
 		this.offset = Math.max(0, Math.min(this.maxOffset(), this.offset));
 		const stats = this.diff.kind === "binary"
 			? "binary"
-			: `+${this.diff.additions} -${this.diff.deletions}`;
+			: `+${this.diff.additions} -${this.diff.deletions}${this.diff.simplified ? " (block replacement)" : ""}`;
 		const safePath = sanitizeDisplayText(this.diff.path, 240);
 		const header = truncateToWidth(this.theme.fg("accent", `${this.diff.status.toUpperCase()} ${safePath}`) + this.theme.fg("dim", `  ${stats}`), width);
 		const out: string[] = [header, this.theme.fg("borderMuted", "─".repeat(Math.min(width, 80)))];
 		const visible = this.lines.slice(this.offset, this.offset + rows);
 		for (const line of visible) {
-			out.push(visibleWidth(line) > width ? truncateToWidth(line, width) : line);
+			if (this.colorVisibleLines) {
+				const color = line.startsWith("-") ? "toolDiffRemoved" : line.startsWith("+") ? "toolDiffAdded" : "toolDiffContext";
+				out.push(this.theme.fg(color, truncateToWidth(line.replace(/\t/g, "   "), width)));
+			} else {
+				out.push(truncateToWidth(line, width));
+			}
 		}
 		for (let index = visible.length; index < rows; index += 1) out.push("");
 		const position = this.lines.length <= rows

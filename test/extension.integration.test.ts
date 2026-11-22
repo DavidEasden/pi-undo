@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import extension, { createPiUndoExtension } from "../extensions/pi-undo.ts";
 import type { OperationResult } from "../src/controller.ts";
 import { StatusReporter } from "../src/status-reporter.ts";
@@ -614,12 +614,13 @@ describe("pi-undo extension", () => {
 		expect(editor).toBe("原始 prompt");
 	});
 
-	it("/diff 在非 TUI 模式输出最近 run 的文件与行数摘要", async () => {
+	it("/diff 在非 TUI 模式输出行数摘要，在 TUI 取消选择时无需读取正文", async () => {
 		const handlers = new Map<string, (event: any, context: any) => any>();
 		const commands = new Map<string, (args: string, context: any) => Promise<void>>();
 		const notifications: string[] = [];
 		const beforeId = "a".repeat(64);
 		const afterId = "b".repeat(64);
+		let blobReads = 0;
 		const checkpoint = {
 			beforeManifestId: beforeId,
 			afterManifestId: afterId,
@@ -672,13 +673,22 @@ describe("pi-undo extension", () => {
 					relativePath: "src/value.ts", kind: "file" as const, mode: 0o100644,
 					blobId: id === beforeId ? "old" : "new", size: 4, rootHash: "tree",
 				}],
-				readBlob: async (_id: any, _root: string, blobId: string) => Buffer.from(blobId === "old" ? "old\n" : "new\n"),
+				readBlob: async (_id: any, _root: string, blobId: string) => {
+					blobReads++;
+					return Buffer.from(blobId === "old" ? "old\n" : "new\n");
+				},
 			},
 		}))(pi);
 		await handlers.get("session_start")!({}, context);
 
 		await commands.get("diff")!("", context);
 		expect(notifications).toEqual(["Run #1: 更新 value — 1 file(s), +1 -1: src/value.ts"]);
+		expect(blobReads).toBe(2);
+
+		const select = vi.fn().mockResolvedValue(undefined);
+		await commands.get("diff")!("", { ...context, mode: "tui", ui: { ...context.ui, select } });
+		expect(select).toHaveBeenCalledWith("Run #1: 更新 value", ["M src/value.ts", "← Close"]);
+		expect(blobReads).toBe(2);
 	});
 
 	it("/diff 在没有历史时给出提示", async () => {

@@ -12,7 +12,7 @@ import type {
 
 import type { OperationResult, SessionTreeEvent, UndoController } from "../src/controller.ts";
 import { browseDiff } from "../src/diff-ui.ts";
-import { computeCheckpointDiff, type DiffSource, formatDiffSummary, sanitizeDisplayText } from "../src/diff-view.ts";
+import { prepareCheckpointDiff, type DiffSource, sanitizeDisplayText } from "../src/diff-view.ts";
 import { createPiUndoRuntime } from "../src/pi-runtime.ts";
 import { StatusReporter } from "../src/status-reporter.ts";
 
@@ -243,24 +243,21 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 			}
 			// 1 = 最近一次 run（栈顶）。
 			const checkpoint = checkpoints[checkpoints.length - position]!;
-			let diffs;
-			try {
-				diffs = await computeCheckpointDiff(active.diffSource, checkpoint);
-			} catch (error) {
-				context.ui.notify(`Unable to load diff: ${sanitizeDisplayText(errorMessage(error), 120)}`, "error");
-				return;
-			}
-			if (runtime !== active) return;
-			if (diffs.length === 0) {
-				context.ui.notify("This run changed no files", "info");
-				return;
-			}
 			const label = runLabel(checkpoint.rawPrompt, position);
-			if (context.mode !== "tui") {
-				context.ui.notify(`${label} — ${formatDiffSummary(diffs)}`, "info");
-				return;
+			try {
+				const diff = await prepareCheckpointDiff(active.diffSource, checkpoint);
+				if (runtime !== active) return;
+				if (diff.files.length === 0) {
+					context.ui.notify("This run changed no files", "info");
+				} else if (context.mode === "tui") {
+					await browseDiff(context, label, diff, () => runtime === active);
+				} else {
+					const summary = await diff.summary();
+					if (runtime === active) context.ui.notify(`${label} — ${summary}`, "info");
+				}
+			} catch (error) {
+				if (runtime === active) context.ui.notify(`Unable to load diff: ${sanitizeDisplayText(errorMessage(error), 120)}`, "error");
 			}
-			await browseDiff(context, label, diffs);
 		};
 
 		pi.registerCommand("undo", {

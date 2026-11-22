@@ -56,6 +56,7 @@
 		"@earendil-works/pi-tui": ">=1.2.0"
 	},
 	"dependencies": {
+		"diff": "8.0.4",
 		"proper-lockfile": "4.1.2"
 	},
 	"devDependencies": {
