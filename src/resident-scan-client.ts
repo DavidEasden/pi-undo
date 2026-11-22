@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
 import { currentOperationContext } from "./operation-context.ts";
+import { ResidentResponseBuffer } from "./resident-response-buffer.ts";
 
 const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
 
@@ -26,7 +27,7 @@ export class ResidentScanClient {
 	private starting: Promise<ChildProcessWithoutNullStreams | undefined> | undefined;
 	private queue: Promise<unknown> = Promise.resolve();
 	private pendingScans = 0;
-	private buffer = "";
+	private readonly buffer = new ResidentResponseBuffer(MAX_RESPONSE_BYTES);
 	private waiter: LineWaiter | undefined;
 	private closed = false;
 	private idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -95,7 +96,7 @@ export class ResidentScanClient {
 			return undefined;
 		}
 		this.child = child;
-		this.buffer = "";
+		this.buffer.clear();
 		child.stdout.setEncoding("utf8");
 		child.stdout.on("data", (chunk: string | Buffer) => this.receive(child, chunk.toString()));
 		child.stderr.resume();
@@ -139,7 +140,7 @@ export class ResidentScanClient {
 	}
 
 	private readLine(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<string | undefined> {
-		const buffered = this.takeLine();
+		const buffered = this.buffer.takeLine();
 		if (buffered !== undefined) return Promise.resolve(buffered);
 		if (this.waiter !== undefined) return Promise.resolve(undefined);
 		const context = currentOperationContext();
@@ -169,27 +170,16 @@ export class ResidentScanClient {
 
 	private receive(child: ChildProcessWithoutNullStreams, chunk: string): void {
 		if (this.child !== child) return;
-		this.buffer += chunk;
-		if (Buffer.byteLength(this.buffer, "utf8") > MAX_RESPONSE_BYTES) {
-			const waiter = this.waiter;
+		if (!this.buffer.append(chunk)) {
 			this.invalidate(child);
-			waiter?.resolve(undefined);
 			return;
 		}
 		const waiter = this.waiter;
 		if (waiter === undefined) return;
-		const line = this.takeLine();
+		const line = this.buffer.takeLine();
 		if (line === undefined) return;
 		this.detachWaiter(child);
 		waiter.resolve(line);
-	}
-
-	private takeLine(): string | undefined {
-		const newline = this.buffer.indexOf("\n");
-		if (newline < 0) return undefined;
-		const line = this.buffer.slice(0, newline);
-		this.buffer = this.buffer.slice(newline + 1);
-		return line.endsWith("\r") ? line.slice(0, -1) : line;
 	}
 
 	private detachWaiter(child: ChildProcessWithoutNullStreams): LineWaiter | undefined {
@@ -207,7 +197,7 @@ export class ResidentScanClient {
 		if (this.child !== child) return;
 		const waiter = this.detachWaiter(child);
 		this.child = undefined;
-		this.buffer = "";
+		this.buffer.clear();
 		waiter?.resolve(undefined);
 	}
 
@@ -215,7 +205,7 @@ export class ResidentScanClient {
 		const waiter = this.detachWaiter(child);
 		if (this.child === child) {
 			this.child = undefined;
-			this.buffer = "";
+			this.buffer.clear();
 		}
 		if (child.exitCode === null) child.kill("SIGKILL");
 		waiter?.resolve(undefined);
@@ -232,7 +222,7 @@ export class ResidentScanClient {
 	private stopChild(): void {
 		const child = this.child;
 		if (child !== undefined) this.invalidate(child);
-		this.buffer = "";
+		this.buffer.clear();
 	}
 
 	/** 丢弃当前进程但保留客户端，使下一次请求可以重新握手。 */

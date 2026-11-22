@@ -294,6 +294,50 @@ ${capabilities} else {
 		} finally { scope.dispose(); }
 	});
 
+	it("常驻协议接收合并的握手和首行、跨字节分块的 UTF-8 正文", async () => {
+		const value = await helper(`
+import { createInterface } from "node:readline";
+let first = true;
+createInterface({ input: process.stdin }).on("line", () => {
+ if (first) {
+  first = false;
+  process.stdout.write([JSON.stringify({ ok: true, ready: true }), JSON.stringify({ ok: true }), ""].join("\\r\\n"));
+ } else {
+  const bytes = Buffer.from(JSON.stringify({ name: "目录/测试" }) + "\\r\\n");
+  const split = bytes.indexOf(Buffer.from("目")) + 1;
+  process.stdout.write(bytes.subarray(0, split));
+  setImmediate(() => process.stdout.write(bytes.subarray(split)));
+ }
+});`);
+		const client = new ResidentScanClient(value.path, value.directory, 5_000);
+		try {
+			await expect(client.scan()).resolves.toEqual({ name: "目录/测试" });
+		} finally { await client.close(); }
+	});
+
+	it("常驻响应超过 32 MiB 时丢弃半行，下一次请求重新握手", async () => {
+		const value = await helper(`
+import { existsSync, writeFileSync } from "node:fs";
+import { createInterface } from "node:readline";
+const marker = new URL("started", import.meta.url);
+const restart = existsSync(marker);
+writeFileSync(marker, "x");
+let first = true;
+createInterface({ input: process.stdin }).on("line", () => {
+ if (first) {
+  first = false;
+  console.log(JSON.stringify({ ok: true, ready: true }));
+  console.log(JSON.stringify({ ok: true }));
+ } else if (restart) console.log(JSON.stringify({ ok: true, restarted: true }));
+ else process.stdout.write(" ".repeat(32 * 1024 * 1024) + JSON.stringify({ ok: true }) + "\\n");
+});`);
+		const client = new ResidentScanClient(value.path, value.directory, 10_000);
+		try {
+			await expect(client.scan()).resolves.toBeUndefined();
+			await expect(client.scan()).resolves.toEqual({ ok: true, restarted: true });
+		} finally { await client.close(); }
+	});
+
 	it("闲置回收 serve 子进程后，下一次扫描按需重启", async () => {
 		const value = await helper(`
 import { appendFileSync } from "node:fs";
