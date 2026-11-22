@@ -739,6 +739,49 @@ fn record_leaf(leaves: &mut Option<Vec<String>>, name: String, kind: u8) {
 }
 
 /// 仅从本次事件校验后的 cache 取叶子；不读取文件内容，也不跟随符号链接。
+/// 在复用 cache 前逐级复核叶子子树：FSEvents 可能尚未送达，不能仅凭「无事件」就返回旧 cache。
+///
+/// 只对 roots 及其后代执行 lstat（不 readdir），成本与子树目录数成正比；任一元数据变化即失败，
+/// 由调用方回退完整重扫。文件系统时间戳精度不足时（racy）预先判定不可信。
+pub(crate) fn verify_leaf_subtree(
+    workspace: &Path,
+    directories: &BTreeMap<String, CachedDirectory>,
+    roots: &[String],
+) -> Result<(), String> {
+    let workspace_dev = directories.get("").ok_or("叶子 cache 缺少 workspace 根")?.dev;
+    let mut pending: Vec<String> = roots.to_vec();
+    let mut seen = HashSet::new();
+    let mut checked = 0usize;
+    while let Some(path) = pending.pop() {
+        if !seen.insert(path.clone()) {
+            return Err("叶子子树重复".into());
+        }
+        checked += 1;
+        // 子树目录数超预算时宁可重扫；正常 ignored 树远低于该上限。
+        if checked > 262_144 {
+            return Err("叶子子树超过复核预算".into());
+        }
+        let directory = directories.get(&path).ok_or("叶子子树目录不在 cache 中")?;
+        if directory.dev != workspace_dev {
+            return Err("跨设备子树需要重新枚举".into());
+        }
+        // racy 记录的 mtime/ctime 不足以证明内容未变。
+        if directory.racy {
+            return Err("叶子子树缓存处于 racy 窗口".into());
+        }
+        let absolute = if path.is_empty() {
+            workspace.to_path_buf()
+        } else {
+            workspace.join(&path)
+        };
+        let metadata = fs::symlink_metadata(&absolute).map_err(|error| error.to_string())?;
+        if !metadata.is_dir() || !metadata_matches(directory, &metadata) {
+            return Err(format!("叶子子树目录已变化：{path}"));
+        }
+        pending.extend(directory.children.iter().map(|name| format!("{path}/{name}")));
+    }
+    Ok(())
+}
 pub(crate) fn collect_leaves(
     directories: &BTreeMap<String, CachedDirectory>,
     roots: &[String],
@@ -926,6 +969,56 @@ mod tests {
             workspace_ino: metadata.ino(),
             directories: state.next,
         }
+    }
+
+    #[test]
+    fn verify_leaf_subtree_rejects_untracked_changes_before_events_arrive() {
+        // 复现「写入后立即扫描、但事件尚未送达」：cache 仍是旧的，必须被复核拦住。
+        let root = crate::tests::fixture();
+        fs::create_dir_all(root.join("deps/a/deep")).unwrap();
+        fs::write(root.join("deps/a/deep/one"), "1").unwrap();
+        let cache = verified_cache(&root);
+        let roots = vec!["deps".to_string()];
+        // 无变化时复核通过。
+        verify_leaf_subtree(&root, &cache.directories, &roots).unwrap();
+
+        // 新增叶子：deps/a/deep 的 mtime/ctime 变化，复核必须失败。
+        fs::write(root.join("deps/a/deep/two"), "2").unwrap();
+        assert!(
+            verify_leaf_subtree(&root, &cache.directories, &roots).is_err(),
+            "新增文件后不应复用旧 cache"
+        );
+
+        // 同步 cache 后重新通过。
+        let refreshed = verified_cache(&root);
+        verify_leaf_subtree(&root, &refreshed.directories, &roots).unwrap();
+
+        // 删除叶子同样必须失败。
+        fs::remove_file(root.join("deps/a/deep/two")).unwrap();
+        assert!(
+            verify_leaf_subtree(&root, &refreshed.directories, &roots).is_err(),
+            "删除文件后不应复用旧 cache"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn verify_leaf_subtree_rejects_racy_and_missing_directories() {
+        let root = crate::tests::fixture();
+        fs::create_dir_all(root.join("deps/a")).unwrap();
+        fs::write(root.join("deps/a/one"), "1").unwrap();
+        let mut cache = verified_cache(&root);
+        let roots = vec!["deps".to_string()];
+
+        // racy 记录的时间戳不足以证明内容未变。
+        cache.directories.get_mut("deps/a").unwrap().racy = true;
+        assert!(verify_leaf_subtree(&root, &cache.directories, &roots).is_err());
+        cache.directories.get_mut("deps/a").unwrap().racy = false;
+
+        // 目录被移走后复核失败（不能凭旧 inode 认为子树仍在）。
+        fs::rename(root.join("deps/a"), root.join("deps/b")).unwrap();
+        assert!(verify_leaf_subtree(&root, &cache.directories, &roots).is_err());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

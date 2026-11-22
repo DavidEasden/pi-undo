@@ -6,7 +6,8 @@
 
 use crate::directory::Directory;
 use crate::scan_directories::{
-    CachedDirectory, Repository, Response, ScanState, collect_leaves, load_cache, scan, scan_changed, write_cache,
+    CachedDirectory, Repository, Response, ScanState, collect_leaves, load_cache, metadata_matches,
+    scan, scan_changed, verify_leaf_subtree, write_cache,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
@@ -207,7 +208,12 @@ fn main_loop(
         let result = if pending.uncertain {
             serve_rescan(&mut state, &root)
         } else if pending.changed_paths.is_empty() {
-            serve_cached(&state).or_else(|_| serve_rescan(&mut state, &root))
+            // 叶子请求在无事件时仍需复核子树：事件送达可能晚于写入。
+            match request.leaf_roots.as_deref() {
+                Some(roots) if !roots.is_empty() => serve_cached_for_leaves(&state, roots)
+                    .or_else(|_| serve_rescan(&mut state, &root)),
+                _ => serve_cached(&state).or_else(|_| serve_rescan(&mut state, &root)),
+            }
         } else {
             serve_local(&mut state, &root, &pending)
                 .or_else(|_| serve_rescan(&mut state, &root))
@@ -280,6 +286,17 @@ struct ScanRequest {
 /// 无事件时只返回已建缓存；workspace 身份仍在每次响应前验证。
 fn serve_cached(state: &ResidentState) -> Result<HitResponse, String> {
     assert_workspace_identity(state)?;
+    serve_cached_body(state)
+}
+
+/// 叶子请求额外逐级复核 roots 子树：事件可能仍在路上，不能仅凭「无事件」返回旧 cache。
+fn serve_cached_for_leaves(state: &ResidentState, roots: &[String]) -> Result<HitResponse, String> {
+    assert_workspace_identity(state)?;
+    verify_leaf_subtree(&state.workspace, &state.directories, roots)?;
+    serve_cached_body(state)
+}
+
+fn serve_cached_body(state: &ResidentState) -> Result<HitResponse, String> {
     let repositories = state
         .directories
         .iter()
