@@ -108,7 +108,12 @@ export class RootDiscovery {
 		const workspaceIdentity = await canonicalWorkspaceRoot(workspaceRoot);
 		checkOperation();
 		const activeRoots = new Map<string, DiscoveredRoot>();
-		const outerRepository = await this.inspectRepository(workspaceIdentity, workspaceIdentity);
+		const nestedRoots = new Map<string, DiscoveredRoot>();
+		// 子目录扫描不读取外层仓库信息；两项都结束后仍按外层优先的顺序解析 gitlink。
+		const [outerRepository] = await allCompleted([
+			this.inspectRepository(workspaceIdentity, workspaceIdentity),
+			this.scanDirectory(workspaceIdentity, workspaceIdentity, nestedRoots),
+		] as const);
 		if (outerRepository.kind === "active") {
 			activeRoots.set(
 				outerRepository.repository.absoluteRoot,
@@ -120,7 +125,7 @@ export class RootDiscovery {
 			activeRoots.set(workspaceIdentity, syntheticRoot(workspaceIdentity));
 		}
 
-		await this.scanDirectory(workspaceIdentity, workspaceIdentity, activeRoots);
+		for (const [path, root] of nestedRoots) activeRoots.set(path, root);
 		checkOperation();
 		reportOperationProgress("discover_gitlinks");
 		const gitlinkRoots = await this.discoverGitlinks(workspaceIdentity, activeRoots);

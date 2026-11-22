@@ -346,6 +346,7 @@ export class SnapshotStore {
 	private lastCompactCheckAt: number | undefined;
 	private readonly manifestLocations = new Map<ManifestId, string>();
 	private readonly validatedManifestDigests = new Map<ManifestId, string>();
+	private readonly frozenCaptures = new WeakSet<SnapshotManifest>();
 	// Tree 与 blob 都由 object ID 内容寻址；缓存只复用已从私有 ODB 读取的不可变内容。
 	private readonly treeEntriesCache = new Map<string, Promise<CapturedTreeEntry[]>>();
 	private readonly treeEntryCounts = new Map<string, number>();
@@ -549,6 +550,13 @@ export class SnapshotStore {
 			for (const update of cacheUpdates) this.rememberVisibleLeaves(update);
 			// 指纹缓存落盘：让下一个进程（新会话）的首次 capture 跳过全量内容 hash。
 			await this.persistLeafCache(storeDirectory);
+			// 只冻结 capture 自建的清单及其嵌套容器；弱集合不会延长路径列表的生命周期。
+			for (const root of roots) {
+				Object.freeze(root.ignoredPresentPaths);
+				Object.freeze(root);
+			}
+			Object.freeze(roots);
+			this.frozenCaptures.add(Object.freeze(manifest));
 			return manifest;
 		} catch (error) {
 			if (error instanceof SnapshotStoreError) {
@@ -759,10 +767,13 @@ export class SnapshotStore {
 		options: CaptureOptions,
 		diagnostic?: MutableCaptureDiagnostic,
 	): Promise<boolean> {
-		try {
-			assertManifest(baseline);
-		} catch {
-			return false;
+		const knownCapture = this.frozenCaptures.has(baseline);
+		if (!knownCapture) {
+			try {
+				assertManifest(baseline);
+			} catch {
+				return false;
+			}
 		}
 		const artifactExclusions = captureExclusions(topology.workspaceIdentity, options.excludePaths);
 		if (
@@ -879,7 +890,8 @@ export class SnapshotStore {
 				);
 				if (diagnostic !== undefined) diagnostic.ignoredFiles += ignoredPresentPaths.length;
 				if (!samePathList(ignoredPresentPaths, baselineRoot.ignoredPresentPaths)) return false;
-				if (baselineRoot.ignoreClosure !== ignoredPresentClosure({
+				// 自建清单的路径与 closure 均不可变，和刚取得的路径逐项相等就不必再次哈希。
+				if (!knownCapture && baselineRoot.ignoreClosure !== ignoredPresentClosure({
 					coverage: baselineRoot.coverage,
 					ignorePolicy: IGNORE_POLICY,
 					ignoredPresentPaths,

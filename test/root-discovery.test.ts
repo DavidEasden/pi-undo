@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { GitRunError, GitRunner, type GitRunOptions, type GitRunResult } from "../src/git-runner.ts";
 import { createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
 import { RootDiscovery } from "../src/root-discovery.ts";
@@ -338,12 +338,23 @@ describe("RootDiscovery", () => {
 		expect(phases).toContain("discover_gitlinks");
 	});
 
-	it("无法确认 Git 子进程停止时向上传递，而不是降级为 broken root", async () => {
+	it("外层 Git 检查失败时，仍等待并行的目录扫描结束再报告错误", async () => {
 		const outer = await createGitRepo();
 		temporaryRoots.push(outer.root);
-
-		await expect(new RootDiscovery(new TerminatingGitRunner()).discover(outer.root))
-			.rejects.toMatchObject({ code: "git_termination_failed" });
+		const git = new TerminatingGitRunner();
+		const inspect = vi.spyOn(git, "run");
+		let release!: () => void;
+		const pending = new Promise<void>((resolve) => { release = resolve; });
+		const scan = vi.fn(async () => { await pending; return { directories: 1, repositories: [] }; });
+		let finished = false;
+		const result = new RootDiscovery(git, { scan }).discover(outer.root).catch((error: unknown) => error)
+			.finally(() => { finished = true; });
+		try {
+			await waitUntil(() => inspect.mock.calls.length > 0);
+			expect(scan).toHaveBeenCalledOnce();
+			expect(finished).toBe(false);
+		} finally { release(); }
+		expect(await result).toMatchObject({ code: "git_termination_failed" });
 	});
 });
 

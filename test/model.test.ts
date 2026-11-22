@@ -377,8 +377,10 @@ describe("assertManifest", () => {
 		["未排序", ["z.txt", "a.txt"]],
 		["重复", ["same.txt", "same.txt"]],
 		["前缀冲突", ["dir", "dir/file.txt"]],
+		["非相邻的深层前缀冲突", ["pkg/lib", "pkg/lib.js", "pkg/lib/deep/file"]],
 		["越界", ["../escape.txt"]],
 		["Git metadata", [".git/config"]],
+		["深层 Git metadata", ["pkg/lib/.GiT"]],
 	] as const)("拒绝 ignored-present proof 路径%s", (_name, ignoredPresentPaths) => {
 		const base = manifest();
 		const roots = [{

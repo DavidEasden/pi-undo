@@ -395,6 +395,7 @@ function assertRoots(value: unknown): asserts value is SnapshotManifest["roots"]
 	}
 	for (const { relativeRoot, paths } of ignoredPathsByRoot) {
 		const descendantRoots = rootPaths.filter((candidate) => isStrictRootAncestor(relativeRoot, candidate));
+		if (descendantRoots.length === 0) continue;
 		for (const path of paths) {
 			const workspacePath = relativeRoot === "." ? path : `${relativeRoot}/${path}`;
 			if (descendantRoots.some(
@@ -434,17 +435,16 @@ function assertIgnoredPresentPaths(value: unknown): asserts value is string[] {
 			typeof path !== "string" ||
 			path === "." ||
 			!isCanonicalRoot(path) ||
-			path.split("/").some((component) => component.toLowerCase() === ".git")
+			/(?:^|\/)\.git(?:\/|$)/i.test(path)
 		) {
 			fail("invalid_manifest", "root ignoredPresentPaths 包含不安全路径");
 		}
 		if (previous !== undefined && previous >= path) {
 			fail("invalid_manifest", "root ignoredPresentPaths 必须严格排序且不能重复");
 		}
-		if (path.split("/").slice(0, -1).some(
-			(_part, ancestorIndex, parts) => paths.has(parts.slice(0, ancestorIndex + 1).join("/")),
-		)) {
-			fail("invalid_manifest", "root ignoredPresentPaths 不能包含叶子前缀冲突");
+		// 直接切原字符串；深路径不必为每个祖先重建组件数组并 join。
+		for (let end = path.indexOf("/"); end >= 0; end = path.indexOf("/", end + 1)) {
+			if (paths.has(path.slice(0, end))) fail("invalid_manifest", "root ignoredPresentPaths 不能包含叶子前缀冲突");
 		}
 		paths.add(path);
 		previous = path;

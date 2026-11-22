@@ -545,6 +545,32 @@ describe("SnapshotStore", () => {
 		expect(git.calls.some((call) => call.args[0] === "write-tree")).toBe(true);
 	});
 
+	it("只对本实例捕获的不可变清单复用内容校验，同 ID 的副本仍须重验", async () => {
+		const workspace = await temporaryRoot("pi-undo-baseline-");
+		const topology = await new RootDiscovery().discover(workspace);
+		const store = new SnapshotStore({ storeRoot: await temporaryRoot("pi-undo-store-") });
+		const baseline = await store.capture(topology);
+		for (const value of [baseline, baseline.roots, baseline.roots[0], baseline.roots[0]!.ignoredPresentPaths]) {
+			expect(Object.isFrozen(value)).toBe(true);
+		}
+		const validate = vi.spyOn(await import("../src/encoding.ts"), "assertManifest");
+		try {
+			expect(await store.captureBaseline(topology, baseline)).toBe(baseline);
+			expect(validate).not.toHaveBeenCalled();
+			const copy = structuredClone(baseline);
+			expect(await store.captureBaseline(topology, copy)).toBe(copy);
+			expect(validate).toHaveBeenCalledWith(copy);
+			const forged = Object.freeze({ ...baseline, createdAt: "被替换的时间" });
+			const diagnostics: CaptureDiagnostic[] = [];
+			const recovered = await store.captureBaseline(topology, forged, undefined, {
+				onDiagnostics: (diagnostic) => diagnostics.push(diagnostic),
+			});
+			expect(validate).toHaveBeenCalledWith(forged);
+			expect(diagnostics[0]?.strategy).toBe("baseline-fallback");
+			expect(recovered.createdAt).not.toBe(forged.createdAt);
+		} finally { validate.mockRestore(); }
+	});
+
 	it("baseline topology 变化时回退完整 capture 并纳入新增 nested repository", async () => {
 		const repository = await createGitRepo();
 		temporaryRoots.push(repository.root);
