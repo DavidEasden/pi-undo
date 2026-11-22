@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import { GitRunner } from "../src/git-runner.ts";
 import { allowsNativeLeafCache } from "../src/native-capabilities.ts";
 import { NativeDirectoryScanner } from "../src/native-directory-scan.ts";
+import { ResidentScanClient } from "../src/resident-scan-client.ts";
 import { nativeExecutable } from "../src/native-restore.ts";
 import { createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
 import { RootDiscovery } from "../src/root-discovery.ts";
@@ -32,6 +33,15 @@ describe.skipIf(process.env.PI_UNDO_DISABLE_NATIVE === "1" || binary === undefin
 			await expect(leaves()).resolves.toEqual(["deps/a/deep/one"]);
 			await writeFile(join(workspace, "deps/a/deep/新\n文件"), "2");
 			await expect(leaves()).resolves.toEqual(["deps/a/deep/one", "deps/a/deep/新\n文件"]);
+			const scan = vi.spyOn(ResidentScanClient.prototype, "scan");
+			try {
+				await expect(leaves()).resolves.toEqual(["deps/a/deep/one", "deps/a/deep/新\n文件"]);
+				const digest = scan.mock.calls[0]?.[2];
+				expect(digest).toMatch(/^[0-9a-f]{64}$/);
+				const response = await scan.mock.results[0]?.value;
+				expect(response?.matchedLeafDigest).toBe(digest);
+				expect(response).not.toHaveProperty("leaves");
+			} finally { scan.mockRestore(); }
 			await rm(join(workspace, "deps/a/deep/one"));
 			await expect(leaves()).resolves.toEqual(["deps/a/deep/新\n文件"]);
 			await rename(join(workspace, "deps/a"), join(workspace, "deps/b"));

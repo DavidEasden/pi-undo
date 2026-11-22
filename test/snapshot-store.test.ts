@@ -515,6 +515,7 @@ describe("SnapshotStore", () => {
 		]));
 
 		expect(reused).toEqual(baseline);
+		expect(git.calls.some((call) => call.args[0] === "read-tree")).toBe(false);
 		expect(git.calls.some((call) => call.args[0] === "hash-object")).toBe(false);
 		expect(git.calls.some((call) => call.args[0] === "update-index")).toBe(false);
 		expect(git.calls.some((call) => call.args[0] === "write-tree")).toBe(false);
@@ -539,6 +540,8 @@ describe("SnapshotStore", () => {
 			hashBytesPlanned: 8,
 		})]);
 		expect(changedTimings.map((timing) => timing.phase)).toContain("settled.fullCapture");
+		// 文件不匹配时探测不检查旧对象；随后的完整捕获仍验证新树。
+		expect(git.calls.filter((call) => call.args[1] === "--batch-check")).toHaveLength(1);
 
 		expect(changed.manifestId).not.toBe(baseline.manifestId);
 		expect(git.calls.some((call) => call.args[0] === "hash-object")).toBe(true);

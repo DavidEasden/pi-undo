@@ -825,7 +825,8 @@ export class SnapshotStore {
 				const absoluteRoot = workspaceRootPath(topology.workspaceIdentity, root.relativeRoot);
 				const indexPath = join(transactionDirectory, `${rootStoreId(root)}.index`);
 				const environment = privateGitEnvironment(gitDirectory, absoluteRoot, indexPath);
-				await this.runGit(["read-tree", "--empty"], { cwd: absoluteRoot, env: environment });
+				// Git 根的工作区查询读取源 index；对象检查和 hash-object 也不需要创建私有 index。
+				if (!root.gitBacked) await this.runGit(["read-tree", "--empty"], { cwd: absoluteRoot, env: environment });
 				await this.validateIgnoreQuery(absoluteRoot, environment, root.gitBacked);
 
 				const requestedInclusions = rootScopePathspecs(root.relativeRoot, scope);
@@ -835,8 +836,6 @@ export class SnapshotStore {
 				const exactExclusions = ownedArtifactExclusions(topology.roots, root.relativeRoot, artifactExclusions);
 				const inclusions = ownedRootInclusions(requestedInclusions, exclusions);
 				const entries = await this.readTreeEntries(gitDirectory, treeId);
-				await this.assertObjectsComplete(gitDirectory, treeId, entries);
-				if (baselineRoot.objectClosure !== treeObjectClosure(treeId, entries)) return false;
 
 				const leaves = await this.collectVisibleLeaves(
 					absoluteRoot,
@@ -879,15 +878,13 @@ export class SnapshotStore {
 					if (diagnostic !== undefined) diagnostic.cacheHits += 1;
 				}
 
-				const ignoredPresentPaths = await this.captureIgnoredPresentPaths(
-					absoluteRoot,
-					environment,
-					root.gitBacked,
-					inclusions,
-					exclusions,
-					exactExclusions,
-					transactionDirectory,
-				);
+				// 可见文件失配时已退出；命中时，私有对象库与工作区忽略证明独立读取。
+				if (baselineRoot.objectClosure !== treeObjectClosure(treeId, entries)) return false;
+				const [, ignoredPresentPaths] = await allCompleted([
+					this.assertObjectsComplete(gitDirectory, treeId, entries),
+					this.captureIgnoredPresentPaths(absoluteRoot, environment, root.gitBacked, inclusions,
+						exclusions, exactExclusions, transactionDirectory),
+				] as const);
 				if (diagnostic !== undefined) diagnostic.ignoredFiles += ignoredPresentPaths.length;
 				if (!samePathList(ignoredPresentPaths, baselineRoot.ignoredPresentPaths)) return false;
 				// 自建清单的路径与 closure 均不可变，和刚取得的路径逐项相等就不必再次哈希。

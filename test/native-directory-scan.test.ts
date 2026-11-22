@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import * as nativeCapabilities from "../src/native-capabilities.ts";
+import { checksum } from "../src/encoding.ts";
 import { NativeDirectoryScanner } from "../src/native-directory-scan.ts";
 import { ResidentScanClient } from "../src/resident-scan-client.ts";
 import { createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
@@ -114,6 +115,49 @@ if (process.argv[2] === "--capabilities") {
 			await expect(scanner.scanLeaves(value.directory, ["deps"])).resolves.toBeUndefined();
 			expect(scan).toHaveBeenLastCalledWith(undefined, ["deps"]);
 			expect(reset).toHaveBeenCalledTimes(leaves === null ? 0 : 1);
+		} finally {
+			await scanner.dispose();
+			scan.mockRestore();
+			reset.mockRestore();
+			mount.mockRestore();
+		}
+	});
+
+	it("只接受本次为同一组根发送的摘要，且不与调用方共享缓存数组", async () => {
+		const value = await helper(`console.log(JSON.stringify({ ok: true, capabilities: ["scan-directories-v2", "scan-serve-v1", "scan-serve-leaves-v1", "scan-serve-leaf-digest-v1"] }));`);
+		const base = { ok: true, directories: 1, repositories: [] };
+		const paths = ["deps/换\n行", "deps/\uE000", "deps/𐀀"];
+		const digest = checksum(`${paths.join("\0")}\0`);
+		const scan = vi.spyOn(ResidentScanClient.prototype, "scan").mockResolvedValue(base);
+		const reset = vi.spyOn(ResidentScanClient.prototype, "reset");
+		const mount = vi.spyOn(nativeCapabilities, "allowsNativeLeafCache").mockResolvedValue(true);
+		const scanner = new NativeDirectoryScanner(value.path);
+		const leaves = (roots = ["deps"]) => scanner.scanLeaves(value.directory, roots);
+		try {
+			await scanner.scan(value.directory);
+			scan.mockResolvedValueOnce({ ...base, leaves: [...paths] });
+			(await leaves())!.pop();
+			scan.mockResolvedValue({ ...base, matchedLeafDigest: digest });
+			const hit = await leaves();
+			expect(scan).toHaveBeenLastCalledWith(undefined, ["deps"], digest);
+			expect(hit).toEqual(paths);
+			hit!.reverse();
+			await expect(leaves()).resolves.toEqual(paths);
+			await expect(leaves(["other"])).resolves.toBeUndefined();
+			expect(scan).toHaveBeenLastCalledWith(undefined, ["other"]);
+			scan.mockResolvedValueOnce({ ...base, matchedLeafDigest: "0".repeat(64) });
+			await expect(leaves()).resolves.toBeUndefined();
+			scan.mockResolvedValueOnce({ ...base, matchedLeafDigest: digest, leaves: [] });
+			await expect(leaves()).resolves.toBeUndefined();
+			expect(reset).toHaveBeenCalledTimes(3);
+			// 超过数量或字节预算仍可使用本次完整响应，下一次不得引用它。
+			for (const oversized of [Array.from({ length: 65_537 }, (_, i) => `deps/${i}`), ["deps/" + "x".repeat(4 * 1024 * 1024)]]) {
+				scan.mockResolvedValueOnce({ ...base, leaves: oversized });
+				expect(await leaves()).toHaveLength(oversized.length);
+				scan.mockResolvedValueOnce({ ...base, leaves: paths });
+				await expect(leaves()).resolves.toEqual(paths);
+				expect(scan).toHaveBeenLastCalledWith(undefined, ["deps"]);
+			}
 		} finally {
 			await scanner.dispose();
 			scan.mockRestore();

@@ -6,10 +6,11 @@
 
 use crate::directory::Directory;
 use crate::scan_directories::{
-    CachedDirectory, Repository, Response, ScanState, collect_leaves, load_cache, metadata_matches,
+    CachedDirectory, Repository, Response, ScanState, collect_leaves, load_cache,
     scan, scan_changed, verify_leaf_subtree, write_cache,
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -252,10 +253,14 @@ fn main_loop(
                 });
                 if let Some(roots) = &request.leaf_roots {
                     // 叶子与拓扑来自同一次事件排空和复核；无法给出完整列表时拒绝复用。
-                    payload["leaves"] = match collect_leaves(&state.directories, roots) {
-                        Ok(leaves) => serde_json::json!(leaves),
-                        Err(_) => serde_json::Value::Null,
-                    };
+                    match collect_leaves(&state.directories, roots) {
+                        Ok(leaves) if request.if_leaf_digest.as_deref()
+                            .is_some_and(|digest| digest == leaf_digest(&leaves)) => {
+                            payload["matchedLeafDigest"] = request.if_leaf_digest.into();
+                        }
+                        Ok(leaves) => payload["leaves"] = leaves.into(),
+                        Err(_) => payload["leaves"] = serde_json::Value::Null,
+                    }
                 }
                 writeln!(output, "{payload}")
                     .map_err(|error| format!("写 serve 响应失败：{error}"))?;
@@ -281,6 +286,18 @@ struct ScanRequest {
     schema_version: u32,
     #[serde(default)]
     leaf_roots: Option<Vec<String>>,
+    #[serde(default)]
+    if_leaf_digest: Option<String>,
+}
+
+/// 与完整响应使用同一顺序；每个 UTF-8 路径以 NUL 结尾，名称中的换行等字符不产生歧义。
+fn leaf_digest(leaves: &[String]) -> String {
+    let mut hash = Sha256::new();
+    for path in leaves {
+        hash.update(path.as_bytes());
+        hash.update([0]);
+    }
+    hex::encode(hash.finalize())
 }
 
 /// 无事件时只返回已建缓存；workspace 身份仍在每次响应前验证。

@@ -3,6 +3,7 @@ import { access, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
+import { checksum } from "./encoding.ts";
 import { GitRunError, runSupervisedProcess } from "./git-runner.ts";
 import { allowsNativeLeafCache, allowsNativeMountFastPaths, probeNativeCapabilities } from "./native-capabilities.ts";
 import { nativeExecutable } from "./native-restore.ts";
@@ -30,6 +31,8 @@ export interface NativeDirectoryScanPort {
 	dispose?(): Promise<void>;
 }
 
+const LEAF_CACHE_MAX_PATHS = 65_536;
+const LEAF_CACHE_MAX_BYTES = 4 * 1024 * 1024;
 const nativeScanCacheDirectories = new Set<string>();
 let nativeScanCacheCleanupRegistered = false;
 
@@ -58,6 +61,7 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 		readonly workspaceRoot: string;
 		readonly cachePath: string | undefined;
 		readonly client: ResidentScanClient;
+		lastLeaves?: { readonly roots: readonly string[]; readonly paths: readonly string[]; readonly digest: string };
 	} | undefined;
 	private prewarmInFlight: { readonly workspaceRoot: string; readonly promise: Promise<void> } | undefined;
 
@@ -188,12 +192,27 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 		const resident = this.resident;
 		// 复用 discovery 已建立的监听；旧 helper、其他根和不可靠挂载保持原枚举。
 		if (resident?.workspaceRoot !== workspaceRoot ||
-			!await allowsNativeMountFastPaths(workspaceRoot) || !await allowsNativeLeafCache(workspaceRoot) ||
-			!(await this.capabilities)?.has("scan-serve-leaves-v1")) return undefined;
-		const response = await resident.client.scan(undefined, roots);
+			!await allowsNativeMountFastPaths(workspaceRoot) || !await allowsNativeLeafCache(workspaceRoot)) return undefined;
+		const capabilities = await this.capabilities;
+		if (!capabilities?.has("scan-serve-leaves-v1")) return undefined;
+		const conditional = capabilities.has("scan-serve-leaf-digest-v1");
+		const requested = [...roots];
+		const previous = resident.lastLeaves;
+		const cached = previous !== undefined && previous.roots.length === requested.length && requested.every((root, i) => root === previous.roots[i])
+			? previous : undefined;
+		const response = cached === undefined ? await resident.client.scan(undefined, requested)
+			: await resident.client.scan(undefined, requested, cached.digest);
 		checkOperation();
 		if (response === undefined) return undefined;
 		if (parseResidentResponse(response) === undefined) {
+			resident.client.reset();
+			return undefined;
+		}
+		if (response.matchedLeafDigest !== undefined) {
+			// 只有本次确实发过的摘要可以替代完整结果，不能接受主动回送或含糊的响应。
+			if (cached !== undefined && response.matchedLeafDigest === cached.digest && response.leaves === undefined) {
+				return [...cached.paths];
+			}
 			resident.client.reset();
 			return undefined;
 		}
@@ -201,15 +220,25 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 		if (response.leaves === null) return undefined;
 		const paths = response.leaves;
 		const seen = new Set<string>();
+		let pathBytes = 0;
 		if (!Array.isArray(paths) || paths.length > 262_144 || paths.some((path) => {
 			if (typeof path !== "string" || path.includes("\0") ||
 				path.split("/").some((part) => part === "" || part === "." || part === ".." || part.toLowerCase() === ".git") ||
-				!roots.some((root) => path.startsWith(`${root}/`)) || seen.has(path)) return true;
+				!requested.some((root) => path.startsWith(`${root}/`)) || seen.has(path)) return true;
 			seen.add(path);
+			if (conditional) pathBytes += Buffer.byteLength(path) + 1;
 			return false;
 		})) {
 			resident.client.reset();
 			return undefined;
+		}
+		if (conditional) {
+			resident.lastLeaves = undefined;
+			if (paths.length > 0 && paths.length <= LEAF_CACHE_MAX_PATHS && pathBytes <= LEAF_CACHE_MAX_BYTES &&
+				requested.length <= 512 && requested.reduce((n, root) => n + Buffer.byteLength(root) + 1, 0) <= 24 * 1024) {
+				// 保留原生响应顺序，避免 UTF-16 与 UTF-8 排序差异；不与调用方共享数组。
+				resident.lastLeaves = { roots: requested, paths: [...paths], digest: checksum(`${paths.join("\0")}\0`) };
+			}
 		}
 		return paths as string[];
 	}
