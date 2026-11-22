@@ -36,6 +36,7 @@ const GC_METADATA_FILE = "gc.json";
 const GC_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 const IGNORE_POLICY = "git-check-ignore-v1";
 const NULL_DEVICE = process.platform === "win32" ? "NUL" : "/dev/null";
+const MANIFEST_DIGEST_CACHE_LIMIT = 32;
 const TREE_CACHE_LIMIT = 16;
 const TREE_CACHE_ENTRY_LIMIT = 32_768;
 const TREE_SCOPE_COMPACT_MIN_PATHS = process.platform === "win32" ? 512 : 4_096;
@@ -343,7 +344,8 @@ export class SnapshotStore {
 	private readonly compactMinAgeMs: number;
 	private readonly blobCacheMaxBytes: number;
 	private lastCompactCheckAt: number | undefined;
-	private readonly manifestLocations = new Map<string, string>();
+	private readonly manifestLocations = new Map<ManifestId, string>();
+	private readonly validatedManifestDigests = new Map<ManifestId, string>();
 	// Tree 与 blob 都由 object ID 内容寻址；缓存只复用已从私有 ODB 读取的不可变内容。
 	private readonly treeEntriesCache = new Map<string, Promise<CapturedTreeEntry[]>>();
 	private readonly treeEntryCounts = new Map<string, number>();
@@ -990,10 +992,19 @@ export class SnapshotStore {
 
 	private async loadManifestFromPath(id: ManifestId, manifestPath: string): Promise<SnapshotManifest> {
 		try {
-			const value: unknown = JSON.parse(await readFile(manifestPath, "utf8"));
-			const manifest = assertManifest(value);
+			const bytes = await readFile(manifestPath);
+			const digest = checksum(bytes);
+			const value: unknown = JSON.parse(bytes.toString("utf8"));
+			// 同一 ID 的原始字节完全一致才复用校验结果；返回本次解析的对象，避免调用方改动污染热读。
+			const manifest = this.validatedManifestDigests.get(id) === digest ? value as SnapshotManifest : assertManifest(value);
 			if (manifest.manifestId !== id) {
 				throw new SnapshotStoreError("manifest_invalid", "manifest 文件名与内容 ID 不一致");
+			}
+			this.validatedManifestDigests.delete(id);
+			this.validatedManifestDigests.set(id, digest);
+			if (this.validatedManifestDigests.size > MANIFEST_DIGEST_CACHE_LIMIT) {
+				const oldest = this.validatedManifestDigests.keys().next().value;
+				if (oldest !== undefined) this.validatedManifestDigests.delete(oldest);
 			}
 			return manifest;
 		} catch (error) {
@@ -1384,6 +1395,7 @@ export class SnapshotStore {
 				for (const [id, path] of this.manifestLocations) {
 					if (path.startsWith(`${storeDirectory}${sep}`)) {
 						this.manifestLocations.delete(id);
+						this.validatedManifestDigests.delete(id);
 					}
 				}
 				for (const gitDirectory of this.visibleLeafCache.keys()) {

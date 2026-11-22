@@ -1386,6 +1386,76 @@ describe("SnapshotStore", () => {
 		expect(store.loadManifestCalls).toBe(2);
 	});
 
+	describe("清单摘要缓存", () => {
+		async function fixture() {
+			const workspace = await temporaryRoot("pi-undo-snapshot-");
+			const storeRoot = await temporaryRoot("pi-undo-store-");
+			const store = new SnapshotStore({ storeRoot });
+			const manifest = await store.capture(await new RootDiscovery().discover(workspace));
+			const path = (await filesBelow(storeRoot)).find((name) => name.endsWith(`/manifests/${manifest.manifestId}.json`))!;
+			return { store, manifest, manifestPath: join(storeRoot, path) };
+		}
+
+		it("相同字节只完整校验一次，每次返回独立对象；仅空白变化也重新校验", async () => {
+			const { store, manifest, manifestPath } = await fixture();
+			const validate = vi.spyOn(await import("../src/encoding.ts"), "assertManifest");
+			try {
+				const first = await store.loadManifest(manifest.manifestId);
+				(first.roots[0]!.ignoredPresentPaths as string[]).push("只修改内存");
+				expect(await store.loadManifest(manifest.manifestId)).toEqual(manifest);
+				expect(validate).toHaveBeenCalledTimes(1);
+
+				await writeFile(manifestPath, `${canonicalJson(manifest)}\n`);
+				expect(await store.loadManifest(manifest.manifestId)).toEqual(manifest);
+				expect(await store.loadManifest(manifest.manifestId)).toEqual(manifest);
+				expect(validate).toHaveBeenCalledTimes(2);
+			} finally { validate.mockRestore(); }
+		});
+
+		it("热读仍拒绝同长篡改、内容与文件名不符和文件消失", async () => {
+			const { store, manifest, manifestPath } = await fixture();
+			const id = manifest.manifestId;
+			const original = await readFile(manifestPath, "utf8");
+			const metadata = await stat(manifestPath);
+			await store.loadManifest(id);
+			await writeFile(manifestPath, original.replace(manifest.createdAt, "0".repeat(manifest.createdAt.length)));
+			await utimes(manifestPath, metadata.atime, metadata.mtime);
+			for (let attempt = 0; attempt < 2; attempt++) {
+				await expect(store.loadManifest(id)).rejects.toMatchObject({ code: "manifest_invalid" });
+			}
+			await writeFile(manifestPath, original);
+			expect(await store.loadManifest(id)).toEqual(manifest);
+			const other = checksum("另一份清单") as ManifestId;
+			await writeFile(join(dirname(manifestPath), `${other}.json`), original);
+			await expect(store.loadManifest(other)).rejects.toMatchObject({ code: "manifest_invalid" });
+			await unlink(manifestPath);
+			await expect(store.loadManifest(id)).rejects.toMatchObject({ code: "manifest_invalid" });
+		});
+
+		it("第 33 份清单只淘汰最久未读取的摘要", async () => {
+			const { store, manifest, manifestPath } = await fixture();
+			const { manifestId, ...fields } = manifest;
+			const ids = [manifestId];
+			for (let i = 1; i <= 32; i++) {
+				const content = { ...fields, createdAt: new Date(i).toISOString() };
+				const id = checksum(canonicalJson(content)) as ManifestId;
+				await writeFile(join(dirname(manifestPath), `${id}.json`), canonicalJson({ ...content, manifestId: id }));
+				ids.push(id);
+			}
+			const validate = vi.spyOn(await import("../src/encoding.ts"), "assertManifest");
+			try {
+				for (const id of ids.slice(0, 32)) await store.loadManifest(id);
+				await store.loadManifest(manifestId);
+				await store.loadManifest(ids[32]!);
+				validate.mockClear();
+				await store.loadManifest(manifestId);
+				expect(validate).not.toHaveBeenCalled();
+				await store.loadManifest(ids[1]!);
+				expect(validate).toHaveBeenCalledTimes(1);
+			} finally { validate.mockRestore(); }
+		});
+	});
+
 	it("批量 blob 读取在返回前完整复验同一路径 manifest", async () => {
 		const workspace = await temporaryRoot("pi-undo-snapshot-");
 		const storeRoot = await temporaryRoot("pi-undo-store-");
