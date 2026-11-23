@@ -81,12 +81,9 @@ impl EventBatch {
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn record_change(&mut self, file: bool, path: String) {
+        // 根目录自身的元数据事件无法用路径 scope 表达；子项变化已有各自的事件。
+        // .git 不属于快照内容。两者都不应污染快速路径的信任状态。
         if path.is_empty() || is_git_metadata_path(&path) {
-            // 根目录事件无法用路径 scope 表达；.git 不属于快照内容。
-            if path.is_empty() {
-                self.uncertain = true;
-                self.coverage_trusted = false;
-            }
             return;
         }
         let set = if file { &mut self.changed_files } else { &mut self.changed_dirs };
@@ -230,9 +227,11 @@ mod change_tracker_tests {
         batch.record_file(".git/index".into());
         batch.record_file("packages/.git/HEAD".into());
         batch.record_dir(".git/objects".into());
+        batch.record_file(String::new());
         assert!(batch.changed_files.is_empty());
         assert!(batch.changed_dirs.is_empty());
         assert!(!batch.uncertain);
+        assert!(batch.coverage_trusted);
     }
 }
 
