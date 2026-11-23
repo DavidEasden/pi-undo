@@ -106,6 +106,11 @@ export interface SettledChangeCursor {
 	readonly instance: string;
 }
 
+/** 结算只记录了 before + changedPaths，after manifest 尚未生成。 */
+export function isCheckpointAfterPending(checkpoint: CheckpointRecord): boolean {
+	return checkpoint.changedPaths.length > 0 && checkpoint.afterManifestId === checkpoint.beforeManifestId;
+}
+
 export interface SettledChangeProbe {
 	readonly files: readonly string[];
 	readonly directories: readonly string[];
@@ -158,7 +163,7 @@ export interface SettlementDiagnostic {
 	readonly failureCode?: string;
 	readonly captures?: readonly CaptureDiagnostic[];
 	/** 结算走了无需全量捕获的快速路径；用于诊断和基准核验。 */
-	readonly fastPath?: "no_changes" | "scoped_delta";
+	readonly fastPath?: "no_changes" | "pending_delta";
 }
 
 export interface OperationResult {
@@ -220,6 +225,8 @@ export interface UndoController {
 	/** 后台耐久化失败时锁住当前 runtime，等待显式 recovery。 */
 	markRecoveryRequired?(reason: string): void;
 	history(): HistoryState;
+	/** 按需生成 pending checkpoint 的 after manifest；不可用时返回 undefined。 */
+	materializeAfter?(checkpoint: CheckpointRecord): Promise<ManifestId | undefined>;
 	/** 当前 recovery lock 的原因；未锁定时返回 undefined。 */
 	recoveryReason?(): string | undefined;
 	/** 后台预热快照缓存：立即返回，失败静默；后续 capture 会先等预热完成。 */
@@ -252,6 +259,8 @@ export interface ControllerRedoEntry {
 }
 
 export interface ControllerInitialState {
+	/** 本次 runtime 内已经物化的 after manifest；不写入 session。 */
+	readonly resolvedAfter?: Map<string, ManifestId>;
 	readonly undoStack?: readonly CheckpointRecord[];
 	readonly redoStack?: readonly ControllerRedoEntry[];
 	readonly historyPaused?: boolean;
@@ -277,6 +286,11 @@ export class UndoControllerImpl implements UndoController {
 	private readonly dependencies: ControllerDependencies;
 	private readonly undoStack: CheckpointRecord[] = [];
 	private readonly redoStack: ControllerRedoEntry[] = [];
+	private readonly resolvedAfter: Map<string, ManifestId>;
+	private readonly pendingAfter = new Map<string, {
+		readonly promise: Promise<ManifestId | undefined>;
+		readonly topologyFingerprint: string;
+	}>();
 	private staged: StagedRun | undefined;
 	private pendingTree: PendingTree | undefined;
 	private locked = false;
@@ -325,6 +339,7 @@ export class UndoControllerImpl implements UndoController {
 		this.dependencies = dependencies;
 		this.undoStack.push(...(initialState.undoStack ?? []));
 		this.redoStack.push(...(initialState.redoStack ?? []));
+		this.resolvedAfter = initialState.resolvedAfter ?? new Map();
 		this.historyPaused = initialState.historyPaused ?? false;
 		this.locked = initialState.locked ?? false;
 		this.lockedReason = initialState.recoveryReason;
@@ -586,7 +601,20 @@ export class UndoControllerImpl implements UndoController {
 		this.redoStack.length = 0;
 	}
 
+	private async materializePendingBeforeCapture(): Promise<void> {
+		const pending = this.undoStack.filter((checkpoint) => isCheckpointAfterPending(checkpoint));
+		for (const checkpoint of pending) {
+			const materialized = await this.materializeAfter(checkpoint);
+			if (materialized !== undefined) continue;
+			// 新 run 开始后当前状态就不再是该 checkpoint 的 after；无法物化时必须停止历史。
+			this.lock("pending_after_materialization_failed");
+			throw new Error("pending_after_materialization_failed");
+		}
+	}
+
 	private async captureInputBaseline(): Promise<{ manifest: SnapshotManifest; changeCursor?: SettledChangeCursor }> {
+		// 新 run 的输入快照必须在 pending after 物化之后执行，避免把下一轮修改误当成上一轮 after。
+		await this.materializePendingBeforeCapture();
 		// warm-up 仍在进行时先等待，确保随后可以消费已完成的 baseline，而不是再次完整 capture。
 		const warmUp = this.warmUpInFlight;
 		if (warmUp !== undefined) await warmUp;
@@ -726,23 +754,18 @@ export class UndoControllerImpl implements UndoController {
 			}
 			let after: SnapshotManifest | undefined;
 			let changedPaths: readonly string[] = [];
+			let pendingTopologyFingerprint: string | undefined;
 			if (probe?.trusted === true && probe.files.length === 0 && probe.directories.length === 0) {
 				// 事件覆盖证明自输入基线以来没有工作区变化：before 就是 after，无需全量 hash。
 				after = staged.before;
 				fastPath = "no_changes";
 			} else if (scopedFiles !== undefined) {
-				try {
-					// 文件事件本身已经给出精确 scope；即使其中某个文件最终内容未变，按该路径
-					// 捕获并纳入检查点仍是安全的，只是撤销时多做一次 no-op 复核。
-					after = await measure("settled.deltaCapture", () =>
-						this.captureScopedWithWorkspaceLock(scopedFiles!, staged.before.topologyFingerprint));
-					changedPaths = scopedFiles;
-					fastPath = "scoped_delta";
-				} catch (error) {
-					// 取消/超时应中断结算；普通作用域捕获失败退回完整结算。
-					rethrowOperationFailure(error);
-					after = undefined;
-				}
+				// 先只记录 before + 精确文件 scope；after manifest 在后台按需物化。
+				// 检查点是否 pending 由 afterManifestId === beforeManifestId 且 changedPaths 非空判定。
+				after = staged.before;
+				changedPaths = scopedFiles;
+				pendingTopologyFingerprint = staged.before.topologyFingerprint;
+				fastPath = "pending_delta";
 			}
 			if (after === undefined) {
 				after = await measure("settled.capture", () =>
@@ -775,11 +798,15 @@ export class UndoControllerImpl implements UndoController {
 			}
 			outcome = "ok";
 			this.undoStack.push(checkpoint);
+			if (pendingTopologyFingerprint !== undefined) {
+				this.startPendingAfterMaterialization(checkpoint, pendingTopologyFingerprint);
+			}
 			// agentSettled 的 finally 会在结算摘要写入 run 后解除等待；durable pack 继续后台预制。
 			// applyRestore 有惰性路径，可在预制未完成时现场创建 durable pack。
 			// 两个方向放在同一个后台任务里串行：并发创建两份 durable pack 会让文件 IO
 			// 与事件循环压力翻倍，大工作区下足以让 TUI 按键（含 Esc 中断）得不到处理。
-			if (changedPaths.length > 0 && this.dependencies.prepareDurableRestore !== undefined) {
+			if (changedPaths.length > 0 && fastPath !== "pending_delta" &&
+				this.dependencies.prepareDurableRestore !== undefined) {
 				const prepareDurable = this.runBackground(async () => {
 					try {
 						// undo 是撤回时立即需要的方向，优先预制。
@@ -875,12 +902,22 @@ export class UndoControllerImpl implements UndoController {
 		this.operationInFlight = true;
 		let lease: { release(): Promise<void> } | undefined;
 		try {
+			// 后台物化任务会持有 workspace lock；先等它结束，再进入树导航事务。
+			await this.awaitAllPendingAfter();
 			checkOperation();
 			lease = await this.dependencies.acquireWorkspaceLock();
 			const rollback = await this.dependencies.capture();
 			checkOperation();
 			const targetState = await this.dependencies.resolveTreeTarget(event.targetLeafId);
-			const target = await this.dependencies.loadManifest(targetState.targetManifestId);
+			const loadedTarget = await this.dependencies.loadManifest(targetState.targetManifestId);
+			// 作用域 after 只包含该 run 的 changedPaths；仅当它是最新 undo 栈顶时，
+			// 当前 rollback 仍代表该叶子的文件状态，可直接做 session 导航。
+			const latestScopedTarget = loadedTarget.coverage !== "complete" &&
+				this.undoStack.at(-1)?.afterManifestId === loadedTarget.manifestId;
+			if (loadedTarget.coverage !== "complete" && !latestScopedTarget) {
+				throw new Error("tree_target_scoped_history_unsupported");
+			}
+			const target = latestScopedTarget ? rollback : loadedTarget;
 			const plan = await this.dependencies.planRestore(rollback, target);
 			const descriptor = this.createDescriptor("tree", rollback, target, plan, targetState.logicalLeafId);
 			await this.dependencies.journal.prepare(descriptor, plan);
@@ -1073,6 +1110,16 @@ export class UndoControllerImpl implements UndoController {
 			const checkpoint = action === "undo" ? this.undoStack.at(-1) : redo?.checkpoint;
 			if (checkpoint === undefined) return done(noop());
 			const targetManifestId = redo?.targetManifestId;
+			const afterPending = action === "undo" && isCheckpointAfterPending(checkpoint);
+			if (action === "redo" && isCheckpointAfterPending(checkpoint) && targetManifestId === undefined) {
+				return done({ code: "recovery_required", changedFiles: 0, message: "redo_after_pending" });
+			}
+			let materializedAfterId: ManifestId | undefined;
+			if (afterPending) {
+				// 后台物化任务可能正在持有 workspace lock；必须在取锁前等待，避免互等。
+				materializedAfterId = await profile.measure("materialize", () =>
+					this.awaitPendingAfter(checkpoint.checkpointId));
+			}
 			try {
 				lease = await profile.measure("lock", () => this.dependencies.acquireWorkspaceLock());
 			} catch (error) {
@@ -1087,12 +1134,13 @@ export class UndoControllerImpl implements UndoController {
 				action === "undo" ? checkpoint.beforeManifestId : checkpoint.afterManifestId
 			);
 			const referenceManifestId = action === "undo"
-				? checkpoint.afterManifestId
+				? materializedAfterId ?? checkpoint.afterManifestId
 				: checkpoint.beforeManifestId;
+			const forcePendingCapture = afterPending && materializedAfterId === undefined;
 			let rollback: SnapshotManifest;
 			try {
 				rollback = await profile.measure("capture", () =>
-					this.dependencies.captureSafety === undefined
+					forcePendingCapture || this.dependencies.captureSafety === undefined
 						? this.dependencies.capture(checkpoint.changedPaths)
 						: this.dependencies.captureSafety(
 							referenceManifestId,
@@ -1168,11 +1216,20 @@ export class UndoControllerImpl implements UndoController {
 				await this.dependencies.journal.markCommitted(descriptor.opId);
 			});
 			this.lastSafetyManifestId = rollback.manifestId;
+			let historyCheckpoint = checkpoint;
+			if (action === "undo" && afterPending) {
+				// 本次 capture 的 rollback 就是 pending run 的 after 状态；用它补全 redo 记录。
+				historyCheckpoint = withAfterManifest(checkpoint, rollback.manifestId);
+				this.resolvedAfter.set(checkpoint.checkpointId, rollback.manifestId);
+			} else if (action === "redo" && isCheckpointAfterPending(checkpoint) && targetManifestId !== undefined) {
+				historyCheckpoint = withAfterManifest(checkpoint, targetManifestId);
+				this.resolvedAfter.set(checkpoint.checkpointId, targetManifestId);
+			}
 			if (checkpoint.changedPaths.length > 0) {
 				this.lastAppliedTargetManifest = target;
 				this.lastAppliedTargetAt = performance.now();
 			}
-			return done(this.advanceHistory(action, checkpoint, { code: "ok", changedFiles: applied.verifiedPaths }));
+			return done(this.advanceHistory(action, historyCheckpoint, { code: "ok", changedFiles: applied.verifiedPaths }));
 		} catch (error) {
 			if (this.recordUnsafeExit(error)) return done(this.recoveryResult());
 			const reason = operationFailure(error);
@@ -1350,13 +1407,16 @@ export class UndoControllerImpl implements UndoController {
 		}
 	}
 
-	private async captureWithWorkspaceLock(skipWarmUpWait = false): Promise<SnapshotManifest> {
+	private async captureWithWorkspaceLock(
+		skipWarmUpWait = false,
+		scopePaths?: readonly string[],
+	): Promise<SnapshotManifest> {
 		// 预热任务本身不能等待 warmUpInFlight，否则会等待自己的 Promise。
 		const warmUp = skipWarmUpWait ? undefined : this.warmUpInFlight;
 		if (warmUp !== undefined) await warmUp;
 		const lease = await this.dependencies.acquireWorkspaceLock();
 		try {
-			return await this.dependencies.capture();
+			return await this.dependencies.capture(scopePaths);
 		} catch (error) {
 			this.recordUnsafeExit(error);
 			throw error;
@@ -1381,6 +1441,82 @@ export class UndoControllerImpl implements UndoController {
 			throw error;
 		} finally {
 			if (!this.unsafeExit) await lease.release();
+		}
+	}
+
+	private startPendingAfterMaterialization(
+		checkpoint: CheckpointRecord,
+		topologyFingerprint: string,
+	): void {
+		const checkpointId = checkpoint.checkpointId;
+		if (this.pendingAfter.has(checkpointId)) return;
+		const promise = this.runBackground(async () => {
+			try {
+				const manifest = await this.captureScopedWithWorkspaceLock(checkpoint.changedPaths, topologyFingerprint);
+				this.applyMaterializedAfter(checkpointId, manifest.manifestId);
+				return manifest.manifestId;
+			} catch (error) {
+				this.recordUnsafeExit(error);
+				return undefined;
+			}
+		}, true);
+		this.pendingAfter.set(checkpointId, { promise, topologyFingerprint });
+	}
+
+	private applyMaterializedAfter(checkpointId: string, afterManifestId: ManifestId): void {
+		this.resolvedAfter.set(checkpointId, afterManifestId);
+		for (let index = 0; index < this.undoStack.length; index += 1) {
+			const checkpoint = this.undoStack[index]!;
+			if (checkpoint.checkpointId === checkpointId) {
+				this.undoStack[index] = withAfterManifest(checkpoint, afterManifestId);
+			}
+		}
+		for (let index = 0; index < this.redoStack.length; index += 1) {
+			const entry = this.redoStack[index]!;
+			if (entry.checkpoint.checkpointId === checkpointId) {
+				this.redoStack[index] = { ...entry, checkpoint: withAfterManifest(entry.checkpoint, afterManifestId) };
+			}
+		}
+	}
+
+	private async awaitPendingAfter(checkpointId: string): Promise<ManifestId | undefined> {
+		const pending = this.pendingAfter.get(checkpointId);
+		if (pending !== undefined) {
+			const materialized = await pending.promise;
+			if (materialized !== undefined) return materialized;
+		}
+		return this.resolvedAfter.get(checkpointId);
+	}
+
+	private async awaitAllPendingAfter(): Promise<void> {
+		if (this.pendingAfter.size === 0) return;
+		await Promise.allSettled([...this.pendingAfter.values()].map((entry) => entry.promise));
+	}
+
+	async materializeAfter(checkpoint: CheckpointRecord): Promise<ManifestId | undefined> {
+		if (!isCheckpointAfterPending(checkpoint)) return checkpoint.afterManifestId;
+		const materialized = await this.awaitPendingAfter(checkpoint.checkpointId);
+		if (materialized !== undefined) return materialized;
+		if (this.undoStack.at(-1)?.checkpointId !== checkpoint.checkpointId) return undefined;
+		const pending = this.pendingAfter.get(checkpoint.checkpointId);
+		try {
+			const manifest = pending !== undefined
+				? await this.captureScopedWithWorkspaceLock(checkpoint.changedPaths, pending.topologyFingerprint)
+				: await this.captureWithWorkspaceLock(false, checkpoint.changedPaths);
+			this.applyMaterializedAfter(checkpoint.checkpointId, manifest.manifestId);
+			return manifest.manifestId;
+		} catch (error) {
+			rethrowOperationFailure(error);
+			if (pending === undefined) return undefined;
+		}
+		// 缓存 topology 或作用域捕获失败时，退回一次完整发现的作用域捕获，避免直接丢历史。
+		try {
+			const manifest = await this.captureWithWorkspaceLock(false, checkpoint.changedPaths);
+			this.applyMaterializedAfter(checkpoint.checkpointId, manifest.manifestId);
+			return manifest.manifestId;
+		} catch (error) {
+			rethrowOperationFailure(error);
+			return undefined;
 		}
 	}
 
@@ -1659,6 +1795,12 @@ async function waitForCompletion(task: Promise<void>, deadline: number): Promise
 		if (timer !== undefined) clearTimeout(timer);
 		if (onAbort !== undefined) signal?.removeEventListener("abort", onAbort);
 	}
+}
+
+function withAfterManifest(checkpoint: CheckpointRecord, afterManifestId: ManifestId): CheckpointRecord {
+	const { checksum: _checksum, ...content } = checkpoint;
+	const payload = { ...content, afterManifestId };
+	return { ...payload, checksum: checksum(canonicalJson(payload)) };
 }
 
 function noop(): OperationResult {

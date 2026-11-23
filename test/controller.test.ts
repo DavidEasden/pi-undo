@@ -2,7 +2,7 @@ import { performance } from "node:perf_hooks";
 
 import { describe, expect, it, vi } from "vitest";
 
-import { UndoControllerImpl, type ControllerDependencies } from "../src/controller.ts";
+import { UndoControllerImpl, isCheckpointAfterPending, type ControllerDependencies } from "../src/controller.ts";
 import { checkOperation, currentOperationContext, OperationError } from "../src/operation-context.ts";
 import { canonicalJson, checksum } from "../src/encoding.ts";
 import type {
@@ -1754,13 +1754,14 @@ describe("UndoController", () => {
 		await controller.beforeAgentStart();
 		await controller.agentSettled();
 
-		expect(captureScoped).toHaveBeenCalledOnce();
 		expect(captureBaseline).not.toHaveBeenCalled();
 		expect(changedPaths).not.toHaveBeenCalled();
+		await vi.waitFor(() => expect(captureScoped).toHaveBeenCalledOnce());
 		const checkpoint = controller.listCheckpoints().at(-1);
 		expect(checkpoint?.changedPaths).toEqual(["file.txt"]);
 		expect(checkpoint?.afterManifestId).toBe("c".repeat(64));
 		expect(checkpoint?.beforeManifestId).not.toBe(checkpoint?.afterManifestId);
+		expect(isCheckpointAfterPending(checkpoint!)).toBe(false);
 	});
 
 	it("目录变化或文件数超限时保守退回完整结算", async () => {
@@ -1789,25 +1790,48 @@ describe("UndoController", () => {
 	});
 
 
-	it("作用域捕获失败时退回完整结算", async () => {
+	it("后台物化失败时保持 pending，并在 undo 前强制捕获当前状态", async () => {
 		const captureScoped = vi.fn(async () => { throw new Error("scoped failed"); });
 		const captureBaseline = vi.fn(async () => manifest("c"));
-		const changedPaths = vi.fn(async () => ["file.txt"]);
+		const capture = vi.fn(async (scope?: readonly string[]) => manifest(scope === undefined ? "a" : "c"));
 		const controller = new UndoControllerImpl(dependencies({
 			changeCursor: () => ({ sequence: 7, instance: "helper-test" }),
 			probeChanges: async () => ({ files: ["file.txt"], directories: [], trusted: true }),
 			captureScoped,
 			captureBaseline,
-			changedPaths,
+			capture,
 		}));
 		await controller.prepareInput("写入 run", { streaming: false });
 		await controller.beforeAgentStart();
 		await controller.agentSettled();
 
-		expect(captureScoped).toHaveBeenCalledOnce();
-		expect(captureBaseline).toHaveBeenCalledOnce();
-		expect(changedPaths).toHaveBeenCalledOnce();
-		expect(controller.listCheckpoints().at(-1)?.changedPaths).toEqual(["file.txt"]);
+		await vi.waitFor(() => expect(captureScoped).toHaveBeenCalledOnce());
+		const pending = controller.listCheckpoints().at(-1)!;
+		expect(isCheckpointAfterPending(pending)).toBe(true);
+		expect(captureBaseline).not.toHaveBeenCalled();
+		const result = await controller.undo();
+		expect(result.code).toBe("ok");
+		expect(capture.mock.calls.some(([scope]) =>
+			Array.isArray(scope) && scope.includes("file.txt"))).toBe(true);
+		expect(controller.history()).toEqual({ undoCount: 0, redoCount: 1, locked: false });
+	});
+
+	it("pending after 可按需物化并更新当前检查点", async () => {
+		const pending = checkpointWithPaths(["file.txt"]);
+		const pendingRecord: CheckpointRecord = {
+			...pending,
+			afterManifestId: pending.beforeManifestId,
+		};
+		const unsigned = { ...pendingRecord };
+		delete (unsigned as { checksum?: string }).checksum;
+		const withChecksum = { ...unsigned, checksum: checksum(canonicalJson(unsigned)) };
+		const capture = vi.fn(async () => manifest("c"));
+		const controller = new UndoControllerImpl(dependencies({ capture }), {
+			undoStack: [withChecksum],
+		});
+
+		expect(await controller.materializeAfter?.(withChecksum)).toBe("c".repeat(64));
+		expect(isCheckpointAfterPending(controller.listCheckpoints().at(-1)!)).toBe(false);
 	});
 
 	it("tree observed leaf 与预检目标不一致时进入 recovery lock 且不恢复", async () => {

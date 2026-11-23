@@ -10,7 +10,7 @@ import type {
 	SessionTreeEvent as PiSessionTreeEvent,
 } from "@earendil-works/pi-coding-agent";
 
-import type { OperationResult, SessionTreeEvent, UndoController } from "../src/controller.ts";
+import { isCheckpointAfterPending, type OperationResult, type SessionTreeEvent, type UndoController } from "../src/controller.ts";
 import { browseDiff } from "../src/diff-ui.ts";
 import { prepareCheckpointDiff, type DiffSource, sanitizeDisplayText } from "../src/diff-view.ts";
 import { createPiUndoRuntime } from "../src/pi-runtime.ts";
@@ -245,7 +245,21 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 			const checkpoint = checkpoints[checkpoints.length - position]!;
 			const label = runLabel(checkpoint.rawPrompt, position);
 			try {
-				const diff = await prepareCheckpointDiff(active.diffSource, checkpoint);
+				let afterManifestId = checkpoint.afterManifestId;
+				if (isCheckpointAfterPending(checkpoint)) {
+					const materialized = await active.controller.materializeAfter?.(checkpoint);
+					if (runtime !== active) return;
+					if (materialized === undefined) {
+						context.ui.notify("This run's after snapshot is still pending; try again after it settles", "warning");
+						return;
+					}
+					afterManifestId = materialized;
+				}
+				const diff = await prepareCheckpointDiff(active.diffSource, {
+					beforeManifestId: checkpoint.beforeManifestId,
+					afterManifestId,
+					changedPaths: checkpoint.changedPaths,
+				});
 				if (runtime !== active) return;
 				if (diff.files.length === 0) {
 					context.ui.notify("This run changed no files", "info");

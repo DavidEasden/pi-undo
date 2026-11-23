@@ -29,22 +29,28 @@ macOS arm64 / APFS / Node 23.11.1，工作区 11,182 个目录、36,377 个可�
 
 - 仅当探测结果全部是 `files`、没有 `directories`，且路径数不超过 2,048 时启用。
 - 复用输入基线捕获时缓存的 topology，不再重新执行目录发现。
-- 直接调用 `capture(topology, scopePaths)`，跳过全量 `captureBaseline`、baseline 探测和结果 plan。
+- 结算只写入 `before + changedPaths`，`after` 先等于 `before`，检查点标记为 pending；不执行任何 manifest capture。
+- 后台按缓存的 topology 物化 after：调用 `capture(topology, scopePaths)`，跳过全量 `captureBaseline`、baseline 探测和结果 plan。
 - 事件路径本身作为 `changedPaths`；即使某个文件最终内容未变，按该路径捕获并纳入检查点仍是安全的 no-op。
 - 作用域捕获跳过整份 leaf-cache 落盘，内存缓存仍更新；进程重启后由下一次完整捕获重建。
+- agentSettled 后立即 `/undo` 时会等待后台物化；物化失败时保留 pending，撤销前强制捕获当前状态。
+- 新 run 的输入捕获会先等待/物化上一轮 pending after，避免把下一轮修改误当成上一轮 after；无法物化时锁定历史。
 - 目录变化、事件不可信、helper 重启、topology 缓存缺失或路径超限时，继续走原完整结算。
 - 创建/删除/重命名 `.git` 仓库标记本身会禁用快速路径；`.git` 内部普通文件变化不计入。
-- 检查点写入 `settlement.fastPath = "scoped_delta"`；撤销和重做仍按 `changedPaths` 做作用域安全捕获。
+- 检查点写入 `settlement.fastPath = "pending_delta"`；撤销和重做仍按 `changedPaths` 做作用域安全捕获。
+- 树导航到最新 scoped/pending 检查点时按 session-only 处理（当前工作区已代表该叶子）；导航到历史中更早的 scoped 检查点会取消，避免用作用域清单推断完整树。后续如需完整支持，需要在后台合成全量 after manifest。
 
 macOS arm64 / APFS / Node 23.11.1，临时工作区 70 个目录、修改 1 个已有文件：
 
 | 指标 | 结果 |
 | --- | ---: |
-| `agentSettled` 全流程 | 104–131 ms（中位数约 111 ms） |
-| `settled.changeProbe` | 14–30 ms |
-| `settled.deltaCapture` | 87–132 ms |
+| `agentSettled` 全流程 | 14–17 ms |
+| `settled.changeProbe` | 13–16 ms |
+| 后台 after 物化 | 约 90–130 ms（不阻塞 agentSettled） |
+| 立即 `/undo`（含等待后台物化） | 约 344 ms |
+| 等待 300 ms 后 `/undo` | 约 267 ms |
 
-剩余成本主要是作用域 manifest 的 Git 对象写入与校验；多次运行会有进程与页缓存波动，尚未稳定低于 100 ms。要继续压缩，需要把 after manifest 改为按需/后台生成，而不是在结算路径同步完成。目录结构变化仍走完整捕获。
+结算前置等待已稳定低于 100 ms，剩余时间是真实的 after 物化、安全捕获和恢复计划，不再计入“undo 前等待”。多次运行会有进程与页缓存波动。目录结构变化仍走完整捕获。
 
 ## 叶子复核瓶颈定位（以 383a1acc 为基线，未采用任何优化）
 
