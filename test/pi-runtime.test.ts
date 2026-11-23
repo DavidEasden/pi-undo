@@ -1,5 +1,5 @@
 import { appendFileSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -10,6 +10,7 @@ import type { CheckpointRecord, CursorState, ManifestId, SessionFileIdentity } f
 import { createPiUndoRuntime as createRuntime } from "../src/pi-runtime.ts";
 import { JournalRecovery } from "../src/recovery.ts";
 import { RestoreEngine } from "../src/restore-engine.ts";
+import { SnapshotStore } from "../src/snapshot-store.ts";
 
 const temporaryRoots: string[] = [];
 const runtimes: Awaited<ReturnType<typeof createRuntime>>[] = [];
@@ -151,6 +152,88 @@ describe("Pi runtime cursor durability", () => {
 		const checkpoint = runtime.controller.listCheckpoints().at(-1);
 		expect(checkpoint?.changedPaths).toEqual([]);
 		expect(checkpoint?.beforeManifestId).toBe(checkpoint?.afterManifestId);
+	});
+
+	it.skipIf(process.platform !== "darwin")("native 可信空变更结算直接复用 before，不调用 captureBaseline", async () => {
+		const fixture = await liveOperationFixture();
+		// 让后续 discovery 继续选择 native 扫描，从而拿到变更序号。
+		await Promise.all(Array.from({ length: 70 }, (_, index) =>
+			mkdir(join(fixture.workspace, `dir-${index}`), { recursive: true })));
+		await writeFile(join(fixture.workspace, "stable.txt"), "stable\n");
+		const runtime = await createPiUndoRuntime(fixture.context as any, fixture.pi as any);
+		const captureBaseline = vi.spyOn(SnapshotStore.prototype, "captureBaseline");
+		try {
+			expect(await runtime.controller.prepareInput("只读 run", { streaming: false })).toEqual({ action: "continue" });
+			await runtime.controller.beforeAgentStart();
+			const startEntryId = fixture.manager.getLeafId();
+			fixture.appendSessionEntry({
+				type: "message",
+				id: "user-fast-settle",
+				parentId: startEntryId,
+				message: { role: "user", content: "只读 run" },
+			});
+			fixture.appendSessionEntry({
+				type: "message",
+				id: "assistant-fast-settle",
+				parentId: "user-fast-settle",
+				message: { role: "assistant", content: [] },
+			});
+
+			await runtime.controller.agentSettled();
+
+			expect(captureBaseline).not.toHaveBeenCalled();
+			const checkpoint = runtime.controller.listCheckpoints().at(-1);
+			expect(checkpoint?.changedPaths).toEqual([]);
+			expect(checkpoint?.beforeManifestId).toBe(checkpoint?.afterManifestId);
+			const diagnosticPath = join(fixture.context.sessionManager.getSessionDir(),
+				".pi-undo", "diagnostics", "session-live-settlement-diagnostic.json");
+			await vi.waitFor(async () => {
+				const diagnostic = JSON.parse(await readFile(diagnosticPath, "utf8"));
+				expect(diagnostic.settlement.fastPath).toBe("no_changes");
+				expect(diagnostic.settlement.timings).toEqual(expect.arrayContaining([
+					expect.objectContaining({ phase: "settled.changeProbe" }),
+				]));
+				expect(diagnostic.settlement.timings).not.toEqual(expect.arrayContaining([
+					expect.objectContaining({ phase: "settled.capture" }),
+				]));
+			});
+		} finally {
+			captureBaseline.mockRestore();
+		}
+	});
+
+	it.skipIf(process.platform !== "darwin")("native 探测到 run 期间写入时退回完整 capture 并记录变更路径", async () => {
+		const fixture = await liveOperationFixture();
+		await Promise.all(Array.from({ length: 70 }, (_, index) =>
+			mkdir(join(fixture.workspace, `dir-${index}`), { recursive: true })));
+		const runtime = await createPiUndoRuntime(fixture.context as any, fixture.pi as any);
+		const captureBaseline = vi.spyOn(SnapshotStore.prototype, "captureBaseline");
+		try {
+			expect(await runtime.controller.prepareInput("写入 run", { streaming: false })).toEqual({ action: "continue" });
+			await runtime.controller.beforeAgentStart();
+			const startEntryId = fixture.manager.getLeafId();
+			fixture.appendSessionEntry({
+				type: "message",
+				id: "user-write-settle",
+				parentId: startEntryId,
+				message: { role: "user", content: "写入 run" },
+			});
+			fixture.appendSessionEntry({
+				type: "message",
+				id: "assistant-write-settle",
+				parentId: "user-write-settle",
+				message: { role: "assistant", content: [] },
+			});
+			await writeFile(join(fixture.workspace, "tracked.txt"), "after\n");
+			await new Promise((resolve) => setTimeout(resolve, 50));
+
+			await runtime.controller.agentSettled();
+
+			expect(captureBaseline).toHaveBeenCalledOnce();
+			expect(runtime.controller.listCheckpoints().at(-1)?.changedPaths).toContain("tracked.txt");
+		} finally {
+			captureBaseline.mockRestore();
+		}
 	});
 
 	it("settled 发现变化时 captureBaseline 回退完整 capture", async () => {

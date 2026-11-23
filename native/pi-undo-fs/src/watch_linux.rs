@@ -266,7 +266,15 @@ impl Watch {
             by_path: HashMap::new(),
             generation: 0,
             degraded: false,
-            pending: EventBatch { generation: 0, changed_paths: HashSet::new(), uncertain: false, file_entries_only: false, coverage_trusted: false },
+            pending: EventBatch {
+                generation: 0,
+                changed_paths: HashSet::new(),
+                changed_files: HashSet::new(),
+                changed_dirs: HashSet::new(),
+                uncertain: false,
+                file_entries_only: false,
+                coverage_trusted: false,
+            },
         };
         // 初始 watch 建立失败（如超过 max_user_watches）时拒绝常驻模式，调用方回退一次性扫描。
         if let Err(error) = inner.add_tree("", 0, false) {
@@ -292,8 +300,46 @@ impl Watch {
         }
         let generation = inner.generation;
         let changed_paths = std::mem::take(&mut inner.pending.changed_paths);
+        let changed_files = std::mem::take(&mut inner.pending.changed_files);
+        let changed_dirs = std::mem::take(&mut inner.pending.changed_dirs);
         let uncertain = std::mem::replace(&mut inner.pending.uncertain, false);
-        EventBatch { generation, changed_paths, uncertain, file_entries_only: false, coverage_trusted: false }
+        EventBatch {
+            generation,
+            changed_paths,
+            changed_files,
+            changed_dirs,
+            uncertain,
+            file_entries_only: false,
+            coverage_trusted: false,
+        }
+    }
+
+    pub(super) fn peek(&self, settle: bool) -> EventBatch {
+        if settle {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut inner = self.inner.borrow_mut();
+        inner.read_events();
+        if inner.degraded {
+            return EventBatch::unknown();
+        }
+        EventBatch {
+            generation: inner.generation,
+            changed_paths: inner.pending.changed_paths.clone(),
+            changed_files: inner.pending.changed_files.clone(),
+            changed_dirs: inner.pending.changed_dirs.clone(),
+            uncertain: inner.pending.uncertain,
+            file_entries_only: false,
+            coverage_trusted: false,
+        }
+    }
+
+    pub(super) fn change_tracking_supported(&self) -> bool {
+        false
+    }
+
+    pub(super) fn trusted(&self) -> bool {
+        false
     }
 }
 

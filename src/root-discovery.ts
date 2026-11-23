@@ -5,7 +5,12 @@ import { DirectoryListingCache } from "./directory-listing-cache.ts";
 import { checksum, topologyFingerprint } from "./encoding.ts";
 import { GitRunError, GitRunner } from "./git-runner.ts";
 import type { DiscoveryRoot } from "./model.ts";
-import { NativeDirectoryScanner, type NativeDirectoryScanPort, type NativeRepositoryCandidate } from "./native-directory-scan.ts";
+import {
+	NativeDirectoryScanner,
+	type NativeChangeCursor,
+	type NativeDirectoryScanPort,
+	type NativeRepositoryCandidate,
+} from "./native-directory-scan.ts";
 import { allCompleted, checkOperation, OperationError, reportOperationProgress } from "./operation-context.ts";
 
 const DIRECTORY_SCAN_CONCURRENCY = 16;
@@ -78,6 +83,8 @@ export class RootDiscovery {
 	private readonly git: GitRunner;
 	private lastDirectoryCount: number | undefined;
 	private readonly nativeScan: NativeDirectoryScanPort;
+	/** 最近一次 discover 实际使用 native 扫描时的变更游标；TS 回退必须视为不可用。 */
+	private lastChangeCursor: NativeChangeCursor | undefined;
 	/** 共享盘 TypeScript 扫描的目录项缓存；ignored 扫描与恢复前后发现复用同一份。 */
 	readonly listingCache = new DirectoryListingCache();
 
@@ -95,6 +102,22 @@ export class RootDiscovery {
 	/** ignored 分区与拓扑发现共享常驻目录缓存，但每次请求都重新核验事件。 */
 	async scanIgnoredLeaves(workspaceRoot: string, roots: readonly string[]): Promise<string[] | undefined> {
 		return this.nativeScan.scanLeaves?.(workspaceRoot, roots);
+	}
+
+	/** 最近一次 native 拓扑扫描的变更游标；旧 helper 或 TS 扫描返回 undefined。 */
+	changeCursor(): NativeChangeCursor | undefined {
+		return this.lastChangeCursor;
+	}
+
+	/** 查询自基线捕获以来的可信文件/目录变化；不可用时返回 undefined。 */
+	async changesSince(workspaceRoot: string, cursor: NativeChangeCursor) {
+		const canonical = await canonicalWorkspaceRoot(workspaceRoot);
+		return this.nativeScan.changesSince?.(canonical, cursor);
+	}
+
+	/** 仅重置常驻 helper 看门狗；失败不影响结算。 */
+	keepAlive(): void {
+		this.nativeScan.keepAlive?.();
 	}
 
 	/** 关闭 native 常驻扫描客户端。 */
@@ -150,6 +173,9 @@ export class RootDiscovery {
 		// 上次规模只选择执行器；小工作区仍完整重扫，目录增长后会重新使用 native。
 		const native = this.lastDirectoryCount !== undefined && this.lastDirectoryCount < NATIVE_SCAN_MIN_DIRECTORIES
 			? undefined : await this.nativeScan.scan(workspaceIdentity);
+		this.lastChangeCursor = native?.changeSequence === undefined || native.changeInstance === undefined
+			? undefined
+			: { sequence: native.changeSequence, instance: native.changeInstance };
 		if (native !== undefined) {
 			this.lastDirectoryCount = native.directories;
 			for (let index = 0; index < native.repositories.length; index += DIRECTORY_SCAN_CONCURRENCY) {

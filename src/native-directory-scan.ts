@@ -19,12 +19,35 @@ export interface NativeRepositoryCandidate {
 export interface NativeDirectoryScan {
 	readonly directories: number;
 	readonly repositories: readonly NativeRepositoryCandidate[];
+	/** 常驻 helper 当前变更序号；旧 helper 或一次性扫描没有该字段。 */
+	readonly changeSequence?: number;
+	/** 变更序号所属的 helper 实例；重启后的序号不可比较。 */
+	readonly changeInstance?: string;
+}
+
+export interface NativeChangeCursor {
+	readonly sequence: number;
+	readonly instance: string;
+}
+
+export interface NativeChangeSet {
+	readonly files: readonly string[];
+	readonly directories: readonly string[];
+	readonly trusted: boolean;
+	readonly sequence: number;
+	readonly instance: string;
 }
 
 export interface NativeDirectoryScanPort {
 	scan(workspaceRoot: string): Promise<NativeDirectoryScan | undefined>;
 	/** 重新排空事件并核验缓存后，返回指定子树的完整文件/符号链接名。 */
 	scanLeaves?(workspaceRoot: string, roots: readonly string[]): Promise<string[] | undefined>;
+	/** 最近一次 native 扫描对应的变更游标；未建立常驻监听时返回 undefined。 */
+	changeCursor?(): NativeChangeCursor | undefined;
+	/** 查询自指定变更游标以来的文件/目录变化；不可信时返回 undefined。 */
+	changesSince?(workspaceRoot: string, cursor: NativeChangeCursor): Promise<NativeChangeSet | undefined>;
+	/** 仅重置常驻 helper 看门狗，不触发扫描。 */
+	keepAlive?(): void;
 	/** 可选的会话级预热；测试替身和旧调用方无需实现。 */
 	prewarm?(workspaceRoot: string): void;
 	/** 运行时销毁时关闭常驻 helper，避免跨会话遗留进程。 */
@@ -61,6 +84,8 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 		readonly workspaceRoot: string;
 		readonly cachePath: string | undefined;
 		readonly client: ResidentScanClient;
+		lastSequence?: number;
+		lastInstance?: string;
 		lastLeaves?: { readonly roots: readonly string[]; readonly paths: readonly string[]; readonly digest: string };
 	} | undefined;
 	private prewarmInFlight: { readonly workspaceRoot: string; readonly promise: Promise<void> } | undefined;
@@ -90,17 +115,20 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 	}
 
 	private async prewarmResident(workspaceRoot: string): Promise<void> {
-		if (!await allowsNativeMountFastPaths(workspaceRoot)) return;
+		// discovery 用 canonical identity 建立 resident；预热也必须使用同一路径，
+		// 否则符号链接（macOS 的 /var → /private/var）会导致 helper 被重建。
+		const canonicalRoot = await realpath(workspaceRoot).catch(() => workspaceRoot);
+		if (!await allowsNativeMountFastPaths(canonicalRoot)) return;
 		const temporaryRoot = await realpath(tmpdir()).catch(() => undefined);
-		if (temporaryRoot === undefined || isPathInside(workspaceRoot, temporaryRoot)) return;
+		if (temporaryRoot === undefined || isPathInside(canonicalRoot, temporaryRoot)) return;
 		const requestDirectory = await mkdtemp(join(temporaryRoot, "pi-undo-native-serve-probe-"));
 		try {
 			const capabilities = await this.probeCapabilities(requestDirectory);
 			if (!capabilities.has("scan-serve-v1")) return;
 			const cachePath = capabilities.has("scan-serve-cache-v1")
-				? await this.directoryCachePath(workspaceRoot, temporaryRoot, requestDirectory)
+				? await this.directoryCachePath(canonicalRoot, temporaryRoot, requestDirectory)
 				: undefined;
-			const client = this.ensureResident(workspaceRoot, cachePath);
+			const client = this.ensureResident(canonicalRoot, cachePath);
 			if (client !== undefined) await client.prewarm();
 		} finally {
 			await rm(requestDirectory, { recursive: true, force: true }).catch(() => {});
@@ -149,7 +177,14 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 					checkOperation();
 					if (response !== undefined) {
 						const parsed = parseResidentResponse(response);
-						if (parsed !== undefined) return parsed;
+						if (parsed !== undefined) {
+							const resident = this.resident;
+							if (resident !== undefined) {
+								resident.lastSequence = parsed.changeSequence;
+								resident.lastInstance = parsed.changeInstance;
+							}
+							return parsed;
+						}
 						client.reset();
 					}
 				}
@@ -204,10 +239,13 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 			: await resident.client.scan(undefined, requested, cached.digest);
 		checkOperation();
 		if (response === undefined) return undefined;
-		if (parseResidentResponse(response) === undefined) {
+		const parsed = parseResidentResponse(response);
+		if (parsed === undefined) {
 			resident.client.reset();
 			return undefined;
 		}
+		resident.lastSequence = parsed.changeSequence;
+		resident.lastInstance = parsed.changeInstance;
 		if (response.matchedLeafDigest !== undefined) {
 			// 只有本次确实发过的摘要可以替代完整结果，不能接受主动回送或含糊的响应。
 			if (cached !== undefined && response.matchedLeafDigest === cached.digest && response.leaves === undefined) {
@@ -241,6 +279,42 @@ export class NativeDirectoryScanner implements NativeDirectoryScanPort {
 			}
 		}
 		return paths as string[];
+	}
+
+	changeCursor(): NativeChangeCursor | undefined {
+		const resident = this.resident;
+		return resident?.lastSequence === undefined || resident.lastInstance === undefined
+			? undefined
+			: { sequence: resident.lastSequence, instance: resident.lastInstance };
+	}
+
+	async changesSince(workspaceRoot: string, cursor: NativeChangeCursor): Promise<NativeChangeSet | undefined> {
+		checkOperation();
+		const resident = this.resident;
+		if (resident?.workspaceRoot !== workspaceRoot || this.executable === undefined ||
+			!await allowsNativeMountFastPaths(workspaceRoot)) return undefined;
+		const capabilities = this.capabilities === undefined ? undefined : await this.capabilities;
+		if (capabilities?.has("scan-serve-changes-v1") !== true) return undefined;
+		const response = await resident.client.changesSince(cursor.sequence, cursor.instance);
+		checkOperation();
+		if (response === undefined) return undefined;
+		const parsed = parseChangesResponse(response);
+		if (parsed === undefined) {
+			resident.client.reset();
+			return undefined;
+		}
+		// 实例不匹配只说明 helper 重启过；保留新 helper 的游标，下一次仍可正常工作。
+		resident.lastSequence = parsed.sequence;
+		resident.lastInstance = parsed.instance;
+		return parsed;
+	}
+
+	keepAlive(): void {
+		const resident = this.resident;
+		if (resident === undefined || this.capabilities === undefined) return;
+		void this.capabilities.then((capabilities) => {
+			if (capabilities.has("scan-serve-changes-v1")) void resident.client.keepAlive().catch(() => undefined);
+		}).catch(() => undefined);
 	}
 
 	private async probeCapabilities(directory: string): Promise<ReadonlySet<string>> {
@@ -308,7 +382,14 @@ function parseScanResponse(text: string): NativeDirectoryScan | undefined {
 		seen.add(candidate.path);
 		return { path: candidate.path, dev: parseIdentity(candidate.dev), ino: parseIdentity(candidate.ino) };
 	});
-	return { directories: value.directories as number, repositories };
+	const changeSequence = parseChangeSequence(value.changeSeq);
+	const changeInstance = parseChangeInstance(value.changeInstance);
+	return {
+		directories: value.directories as number,
+		repositories,
+		...(changeSequence === undefined ? {} : { changeSequence }),
+		...(changeInstance === undefined ? {} : { changeInstance }),
+	};
 }
 
 function parseResidentResponse(value: Record<string, unknown>): NativeDirectoryScan | undefined {
@@ -336,7 +417,51 @@ function parseScanValue(value: unknown): NativeDirectoryScan | undefined {
 		seen.add(candidate.path);
 		repositories.push({ path: candidate.path, dev: parseIdentity(candidate.dev), ino: parseIdentity(candidate.ino) });
 	}
-	return { directories: value.directories as number, repositories };
+	const changeSequence = parseChangeSequence(value.changeSeq);
+	const changeInstance = parseChangeInstance(value.changeInstance);
+	return {
+		directories: value.directories as number,
+		repositories,
+		...(changeSequence === undefined ? {} : { changeSequence }),
+		...(changeInstance === undefined ? {} : { changeInstance }),
+	};
+}
+
+function parseChangesResponse(value: Record<string, unknown>): NativeChangeSet | undefined {
+	try {
+		const sequence = parseChangeSequence(value.changeSeq);
+		const instance = parseChangeInstance(value.changeInstance);
+		if (value.ok !== true || value.supported !== true ||
+			sequence === undefined || instance === undefined) return undefined;
+		const files = parseChangePaths(value.changedFiles);
+		const directories = parseChangePaths(value.changedDirs);
+		if (files === undefined || directories === undefined) return undefined;
+		return { files, directories, trusted: value.trusted === true, sequence, instance };
+	} catch {
+		return undefined;
+	}
+}
+
+function parseChangePaths(value: unknown): string[] | undefined {
+	if (!Array.isArray(value) || value.length > 65_536) return undefined;
+	const paths: string[] = [];
+	for (const entry of value) {
+		if (typeof entry !== "string" || entry.length === 0 || entry.includes("\0") ||
+			entry.split("/").some((part) => part === "" || part === "." || part === ".." ||
+				part.toLowerCase() === ".git")) return undefined;
+		paths.push(entry);
+	}
+	return paths;
+}
+
+function parseChangeSequence(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function parseChangeInstance(value: unknown): string | undefined {
+	return typeof value === "string" && value.length > 0 && value.length <= 128 && !value.includes("\0")
+		? value
+		: undefined;
 }
 
 function parseIdentity(value: unknown): bigint {

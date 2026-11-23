@@ -11,13 +11,13 @@ use crate::scan_directories::{
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use std::time::{Duration, Instant};
 
@@ -25,6 +25,11 @@ const SERVE_PROTOCOL_VERSION: u32 = 1;
 /// 闲置超时：无请求持续该时长后自杀，由调用方按需重启。
 /// 空闲 10 秒后退出；客户端按需重新握手并复用持久目录缓存。
 const SERVE_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 单次 drain 最多保留的精确变更项；超限时要求调用方退回完整捕获。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const MAX_CHANGED_ENTRIES: usize = 8192;
+/// 变更日志最多保存的路径数；超出后丢弃最早一半，并拒绝越过该序号的查询。
+const MAX_TRACKED_CHANGE_PATHS: usize = 65_536;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -36,9 +41,14 @@ struct ServeRequest {
     cache_path: Option<String>,
 }
 
+#[derive(Clone)]
 struct EventBatch {
     generation: u64,
     changed_paths: HashSet<String>,
+    /// 精确到文件/符号链接的变化项，供结算前的快速变更探测使用。
+    changed_files: HashSet<String>,
+    /// 精确到目录的变化项；目录结构变化需要按子树捕获。
+    changed_dirs: HashSet<String>,
     uncertain: bool,
     /// 仅普通文件目录项或明确的目录元数据事件，允许核验后复用无事件的近期子树。
     file_entries_only: bool,
@@ -51,10 +61,178 @@ impl EventBatch {
         Self {
             generation: 0,
             changed_paths: HashSet::new(),
+            changed_files: HashSet::new(),
+            changed_dirs: HashSet::new(),
             uncertain: true,
             file_entries_only: false,
             coverage_trusted: false,
         }
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn record_file(&mut self, path: String) {
+        self.record_change(true, path);
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn record_dir(&mut self, path: String) {
+        self.record_change(false, path);
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn record_change(&mut self, file: bool, path: String) {
+        if path.is_empty() || is_git_metadata_path(&path) {
+            // 根目录事件无法用路径 scope 表达；.git 不属于快照内容。
+            if path.is_empty() {
+                self.uncertain = true;
+                self.coverage_trusted = false;
+            }
+            return;
+        }
+        let set = if file { &mut self.changed_files } else { &mut self.changed_dirs };
+        if set.len() >= MAX_CHANGED_ENTRIES && !set.contains(&path) {
+            self.uncertain = true;
+            self.coverage_trusted = false;
+            self.changed_files.clear();
+            self.changed_dirs.clear();
+            return;
+        }
+        set.insert(path);
+    }
+}
+
+/// 只记录路径的最新变化序号；查询时返回序号晚于 since 的路径。
+struct ChangeTracker {
+    sequence: u64,
+    files: HashMap<String, u64>,
+    dirs: HashMap<String, u64>,
+    pruned_before: u64,
+    trusted: bool,
+}
+
+impl ChangeTracker {
+    fn new() -> Self {
+        Self {
+            sequence: 0,
+            files: HashMap::new(),
+            dirs: HashMap::new(),
+            pruned_before: 0,
+            trusted: true,
+        }
+    }
+
+    fn record(&mut self, batch: &EventBatch) {
+        if batch.uncertain || !batch.coverage_trusted {
+            self.trusted = false;
+        }
+        if batch.changed_files.is_empty() && batch.changed_dirs.is_empty() {
+            return;
+        }
+        self.sequence = self.sequence.saturating_add(1);
+        let sequence = self.sequence;
+        for path in &batch.changed_files {
+            self.files.insert(path.clone(), sequence);
+        }
+        for path in &batch.changed_dirs {
+            self.dirs.insert(path.clone(), sequence);
+        }
+        self.prune();
+    }
+
+    fn prune(&mut self) {
+        if self.files.len() + self.dirs.len() <= MAX_TRACKED_CHANGE_PATHS {
+            return;
+        }
+        let mut sequences: Vec<u64> = self.files.values().chain(self.dirs.values()).copied().collect();
+        sequences.sort_unstable();
+        let cutoff = sequences[sequences.len() / 2];
+        self.files.retain(|_, sequence| *sequence > cutoff);
+        self.dirs.retain(|_, sequence| *sequence > cutoff);
+        self.pruned_before = self.pruned_before.max(cutoff);
+    }
+
+    fn changes_since(&self, since: u64) -> (Vec<String>, Vec<String>, bool) {
+        if !self.trusted || since > self.sequence || since < self.pruned_before {
+            return (Vec::new(), Vec::new(), false);
+        }
+        let mut files: Vec<String> = self.files.iter()
+            .filter(|(_, sequence)| **sequence > since)
+            .map(|(path, _)| path.clone())
+            .collect();
+        let mut dirs: Vec<String> = self.dirs.iter()
+            .filter(|(_, sequence)| **sequence > since)
+            .map(|(path, _)| path.clone())
+            .collect();
+        files.sort();
+        dirs.sort();
+        (files, dirs, true)
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn is_git_metadata_path(path: &str) -> bool {
+    path.split('/').any(|component| component.eq_ignore_ascii_case(".git"))
+}
+
+#[cfg(test)]
+mod change_tracker_tests {
+    use super::*;
+
+    fn batch(files: &[&str], dirs: &[&str]) -> EventBatch {
+        let mut batch = EventBatch::unknown();
+        batch.uncertain = false;
+        batch.coverage_trusted = true;
+        for file in files {
+            batch.record_file((*file).to_owned());
+        }
+        for dir in dirs {
+            batch.record_dir((*dir).to_owned());
+        }
+        batch
+    }
+
+    #[test]
+    fn changes_since_only_returns_entries_after_the_requested_sequence() {
+        let mut tracker = ChangeTracker::new();
+        tracker.record(&batch(&["src/a.ts"], &[]));
+        let (files, dirs, trusted) = tracker.changes_since(0);
+        assert!(trusted);
+        assert_eq!(files, vec!["src/a.ts".to_owned()]);
+        assert!(dirs.is_empty());
+
+        let (files, _, trusted) = tracker.changes_since(1);
+        assert!(trusted);
+        assert!(files.is_empty());
+
+        tracker.record(&batch(&["src/b.ts"], &["new-dir"]));
+        let (files, dirs, trusted) = tracker.changes_since(1);
+        assert!(trusted);
+        assert_eq!(files, vec!["src/b.ts".to_owned()]);
+        assert_eq!(dirs, vec!["new-dir".to_owned()]);
+    }
+
+    #[test]
+    fn untrusted_or_future_sequences_refuse_the_fast_path() {
+        let mut tracker = ChangeTracker::new();
+        tracker.record(&batch(&["src/a.ts"], &[]));
+        let mut uncertain = batch(&["src/b.ts"], &[]);
+        uncertain.uncertain = true;
+        tracker.record(&uncertain);
+        assert!(!tracker.changes_since(0).2);
+        assert!(!ChangeTracker::new().changes_since(1).2);
+    }
+
+    #[test]
+    fn git_metadata_is_not_part_of_the_workspace_change_set() {
+        let mut batch = EventBatch::unknown();
+        batch.uncertain = false;
+        batch.coverage_trusted = true;
+        batch.record_file(".git/index".into());
+        batch.record_file("packages/.git/HEAD".into());
+        batch.record_dir(".git/objects".into());
+        assert!(batch.changed_files.is_empty());
+        assert!(batch.changed_dirs.is_empty());
+        assert!(!batch.uncertain);
     }
 }
 
@@ -63,6 +241,9 @@ struct ResidentState {
     workspace_dev: u64,
     workspace_ino: u64,
     directories: BTreeMap<String, CachedDirectory>,
+    changes: ChangeTracker,
+    /// 本次 helper 进程的唯一标识；序号只在本实例内可比较。
+    change_instance: String,
     watch: Watch,
 }
 
@@ -74,13 +255,20 @@ fn main_loop(
     // busy 标志在请求处理期间置 1，处理结束归 0；扫描长操作不受影响（最长操作时间远小于超时也成立：
     // 看门狗只看 busy，不看总时长）。
     let busy = Arc::new(AtomicBool::new(true));
+    // busy 只在请求处理期间为 true，极短的 keepAlive 请求可能落在两次采样之间；
+    // 额外记录请求到达次数，确保任何请求都能重置看门狗。
+    let activity = Arc::new(AtomicU64::new(0));
     {
         let busy_flag = busy.clone();
+        let activity_flag = activity.clone();
         std::thread::spawn(move || {
             let mut idle_start: Option<Instant> = None;
+            let mut observed_activity = activity_flag.load(Ordering::Relaxed);
             loop {
                 std::thread::sleep(Duration::from_millis(250));
-                if busy_flag.load(Ordering::Relaxed) {
+                let current_activity = activity_flag.load(Ordering::Relaxed);
+                if busy_flag.load(Ordering::Relaxed) || current_activity != observed_activity {
+                    observed_activity = current_activity;
                     idle_start = None;
                 } else {
                     let since = *idle_start.get_or_insert_with(Instant::now);
@@ -122,11 +310,17 @@ fn main_loop(
         .cache_path
         .as_deref()
         .and_then(|path| load_cache(Path::new(path), &root, &workspace));
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
     let mut state = ResidentState {
         workspace,
         workspace_dev,
         workspace_ino,
         directories: BTreeMap::new(),
+        changes: ChangeTracker::new(),
+        change_instance: format!("{}-{started_at}", std::process::id()),
         watch,
     };
     let mut scan_state = ScanState {
@@ -168,6 +362,8 @@ fn main_loop(
         "directories": initial_directories,
         "cacheHits": false,
         "repositories": initial_repositories,
+        "changeSeq": state.changes.sequence,
+        "changeInstance": state.change_instance,
     });
     writeln!(output, "{initial}").map_err(|error| format!("写 serve 响应失败：{error}"))?;
     output
@@ -183,6 +379,7 @@ fn main_loop(
         if read == 0 {
             return Ok(()); // 客户端关闭：进程随之退出。
         }
+        activity.fetch_add(1, Ordering::Relaxed);
         busy.store(true, Ordering::Relaxed);
         if line.last() == Some(&b'\n') {
             line.pop();
@@ -204,7 +401,53 @@ fn main_loop(
             output.flush().map_err(|error| error.to_string())?;
             continue;
         }
+        if request.keep_alive {
+            let payload = serde_json::json!({
+                "ok": true,
+                "changeSeq": state.changes.sequence,
+            });
+            writeln!(output, "{payload}")
+                .map_err(|error| format!("写 serve 响应失败：{error}"))?;
+            output.flush().map_err(|error| error.to_string())?;
+            busy.store(false, Ordering::Relaxed);
+            continue;
+        }
+        if let Some(since) = request.since_seq {
+            if let Err(error) = assert_workspace_identity(&state) {
+                write_error(&mut output, &error)?;
+                output.flush().map_err(|error| error.to_string())?;
+                busy.store(false, Ordering::Relaxed);
+                continue;
+            }
+            // 只 peek，不消费目录缓存事件：随后的拓扑扫描仍必须看到同一批变化。
+            let first = state.watch.peek(true);
+            state.changes.record(&first);
+            let second = state.watch.peek(true);
+            state.changes.record(&second);
+            let supported = state.watch.change_tracking_supported();
+            let same_instance = request.since_instance.as_deref() == Some(state.change_instance.as_str());
+            let (changed_files, changed_dirs, mut trusted) = state.changes.changes_since(since);
+            trusted &= same_instance && supported && state.watch.trusted()
+                && !first.uncertain && !second.uncertain
+                && first.coverage_trusted && second.coverage_trusted;
+            let payload = serde_json::json!({
+                "ok": true,
+                "supported": supported,
+                "changeSeq": state.changes.sequence,
+                "changedFiles": changed_files,
+                "changedDirs": changed_dirs,
+                "trusted": trusted,
+                "changeInstance": state.change_instance,
+                "prunedBefore": state.changes.pruned_before,
+            });
+            writeln!(output, "{payload}")
+                .map_err(|error| format!("写 serve 响应失败：{error}"))?;
+            output.flush().map_err(|error| error.to_string())?;
+            busy.store(false, Ordering::Relaxed);
+            continue;
+        }
         let pending = state.watch.drain(false);
+        state.changes.record(&pending);
         let local_generation = pending.generation;
         let result = if pending.uncertain {
             serve_rescan(&mut state, &root)
@@ -220,6 +463,7 @@ fn main_loop(
                 .or_else(|_| serve_rescan(&mut state, &root))
         };
         let late = state.watch.drain(true);
+        state.changes.record(&late);
         let result = if late.uncertain
             || late.generation != local_generation
             || !late.changed_paths.is_empty()
@@ -232,6 +476,7 @@ fn main_loop(
             };
             if retry.is_ok() {
                 let after = state.watch.drain(false);
+                state.changes.record(&after);
                 if after.uncertain || !after.changed_paths.is_empty() {
                     Err("目录扫描期间 workspace 持续发生变化".into())
                 } else {
@@ -250,6 +495,8 @@ fn main_loop(
                     "directories": response.directories,
                     "cacheHits": response.cache_hits,
                     "repositories": response.repositories,
+                    "changeSeq": state.changes.sequence,
+                    "changeInstance": state.change_instance,
                 });
                 if let Some(roots) = &request.leaf_roots {
                     // 叶子与拓扑来自同一次事件排空和复核；无法给出完整列表时拒绝复用。
@@ -288,6 +535,15 @@ struct ScanRequest {
     leaf_roots: Option<Vec<String>>,
     #[serde(default)]
     if_leaf_digest: Option<String>,
+    /// 查询自该变更序号以来的文件/目录变化；不消费目录缓存事件。
+    #[serde(default)]
+    since_seq: Option<u64>,
+    /// 变更序号所属的 helper 实例；重启后的 helper 不能复用旧序号。
+    #[serde(default)]
+    since_instance: Option<String>,
+    /// 仅用于重置 serve 看门狗，不触发扫描。
+    #[serde(default)]
+    keep_alive: bool,
 }
 
 /// 与完整响应使用同一顺序；每个 UTF-8 路径以 NUL 结尾，名称中的换行等字符不产生歧义。
@@ -664,6 +920,7 @@ mod watch_impl {
         if !relative_path.is_empty()
             && (flags == content_flags || flags == (content_flags | EVENT_ITEM_INODE_META_MOD))
         {
+            batch.record_file(relative_path);
             return false;
         }
         // 即使文件的 Created 与 Modified 合并，也必须重读父目录；只有其无事件子树可复用。
@@ -692,12 +949,14 @@ mod watch_impl {
             .unwrap_or("")
             .to_owned();
         if is_directory {
+            batch.record_dir(relative_path.clone());
             insert_changed_path(batch, relative_path.clone());
             if flags & (EVENT_ITEM_CREATED | EVENT_ITEM_REMOVED | EVENT_ITEM_RENAMED) != 0 {
                 insert_changed_path(batch, parent);
             }
             return true;
         }
+        batch.record_file(relative_path);
         insert_changed_path(batch, parent);
         true
     }
@@ -722,6 +981,8 @@ mod watch_impl {
                 pending: Mutex::new(EventBatch {
                     generation: 0,
                     changed_paths: HashSet::new(),
+                    changed_files: HashSet::new(),
+                    changed_dirs: HashSet::new(),
                     uncertain: false,
                     file_entries_only: true,
                     coverage_trusted: true,
@@ -767,6 +1028,8 @@ mod watch_impl {
             assert_eq!(events.generation.load(Ordering::Acquire), 0);
             let pending = events.pending.lock().unwrap();
             assert!(pending.changed_paths.is_empty());
+            assert_eq!(pending.changed_files, HashSet::from(["value.txt".into(), "deep/file".into()]));
+            assert!(pending.changed_dirs.is_empty());
             assert!(!pending.uncertain);
         }
 
@@ -803,11 +1066,13 @@ mod watch_impl {
             ]);
             assert_eq!(events.generation.load(Ordering::Acquire), 1);
             assert_eq!(events.pending.lock().unwrap().changed_paths, HashSet::from(["deps".into()]));
+            assert_eq!(events.pending.lock().unwrap().changed_files, HashSet::from(["deps/new".into(), "value.txt".into()]));
             // 同一路径再次变化仍推进代数；纯内容事件不得清除尚未消费的变化。
             emit_events(&events, &[("/workspace/deps/new", created)]);
             emit_events(&events, &[("/workspace/value.txt", modified)]);
             assert_eq!(events.generation.load(Ordering::Acquire), 2);
             assert!(events.pending.lock().unwrap().changed_paths.contains("deps"));
+            assert_eq!(events.pending.lock().unwrap().changed_files, HashSet::from(["deps/new".into(), "value.txt".into()]));
             for path in ["/outside/value.txt", "/workspace/../outside/value.txt"] {
                 let events = shared_events();
                 emit_events(&events, &[(path, modified)]);
@@ -859,6 +1124,8 @@ mod watch_impl {
             let mut batch = EventBatch {
                 generation: 0,
                 changed_paths: HashSet::new(),
+                changed_files: HashSet::new(),
+                changed_dirs: HashSet::new(),
                 uncertain: false,
                 file_entries_only: true,
                 coverage_trusted: true,
@@ -884,6 +1151,8 @@ mod watch_impl {
                 ])
             );
             assert!(!batch.uncertain);
+            assert_eq!(batch.changed_files, HashSet::from(["repo/src/main.rs".into()]));
+            assert_eq!(batch.changed_dirs, HashSet::from(["repo/new-dir".into()]));
         }
 
         #[test]
@@ -891,6 +1160,8 @@ mod watch_impl {
             let mut batch = EventBatch {
                 generation: 0,
                 changed_paths: HashSet::new(),
+                changed_files: HashSet::new(),
+                changed_dirs: HashSet::new(),
                 uncertain: false,
                 file_entries_only: true,
                 coverage_trusted: true,
@@ -905,6 +1176,8 @@ mod watch_impl {
             let mut batch = EventBatch {
                 generation: 0,
                 changed_paths: HashSet::new(),
+                changed_files: HashSet::new(),
+                changed_dirs: HashSet::new(),
                 uncertain: false,
                 file_entries_only: true,
                 coverage_trusted: true,
@@ -927,6 +1200,8 @@ mod watch_impl {
                 pending: Mutex::new(EventBatch {
                     generation: 0,
                     changed_paths: HashSet::new(),
+                    changed_files: HashSet::new(),
+                    changed_dirs: HashSet::new(),
                     uncertain: false,
                     file_entries_only: true,
                     coverage_trusted: true,
@@ -1057,16 +1332,57 @@ mod watch_impl {
                 Err(_) => return EventBatch::unknown(),
             };
             let changed_paths = std::mem::take(&mut pending.changed_paths);
+            let changed_files = std::mem::take(&mut pending.changed_files);
+            let changed_dirs = std::mem::take(&mut pending.changed_dirs);
             let uncertain = std::mem::replace(&mut pending.uncertain, false);
             let file_entries_only = std::mem::replace(&mut pending.file_entries_only, true);
             let batch_trusted = std::mem::replace(&mut pending.coverage_trusted, trusted);
             EventBatch {
                 generation,
                 changed_paths,
+                changed_files,
+                changed_dirs,
                 uncertain,
                 file_entries_only,
                 coverage_trusted: trusted && batch_trusted,
             }
+        }
+
+        /// 与 drain 使用同一套排空与信任判定，但不消费 pending；目录缓存仍需看到这些事件。
+        pub(super) fn peek(&self, settle: bool) -> EventBatch {
+            if settle {
+                std::thread::sleep(std::time::Duration::from_millis(12));
+            }
+            if !self.events.running.load(Ordering::Acquire) {
+                return EventBatch::unknown();
+            }
+            unsafe { FSEventStreamFlushSync(self.stream) };
+            if !self.events.running.load(Ordering::Acquire) {
+                return EventBatch::unknown();
+            }
+            let generation = self.events.generation.load(Ordering::Acquire);
+            let trusted = self.events.trusted.load(Ordering::Acquire);
+            let pending = match self.events.pending.lock() {
+                Ok(pending) => pending,
+                Err(_) => return EventBatch::unknown(),
+            };
+            EventBatch {
+                generation,
+                changed_paths: pending.changed_paths.clone(),
+                changed_files: pending.changed_files.clone(),
+                changed_dirs: pending.changed_dirs.clone(),
+                uncertain: pending.uncertain,
+                file_entries_only: pending.file_entries_only,
+                coverage_trusted: trusted && pending.coverage_trusted,
+            }
+        }
+
+        pub(super) fn change_tracking_supported(&self) -> bool {
+            true
+        }
+
+        pub(super) fn trusted(&self) -> bool {
+            self.events.trusted.load(Ordering::Acquire)
         }
     }
 
@@ -1103,6 +1419,15 @@ mod watch_impl {
         }
         pub(super) fn drain(&self, _settle: bool) -> EventBatch {
             EventBatch::unknown()
+        }
+        pub(super) fn peek(&self, _settle: bool) -> EventBatch {
+            EventBatch::unknown()
+        }
+        pub(super) fn change_tracking_supported(&self) -> bool {
+            false
+        }
+        pub(super) fn trusted(&self) -> bool {
+            false
         }
     }
 }
