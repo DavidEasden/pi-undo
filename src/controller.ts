@@ -20,6 +20,8 @@ import type { RestorePlan, RestoreResult } from "./restore-engine.ts";
 import type { CaptureDiagnostic } from "./snapshot-store.ts";
 
 const INPUT_CAPTURE_RETRY_DELAY_MS = 250;
+/** 快速结算最多按路径捕获的文件数；超过后退回完整结算。 */
+const MAX_SCOPED_SETTLE_PATHS = 2_048;
 
 /** 控制器所需的最小运行时适配层；Pi 绑定在 extension 中完成。 */
 export interface ControllerDependencies {
@@ -50,6 +52,11 @@ export interface ControllerDependencies {
 		onDiagnostics?: (diagnostic: CaptureDiagnostic) => void,
 		onTiming?: (phase: string, durationMs: number) => void,
 		options?: CaptureBaselineOptions,
+	) => Promise<SnapshotManifest>;
+	/** 复用输入基线的 topology，只捕获指定文件路径；不重新执行目录发现。 */
+	readonly captureScoped?: (
+		scopePaths: readonly string[],
+		topologyFingerprint: string,
 	) => Promise<SnapshotManifest>;
 	/** 输入基线完成时的 native 变更游标；不可用时返回 undefined。 */
 	readonly changeCursor?: () => SettledChangeCursor | undefined;
@@ -151,7 +158,7 @@ export interface SettlementDiagnostic {
 	readonly failureCode?: string;
 	readonly captures?: readonly CaptureDiagnostic[];
 	/** 结算走了无需全量捕获的快速路径；用于诊断和基准核验。 */
-	readonly fastPath?: "no_changes";
+	readonly fastPath?: "no_changes" | "scoped_delta";
 }
 
 export interface OperationResult {
@@ -711,12 +718,33 @@ export class UndoControllerImpl implements UndoController {
 					rethrowOperationFailure(error);
 				}
 			}
-			let after: SnapshotManifest;
+			let scopedFiles: string[] | undefined;
+			if (probe?.trusted === true && probe.files.length > 0 && probe.directories.length === 0 &&
+				staged.before.coverage === "complete" && this.dependencies.captureScoped !== undefined) {
+				const unique = [...new Set(probe.files)].sort();
+				if (unique.length > 0 && unique.length <= MAX_SCOPED_SETTLE_PATHS) scopedFiles = unique;
+			}
+			let after: SnapshotManifest | undefined;
+			let changedPaths: readonly string[] = [];
 			if (probe?.trusted === true && probe.files.length === 0 && probe.directories.length === 0) {
 				// 事件覆盖证明自输入基线以来没有工作区变化：before 就是 after，无需全量 hash。
 				after = staged.before;
 				fastPath = "no_changes";
-			} else {
+			} else if (scopedFiles !== undefined) {
+				try {
+					// 文件事件本身已经给出精确 scope；即使其中某个文件最终内容未变，按该路径
+					// 捕获并纳入检查点仍是安全的，只是撤销时多做一次 no-op 复核。
+					after = await measure("settled.deltaCapture", () =>
+						this.captureScopedWithWorkspaceLock(scopedFiles!, staged.before.topologyFingerprint));
+					changedPaths = scopedFiles;
+					fastPath = "scoped_delta";
+				} catch (error) {
+					// 取消/超时应中断结算；普通作用域捕获失败退回完整结算。
+					rethrowOperationFailure(error);
+					after = undefined;
+				}
+			}
+			if (after === undefined) {
 				after = await measure("settled.capture", () =>
 					this.captureSettledBaselineWithRetry(
 						appliedTargetManifest !== undefined && appliedTargetAt !== undefined &&
@@ -729,12 +757,10 @@ export class UndoControllerImpl implements UndoController {
 						// 探测只会白跑一轮，直接进入 fullCapture。
 						{ skipBaselineProbe: appliedTargetInRacyWindow },
 					));
+				failureStage = "settled.changedPaths";
+				changedPaths = await measure("settled.changedPaths", () =>
+					this.dependencies.changedPaths(staged.before, after!));
 			}
-			failureStage = "settled.changedPaths";
-			const changedPaths = fastPath === "no_changes"
-				? []
-				: await measure("settled.changedPaths", () =>
-					this.dependencies.changedPaths(staged.before, after));
 			changedFiles = changedPaths.length;
 			const endLeafId = this.dependencies.getLogicalLeafId() ?? staged.startEntryId;
 			const checkpoint = this.createCheckpoint(staged, after, changedPaths, userEntryId, endLeafId);
@@ -1331,6 +1357,25 @@ export class UndoControllerImpl implements UndoController {
 		const lease = await this.dependencies.acquireWorkspaceLock();
 		try {
 			return await this.dependencies.capture();
+		} catch (error) {
+			this.recordUnsafeExit(error);
+			throw error;
+		} finally {
+			if (!this.unsafeExit) await lease.release();
+		}
+	}
+
+	private async captureScopedWithWorkspaceLock(
+		scopePaths: readonly string[],
+		topologyFingerprint: string,
+	): Promise<SnapshotManifest> {
+		const captureScoped = this.dependencies.captureScoped;
+		if (captureScoped === undefined) throw new Error("scoped_capture_unavailable");
+		const warmUp = this.warmUpInFlight;
+		if (warmUp !== undefined) await warmUp;
+		const lease = await this.dependencies.acquireWorkspaceLock();
+		try {
+			return await captureScoped(scopePaths, topologyFingerprint);
 		} catch (error) {
 			this.recordUnsafeExit(error);
 			throw error;

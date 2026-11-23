@@ -29,6 +29,11 @@ function manifest(seed: string): SnapshotManifest {
 	};
 }
 
+function scopedManifest(seed: string, paths: readonly string[]): SnapshotManifest {
+	const base = manifest(seed);
+	return { ...base, coverage: `paths:${checksum(canonicalJson([...paths].sort()))}` };
+}
+
 function restoredCheckpoint(checkpointId = "restored-checkpoint"): CheckpointRecord {
 	const payload = {
 		schemaVersion: 1 as const,
@@ -1727,6 +1732,82 @@ describe("UndoController", () => {
 			expect(changedPaths).toHaveBeenCalledOnce();
 			expect(controller.history()).toMatchObject({ undoCount: 1 });
 		}
+	});
+
+
+	it("文件级可信变更复用输入 baseline 的 topology 做作用域捕获", async () => {
+		const captureScoped = vi.fn(async (scope: readonly string[], fingerprint: string) => {
+			expect(scope).toEqual(["file.txt"]);
+			expect(fingerprint).toBe("b".repeat(64));
+			return scopedManifest("c", scope);
+		});
+		const captureBaseline = vi.fn(async () => manifest("c"));
+		const changedPaths = vi.fn(async () => ["file.txt"]);
+		const controller = new UndoControllerImpl(dependencies({
+			changeCursor: () => ({ sequence: 7, instance: "helper-test" }),
+			probeChanges: async () => ({ files: ["file.txt"], directories: [], trusted: true }),
+			captureScoped,
+			captureBaseline,
+			changedPaths,
+		}));
+		await controller.prepareInput("写入 run", { streaming: false });
+		await controller.beforeAgentStart();
+		await controller.agentSettled();
+
+		expect(captureScoped).toHaveBeenCalledOnce();
+		expect(captureBaseline).not.toHaveBeenCalled();
+		expect(changedPaths).not.toHaveBeenCalled();
+		const checkpoint = controller.listCheckpoints().at(-1);
+		expect(checkpoint?.changedPaths).toEqual(["file.txt"]);
+		expect(checkpoint?.afterManifestId).toBe("c".repeat(64));
+		expect(checkpoint?.beforeManifestId).not.toBe(checkpoint?.afterManifestId);
+	});
+
+	it("目录变化或文件数超限时保守退回完整结算", async () => {
+		for (const probe of [
+			{ files: [], directories: ["new-dir"], trusted: true },
+			{ files: Array.from({ length: 2_049 }, (_, index) => `f-${index}.txt`), directories: [], trusted: true },
+		]) {
+			const captureScoped = vi.fn(async (_scope: readonly string[]) => manifest("c"));
+			const captureBaseline = vi.fn(async () => manifest("c"));
+			const changedPaths = vi.fn(async () => ["changed.txt"]);
+			const controller = new UndoControllerImpl(dependencies({
+				changeCursor: () => ({ sequence: 7, instance: "helper-test" }),
+				probeChanges: async () => probe,
+				captureScoped,
+				captureBaseline,
+				changedPaths,
+			}));
+			await controller.prepareInput("结构变更 run", { streaming: false });
+			await controller.beforeAgentStart();
+			await controller.agentSettled();
+
+			expect(captureScoped).not.toHaveBeenCalled();
+			expect(captureBaseline).toHaveBeenCalledOnce();
+			expect(changedPaths).toHaveBeenCalledOnce();
+		}
+	});
+
+
+	it("作用域捕获失败时退回完整结算", async () => {
+		const captureScoped = vi.fn(async () => { throw new Error("scoped failed"); });
+		const captureBaseline = vi.fn(async () => manifest("c"));
+		const changedPaths = vi.fn(async () => ["file.txt"]);
+		const controller = new UndoControllerImpl(dependencies({
+			changeCursor: () => ({ sequence: 7, instance: "helper-test" }),
+			probeChanges: async () => ({ files: ["file.txt"], directories: [], trusted: true }),
+			captureScoped,
+			captureBaseline,
+			changedPaths,
+		}));
+		await controller.prepareInput("写入 run", { streaming: false });
+		await controller.beforeAgentStart();
+		await controller.agentSettled();
+
+		expect(captureScoped).toHaveBeenCalledOnce();
+		expect(captureBaseline).toHaveBeenCalledOnce();
+		expect(changedPaths).toHaveBeenCalledOnce();
+		expect(controller.listCheckpoints().at(-1)?.changedPaths).toEqual(["file.txt"]);
 	});
 
 	it("tree observed leaf 与预检目标不一致时进入 recovery lock 且不恢复", async () => {

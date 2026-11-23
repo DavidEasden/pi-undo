@@ -277,6 +277,11 @@ export interface CaptureOptions {
 	 * 仅在调用方已持有工作区独占锁、且刚刚完成 discover 并确认 topology 未变化时传 true。
 	 */
 	readonly skipPostTopologyCheck?: boolean;
+	/**
+	 * 作用域快速结算可跳过整份 leaf-cache 落盘；内存缓存仍会更新，
+	 * 进程重启后由下一次完整 capture 重建。
+	 */
+	readonly persistLeafCache?: boolean;
 	/** 只报告数量和错误类型，不包含路径、文件内容或异常消息。 */
 	readonly onDiagnostics?: (diagnostic: CaptureDiagnostic) => void;
 	/** 报告 capture 内部 wall-time 阶段；回调失败不影响捕获。 */
@@ -549,7 +554,7 @@ export class SnapshotStore {
 			this.manifestLocations.set(manifestId, manifestPath);
 			for (const update of cacheUpdates) this.rememberVisibleLeaves(update);
 			// 指纹缓存落盘：让下一个进程（新会话）的首次 capture 跳过全量内容 hash。
-			await this.persistLeafCache(storeDirectory);
+			if (options.persistLeafCache !== false) await this.persistLeafCache(storeDirectory);
 			// 只冻结 capture 自建的清单及其嵌套容器；弱集合不会延长路径列表的生命周期。
 			for (const root of roots) {
 				Object.freeze(root.ignoredPresentPaths);

@@ -111,6 +111,7 @@ export class StatusReporter {
 const phaseLabels: Record<string, string> = {
 	idle: "等待 Agent 停止", checkpoint: "等待检查点", lock: "等待工作区锁",
 	capture: "捕获安全快照", load: "读取快照", plan: "准备恢复", journal: "记录事务",
+	"settled.deltaCapture": "捕获变更快照",
 	navigate: "切换会话", apply: "恢复文件", cursor: "提交历史", commit: "完成持久化",
 	compensate: "恢复操作前状态", unlock: "释放工作区锁", discover_gitlinks: "检查子模块", scan_directories: "扫描目录",
 	"settled.capture": "结算快照", "settled.workspaceLock": "等待工作区锁",

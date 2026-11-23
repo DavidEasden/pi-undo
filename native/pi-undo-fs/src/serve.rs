@@ -49,6 +49,8 @@ struct EventBatch {
     changed_files: HashSet<String>,
     /// 精确到目录的变化项；目录结构变化需要按子树捕获。
     changed_dirs: HashSet<String>,
+    /// 本次批次创建/删除/重命名了 .git 仓库标记，可能改变 topology。
+    git_structure_changed: bool,
     uncertain: bool,
     /// 仅普通文件目录项或明确的目录元数据事件，允许核验后复用无事件的近期子树。
     file_entries_only: bool,
@@ -63,6 +65,7 @@ impl EventBatch {
             changed_paths: HashSet::new(),
             changed_files: HashSet::new(),
             changed_dirs: HashSet::new(),
+            git_structure_changed: false,
             uncertain: true,
             file_entries_only: false,
             coverage_trusted: false,
@@ -103,6 +106,8 @@ struct ChangeTracker {
     sequence: u64,
     files: HashMap<String, u64>,
     dirs: HashMap<String, u64>,
+    /// 最近一次 .git 仓库标记结构变化的序号；晚于查询游标时拒绝快速路径。
+    last_git_change: u64,
     pruned_before: u64,
     trusted: bool,
 }
@@ -113,6 +118,7 @@ impl ChangeTracker {
             sequence: 0,
             files: HashMap::new(),
             dirs: HashMap::new(),
+            last_git_change: 0,
             pruned_before: 0,
             trusted: true,
         }
@@ -122,11 +128,14 @@ impl ChangeTracker {
         if batch.uncertain || !batch.coverage_trusted {
             self.trusted = false;
         }
-        if batch.changed_files.is_empty() && batch.changed_dirs.is_empty() {
+        if batch.changed_files.is_empty() && batch.changed_dirs.is_empty() && !batch.git_structure_changed {
             return;
         }
         self.sequence = self.sequence.saturating_add(1);
         let sequence = self.sequence;
+        if batch.git_structure_changed {
+            self.last_git_change = sequence;
+        }
         for path in &batch.changed_files {
             self.files.insert(path.clone(), sequence);
         }
@@ -149,7 +158,8 @@ impl ChangeTracker {
     }
 
     fn changes_since(&self, since: u64) -> (Vec<String>, Vec<String>, bool) {
-        if !self.trusted || since > self.sequence || since < self.pruned_before {
+        if !self.trusted || since > self.sequence || since < self.pruned_before ||
+            since < self.last_git_change {
             return (Vec::new(), Vec::new(), false);
         }
         let mut files: Vec<String> = self.files.iter()
@@ -169,6 +179,14 @@ impl ChangeTracker {
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn is_git_metadata_path(path: &str) -> bool {
     path.split('/').any(|component| component.eq_ignore_ascii_case(".git"))
+}
+
+/// 只有仓库标记本身（最后一段是 .git）的创建/删除/重命名才可能改变 topology。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn is_git_marker_path(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|component| component.eq_ignore_ascii_case(".git"))
 }
 
 #[cfg(test)]
@@ -217,6 +235,27 @@ mod change_tracker_tests {
         tracker.record(&uncertain);
         assert!(!tracker.changes_since(0).2);
         assert!(!ChangeTracker::new().changes_since(1).2);
+    }
+
+    #[test]
+    fn git_marker_structure_change_disables_fast_path_since_that_sequence() {
+        let mut tracker = ChangeTracker::new();
+        let mut git = batch(&[], &[]);
+        git.git_structure_changed = true;
+        tracker.record(&git);
+        let (_, _, trusted) = tracker.changes_since(0);
+        assert!(!trusted);
+        // 变化发生在游标之前时，不阻止后续查询。
+        let (_, _, trusted) = tracker.changes_since(tracker.sequence);
+        assert!(trusted);
+    }
+
+    #[test]
+    fn only_git_repository_markers_count_as_topology_changes() {
+        assert!(is_git_marker_path(".git"));
+        assert!(is_git_marker_path("pkg/sub/.git"));
+        assert!(!is_git_marker_path("pkg/.git/index"));
+        assert!(!is_git_marker_path("pkg/.giti"));
     }
 
     #[test]
@@ -419,7 +458,8 @@ fn main_loop(
                 continue;
             }
             // 只 peek，不消费目录缓存事件：随后的拓扑扫描仍必须看到同一批变化。
-            let first = state.watch.peek(true);
+            // 先立即取一次，再做一次 12ms 的 settle；只等待一次已覆盖事件送达窗口。
+            let first = state.watch.peek(false);
             state.changes.record(&first);
             let second = state.watch.peek(true);
             state.changes.record(&second);
@@ -675,7 +715,7 @@ fn serve_rescan(state: &mut ResidentState, root: &Directory) -> Result<HitRespon
 
 #[cfg(target_os = "macos")]
 mod watch_impl {
-    use super::{EventBatch, HashSet};
+    use super::{EventBatch, HashSet, is_git_marker_path};
     use std::ffi::CString;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -912,6 +952,13 @@ mod watch_impl {
             }
         }
         let relative_path = components.join("/");
+        let git_marker_changed = is_git_marker_path(&relative_path) && (
+            flags & (EVENT_ITEM_CREATED | EVENT_ITEM_REMOVED | EVENT_ITEM_RENAMED) != 0 ||
+            flags & EVENT_ITEM_IS_FILE != 0 && flags & EVENT_ITEM_MODIFIED != 0
+        );
+        if git_marker_changed {
+            batch.git_structure_changed = true;
+        }
         // 普通文件覆盖可同时携带 inode 元数据标志；它不改变目录项名称或类型。
         // 只接受这两个确切组合，合并的结构变化、其他元数据变化和未知位均保留复核。
         // 忽略规则、仓库指针、内容及权限仍由调用方实时读取，不依赖这里的目录缓存。
@@ -982,6 +1029,7 @@ mod watch_impl {
                     changed_paths: HashSet::new(),
                     changed_files: HashSet::new(),
                     changed_dirs: HashSet::new(),
+                    git_structure_changed: false,
                     uncertain: false,
                     file_entries_only: true,
                     coverage_trusted: true,
@@ -1081,6 +1129,18 @@ mod watch_impl {
         }
 
         #[test]
+        fn creating_a_nested_git_marker_marks_topology_changed() {
+            let events = shared_events();
+            emit_events(&events, &[(
+                "/workspace/pkg/.git",
+                EVENT_ITEM_IS_DIR | EVENT_ITEM_CREATED,
+            )]);
+            let pending = events.pending.lock().unwrap();
+            assert!(pending.git_structure_changed);
+            assert!(!pending.uncertain);
+        }
+
+        #[test]
         fn event_loss_permanently_disables_trusted_coverage() {
             let events = shared_events();
             emit_events(&events, &[("/workspace/repo/file", EVENT_ITEM_IS_FILE | EVENT_ITEM_MODIFIED)]);
@@ -1125,6 +1185,7 @@ mod watch_impl {
                 changed_paths: HashSet::new(),
                 changed_files: HashSet::new(),
                 changed_dirs: HashSet::new(),
+                git_structure_changed: false,
                 uncertain: false,
                 file_entries_only: true,
                 coverage_trusted: true,
@@ -1161,6 +1222,7 @@ mod watch_impl {
                 changed_paths: HashSet::new(),
                 changed_files: HashSet::new(),
                 changed_dirs: HashSet::new(),
+                git_structure_changed: false,
                 uncertain: false,
                 file_entries_only: true,
                 coverage_trusted: true,
@@ -1177,6 +1239,7 @@ mod watch_impl {
                 changed_paths: HashSet::new(),
                 changed_files: HashSet::new(),
                 changed_dirs: HashSet::new(),
+                git_structure_changed: false,
                 uncertain: false,
                 file_entries_only: true,
                 coverage_trusted: true,
@@ -1201,6 +1264,7 @@ mod watch_impl {
                     changed_paths: HashSet::new(),
                     changed_files: HashSet::new(),
                     changed_dirs: HashSet::new(),
+                    git_structure_changed: false,
                     uncertain: false,
                     file_entries_only: true,
                     coverage_trusted: true,
@@ -1333,6 +1397,7 @@ mod watch_impl {
             let changed_paths = std::mem::take(&mut pending.changed_paths);
             let changed_files = std::mem::take(&mut pending.changed_files);
             let changed_dirs = std::mem::take(&mut pending.changed_dirs);
+            let git_structure_changed = std::mem::replace(&mut pending.git_structure_changed, false);
             let uncertain = std::mem::replace(&mut pending.uncertain, false);
             let file_entries_only = std::mem::replace(&mut pending.file_entries_only, true);
             let batch_trusted = std::mem::replace(&mut pending.coverage_trusted, trusted);
@@ -1341,6 +1406,7 @@ mod watch_impl {
                 changed_paths,
                 changed_files,
                 changed_dirs,
+                git_structure_changed,
                 uncertain,
                 file_entries_only,
                 coverage_trusted: trusted && batch_trusted,
@@ -1370,6 +1436,7 @@ mod watch_impl {
                 changed_paths: pending.changed_paths.clone(),
                 changed_files: pending.changed_files.clone(),
                 changed_dirs: pending.changed_dirs.clone(),
+                git_structure_changed: pending.git_structure_changed,
                 uncertain: pending.uncertain,
                 file_entries_only: pending.file_entries_only,
                 coverage_trusted: trusted && pending.coverage_trusted,
