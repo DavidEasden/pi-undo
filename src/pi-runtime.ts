@@ -9,6 +9,7 @@ import type {
 
 import {
 	UndoControllerImpl,
+	isCheckpointAfterPending,
 	type CaptureBaselineOptions,
 	type ControllerDependencies,
 	type ControllerInitialState,
@@ -60,6 +61,8 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 	// 输入基线使用的 topology 只缓存最近几份；作用域结算在文件级变化时直接复用，
 	// 不重新执行目录发现。fingerprint 失效时回退完整结算。
 	const captureTopologies = new Map<string, RootTopology>();
+	// runtime 内已物化的 pending after；不写回 session，重启后按 pending 处理。
+	const resolvedAfter = new Map<string, ManifestId>();
 	const rememberTopology = (topology: RootTopology): RootTopology => {
 		captureTopologies.delete(topology.fingerprint);
 		captureTopologies.set(topology.fingerprint, topology);
@@ -283,7 +286,8 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 				internalNavigation = false;
 			}
 		},
-		resolveTreeTarget: async (targetEntryId) => resolveTreeTarget(manager, sessionIdentity, targetEntryId),
+		resolveTreeTarget: async (targetEntryId) =>
+			resolveTreeTarget(manager, sessionIdentity, targetEntryId, resolvedAfter),
 		appendControl: async (customType, data) => appendControlEntry(pi, manager, customType, data),
 		appendCursor: async (cursor) => cursorWriter.appendCursor(cursor, pi, sourceFor(manager)),
 		capture,
@@ -381,6 +385,7 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 	);
 	controller = new UndoControllerImpl(dependencies, {
 		...rebuildControllerState(manager, sessionIdentity),
+		resolvedAfter,
 		locked: startupRecovery.kind === "locked",
 		recoveryReason: startupRecovery.kind === "locked" ? startupRecovery.reason : undefined,
 		recoveryCompleted: true,
@@ -483,10 +488,12 @@ function checkpointFrontierById(
 	manager: ReadonlySessionManager,
 	identity: SessionFileIdentity,
 	checkpointId: string,
+	resolvedAfter?: ReadonlyMap<string, ManifestId>,
 ): CheckpointRecord[] {
 	for (const entry of manager.getEntries() as unknown[]) {
 		if (!isRecord(entry) || entry.type !== "custom" || entry.customType !== "pi-undo:checkpoint" || typeof entry.id !== "string") continue;
-		const frontier = sessionStateFor(manager, entry.id).getCheckpoints(identity);
+		const frontier = sessionStateFor(manager, entry.id).getCheckpoints(identity)
+			.map((checkpoint) => applyResolvedAfter(checkpoint, resolvedAfter));
 		const index = frontier.findIndex((checkpoint) => checkpoint.checkpointId === checkpointId);
 		if (index >= 0) return frontier.slice(0, index + 1);
 	}
@@ -560,6 +567,7 @@ async function resolveTreeTarget(
 	manager: ReadonlySessionManager,
 	identity: SessionFileIdentity,
 	targetEntryId: string | null,
+	resolvedAfter?: ReadonlyMap<string, ManifestId>,
 ): Promise<{ logicalLeafId: string | null; targetManifestId: ManifestId; undoStack: readonly CheckpointRecord[] }> {
 	if (targetEntryId === null) throw new Error("tree target 缺失");
 	const target = manager.getEntry(targetEntryId) as unknown;
@@ -576,12 +584,12 @@ async function resolveTreeTarget(
 			undoStack: sessionStateFor(manager, physicalLeaf).getCheckpoints(identity),
 		};
 	}
-	const exact = findCheckpointByEndLeaf(manager, identity, logicalLeafId);
-	if (exact !== undefined) {
+	const exact = findCheckpointByEndLeaf(manager, identity, logicalLeafId, resolvedAfter);
+	if (exact !== undefined && !isCheckpointAfterPending(exact)) {
 		return {
 			logicalLeafId,
 			targetManifestId: exact.afterManifestId,
-			undoStack: checkpointFrontierById(manager, identity, exact.checkpointId),
+			undoStack: checkpointFrontierById(manager, identity, exact.checkpointId, resolvedAfter),
 		};
 	}
 	// cursor 可以证明 summary/撤回后逻辑边界对应的文件状态；不能退回任意旧栈顶。
@@ -590,9 +598,10 @@ async function resolveTreeTarget(
 		return {
 			logicalLeafId,
 			targetManifestId: cursor.targetManifestId,
-			undoStack: cursor.undoHead === null ? [] : checkpointFrontierById(manager, identity, cursor.undoHead),
+			undoStack: cursor.undoHead === null ? [] : checkpointFrontierById(manager, identity, cursor.undoHead, resolvedAfter),
 		};
 	}
+	if (exact !== undefined) throw new Error("tree target after snapshot pending");
 	// 用户输入前的控制条目/根叶可由可信 before checkpoint 证明。
 	const boundaries = new Map<string, { checkpoint: CheckpointRecord; physicalLeaf: string | null }>();
 	for (const value of manager.getEntries() as unknown[]) {
@@ -614,10 +623,19 @@ async function resolveTreeTarget(
 	throw new Error("tree target 缺少精确的 checkpoint 边界");
 }
 
+function applyResolvedAfter(
+	checkpoint: CheckpointRecord,
+	resolvedAfter?: ReadonlyMap<string, ManifestId>,
+): CheckpointRecord {
+	const materialized = resolvedAfter?.get(checkpoint.checkpointId);
+	return materialized === undefined ? checkpoint : { ...checkpoint, afterManifestId: materialized };
+}
+
 function findCheckpointByEndLeaf(
 	manager: ReadonlySessionManager,
 	identity: SessionFileIdentity,
 	endLeafId: string | null,
+	resolvedAfter?: ReadonlyMap<string, ManifestId>,
 ): CheckpointRecord | undefined {
 	if (endLeafId === null) return undefined;
 	const matches: CheckpointRecord[] = [];
@@ -625,7 +643,7 @@ function findCheckpointByEndLeaf(
 		if (!isRecord(entry) || entry.type !== "custom" || entry.customType !== "pi-undo:checkpoint" || typeof entry.id !== "string") continue;
 		const checkpoint = sessionStateFor(manager, entry.id).getCheckpoints(identity)
 			.find((candidate) => candidate.endLeafId === endLeafId);
-		if (checkpoint !== undefined) matches.push(checkpoint);
+		if (checkpoint !== undefined) matches.push(applyResolvedAfter(checkpoint, resolvedAfter));
 	}
 	return matches.length === 1 ? matches[0] : undefined;
 }

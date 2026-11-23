@@ -5,6 +5,8 @@ import { join, resolve } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { canonicalJson, checksum } from "../src/encoding.ts";
+import { isCheckpointAfterPending } from "../src/controller.ts";
+import { prepareCheckpointDiff } from "../src/diff-view.ts";
 import { GitRunner } from "../src/git-runner.ts";
 import type { CheckpointRecord, CursorState, ManifestId, SessionFileIdentity } from "../src/model.ts";
 import { createPiUndoRuntime as createRuntime } from "../src/pi-runtime.ts";
@@ -231,32 +233,100 @@ describe("Pi runtime cursor durability", () => {
 			await runtime.controller.agentSettled();
 
 			expect(captureBaseline).not.toHaveBeenCalled();
-			expect(capture.mock.calls.some(([, scope]) =>
-				Array.isArray(scope) && scope.includes("tracked.txt"))).toBe(true);
 			const checkpoint = runtime.controller.listCheckpoints().at(-1);
 			expect(checkpoint?.changedPaths).toEqual(["tracked.txt"]);
-			expect(checkpoint?.beforeManifestId).not.toBe(checkpoint?.afterManifestId);
-			runtime.setCommandContext(fixture.commandContext as any);
-			expect(await runtime.controller.undo()).toMatchObject({ code: "ok", changedFiles: 1 });
-			await expect(readFile(join(fixture.workspace, "tracked.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-			expect(await runtime.controller.redo()).toMatchObject({ code: "ok", changedFiles: 1 });
-			expect(await readFile(join(fixture.workspace, "tracked.txt"), "utf8")).toBe("after\n");
+			expect(checkpoint?.beforeManifestId).toBe(checkpoint?.afterManifestId);
+			expect(isCheckpointAfterPending(checkpoint!)).toBe(true);
 			const diagnosticPath = join(fixture.context.sessionManager.getSessionDir(),
 				".pi-undo", "diagnostics", "session-live-settlement-diagnostic.json");
 			await vi.waitFor(async () => {
 				const diagnostic = JSON.parse(await readFile(diagnosticPath, "utf8"));
-				expect(diagnostic.settlement.fastPath).toBe("scoped_delta");
+				expect(diagnostic.settlement.fastPath).toBe("pending_delta");
 				expect(diagnostic.settlement.timings).toEqual(expect.arrayContaining([
-					expect.objectContaining({ phase: "settled.deltaCapture" }),
+					expect.objectContaining({ phase: "settled.changeProbe" }),
 				]));
 				expect(diagnostic.settlement.timings).not.toEqual(expect.arrayContaining([
-					expect.objectContaining({ phase: "settled.capture" }),
+					expect.objectContaining({ phase: "settled.deltaCapture" }),
 				]));
 			});
+			runtime.setCommandContext(fixture.commandContext as any);
+			expect(await runtime.controller.undo()).toMatchObject({ code: "ok", changedFiles: 1 });
+			expect(capture.mock.calls.some(([, scope]) =>
+				Array.isArray(scope) && scope.includes("tracked.txt"))).toBe(true);
+			await expect(readFile(join(fixture.workspace, "tracked.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+			expect(await runtime.controller.redo()).toMatchObject({ code: "ok", changedFiles: 1 });
+			expect(await readFile(join(fixture.workspace, "tracked.txt"), "utf8")).toBe("after\n");
 		} finally {
 			captureBaseline.mockRestore();
 			capture.mockRestore();
 		}
+	});
+
+	it.skipIf(process.platform !== "darwin")("pending after 可由 /diff 路径按需物化", async () => {
+		const fixture = await liveOperationFixture();
+		await Promise.all(Array.from({ length: 70 }, (_, index) =>
+			mkdir(join(fixture.workspace, `dir-${index}`), { recursive: true })));
+		const runtime = await createPiUndoRuntime(fixture.context as any, fixture.pi as any);
+		expect(await runtime.controller.prepareInput("写入 run", { streaming: false })).toEqual({ action: "continue" });
+		await runtime.controller.beforeAgentStart();
+		const startEntryId = fixture.manager.getLeafId();
+		fixture.appendSessionEntry({
+			type: "message",
+			id: "user-diff-pending",
+			parentId: startEntryId,
+			message: { role: "user", content: "写入 run" },
+		});
+		fixture.appendSessionEntry({
+			type: "message",
+			id: "assistant-diff-pending",
+			parentId: "user-diff-pending",
+			message: { role: "assistant", content: [] },
+		});
+		await writeFile(join(fixture.workspace, "tracked.txt"), "after\n");
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		await runtime.controller.agentSettled();
+
+		const checkpoint = runtime.controller.listCheckpoints().at(-1)!;
+		expect(isCheckpointAfterPending(checkpoint)).toBe(true);
+		const afterManifestId = await runtime.controller.materializeAfter?.(checkpoint);
+		expect(afterManifestId).toBeDefined();
+		const resolved = runtime.controller.listCheckpoints().at(-1)!;
+		expect(isCheckpointAfterPending(resolved)).toBe(false);
+		const diff = await prepareCheckpointDiff(runtime.diffSource!, {
+			beforeManifestId: resolved.beforeManifestId,
+			afterManifestId: afterManifestId!,
+			changedPaths: resolved.changedPaths,
+		});
+		expect(diff.files.map((file) => file.path)).toContain("tracked.txt");
+	});
+
+	it.skipIf(process.platform !== "darwin")("最新 pending 检查点允许树导航", async () => {
+		const fixture = await liveOperationFixture();
+		await Promise.all(Array.from({ length: 70 }, (_, index) =>
+			mkdir(join(fixture.workspace, `dir-${index}`), { recursive: true })));
+		const runtime = await createPiUndoRuntime(fixture.context as any, fixture.pi as any);
+		expect(await runtime.controller.prepareInput("写入 run", { streaming: false })).toEqual({ action: "continue" });
+		await runtime.controller.beforeAgentStart();
+		const startEntryId = fixture.manager.getLeafId();
+		fixture.appendSessionEntry({
+			type: "message",
+			id: "user-tree-pending",
+			parentId: startEntryId,
+			message: { role: "user", content: "写入 run" },
+		});
+		fixture.appendSessionEntry({
+			type: "message",
+			id: "assistant-tree-pending",
+			parentId: "user-tree-pending",
+			message: { role: "assistant", content: [] },
+		});
+		await writeFile(join(fixture.workspace, "tracked.txt"), "after\n");
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		await runtime.controller.agentSettled();
+
+		expect(await runtime.controller.beforeTree({ targetLeafId: "assistant-tree-pending" })).toBeUndefined();
+		await runtime.controller.afterTree({ newLeafId: "assistant-tree-pending" });
+		expect(runtime.controller.history().undoCount).toBe(1);
 	});
 
 	it("settled 发现文件变化时生成作用域快照", async () => {
@@ -283,20 +353,21 @@ describe("Pi runtime cursor durability", () => {
 		const git = vi.spyOn(GitRunner.prototype, "run");
 		try {
 			await runtime.controller.agentSettled();
+			const checkpoint = runtime.controller.listCheckpoints().at(-1);
+			expect(checkpoint?.changedPaths).toEqual(["tracked.txt"]);
+			expect(isCheckpointAfterPending(checkpoint!)).toBe(true);
+			expect(captureBaseline).not.toHaveBeenCalled();
+			runtime.setCommandContext(fixture.commandContext as any);
+			expect(await runtime.controller.undo()).toMatchObject({ code: "ok", changedFiles: 1 });
 			expect(captureBaseline).not.toHaveBeenCalled();
 			expect(git.mock.calls.some(([args]) => args.includes("write-tree"))).toBe(true);
+			expect(await readFile(join(fixture.workspace, "tracked.txt"), "utf8")).toBe("before\n");
+			expect(await runtime.controller.redo()).toMatchObject({ code: "ok", changedFiles: 1 });
+			expect(await readFile(join(fixture.workspace, "tracked.txt"), "utf8")).toBe("after\n");
 		} finally {
 			git.mockRestore();
 			captureBaseline.mockRestore();
 		}
-		const checkpoint = runtime.controller.listCheckpoints().at(-1);
-		expect(checkpoint?.changedPaths).toEqual(["tracked.txt"]);
-		expect(checkpoint?.beforeManifestId).not.toBe(checkpoint?.afterManifestId);
-		runtime.setCommandContext(fixture.commandContext as any);
-		expect(await runtime.controller.undo()).toMatchObject({ code: "ok", changedFiles: 1 });
-		expect(await readFile(join(fixture.workspace, "tracked.txt"), "utf8")).toBe("before\n");
-		expect(await runtime.controller.redo()).toMatchObject({ code: "ok", changedFiles: 1 });
-		expect(await readFile(join(fixture.workspace, "tracked.txt"), "utf8")).toBe("after\n");
 	});
 
 	it("append cursor 后使用最新 leaf 校验当前 branch", async () => {
