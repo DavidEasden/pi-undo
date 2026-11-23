@@ -202,11 +202,12 @@ describe("Pi runtime cursor durability", () => {
 		}
 	});
 
-	it.skipIf(process.platform !== "darwin")("native 探测到 run 期间写入时退回完整 capture 并记录变更路径", async () => {
+	it.skipIf(process.platform !== "darwin")("native 文件变更使用输入 topology 做作用域捕获", async () => {
 		const fixture = await liveOperationFixture();
 		await Promise.all(Array.from({ length: 70 }, (_, index) =>
 			mkdir(join(fixture.workspace, `dir-${index}`), { recursive: true })));
 		const runtime = await createPiUndoRuntime(fixture.context as any, fixture.pi as any);
+		const capture = vi.spyOn(SnapshotStore.prototype, "capture");
 		const captureBaseline = vi.spyOn(SnapshotStore.prototype, "captureBaseline");
 		try {
 			expect(await runtime.controller.prepareInput("写入 run", { streaming: false })).toEqual({ action: "continue" });
@@ -229,17 +230,38 @@ describe("Pi runtime cursor durability", () => {
 
 			await runtime.controller.agentSettled();
 
-			expect(captureBaseline).toHaveBeenCalledOnce();
-			expect(runtime.controller.listCheckpoints().at(-1)?.changedPaths).toContain("tracked.txt");
+			expect(captureBaseline).not.toHaveBeenCalled();
+			expect(capture.mock.calls.some(([, scope]) =>
+				Array.isArray(scope) && scope.includes("tracked.txt"))).toBe(true);
+			const checkpoint = runtime.controller.listCheckpoints().at(-1);
+			expect(checkpoint?.changedPaths).toEqual(["tracked.txt"]);
+			expect(checkpoint?.beforeManifestId).not.toBe(checkpoint?.afterManifestId);
+			runtime.setCommandContext(fixture.commandContext as any);
+			expect(await runtime.controller.undo()).toMatchObject({ code: "ok", changedFiles: 1 });
+			await expect(readFile(join(fixture.workspace, "tracked.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+			expect(await runtime.controller.redo()).toMatchObject({ code: "ok", changedFiles: 1 });
+			expect(await readFile(join(fixture.workspace, "tracked.txt"), "utf8")).toBe("after\n");
+			const diagnosticPath = join(fixture.context.sessionManager.getSessionDir(),
+				".pi-undo", "diagnostics", "session-live-settlement-diagnostic.json");
+			await vi.waitFor(async () => {
+				const diagnostic = JSON.parse(await readFile(diagnosticPath, "utf8"));
+				expect(diagnostic.settlement.fastPath).toBe("scoped_delta");
+				expect(diagnostic.settlement.timings).toEqual(expect.arrayContaining([
+					expect.objectContaining({ phase: "settled.deltaCapture" }),
+				]));
+				expect(diagnostic.settlement.timings).not.toEqual(expect.arrayContaining([
+					expect.objectContaining({ phase: "settled.capture" }),
+				]));
+			});
 		} finally {
 			captureBaseline.mockRestore();
+			capture.mockRestore();
 		}
 	});
 
-	it("settled 发现变化时 captureBaseline 回退完整 capture", async () => {
+	it("settled 发现文件变化时生成作用域快照", async () => {
 		const fixture = await liveOperationFixture();
 		await writeFile(join(fixture.workspace, "tracked.txt"), "before\n");
-		await new Promise((resolve) => setTimeout(resolve, 2_100));
 		const runtime = await createPiUndoRuntime(fixture.context as any, fixture.pi as any);
 		expect(await runtime.controller.prepareInput("改文件", { streaming: false })).toEqual({ action: "continue" });
 		await runtime.controller.beforeAgentStart();
@@ -257,16 +279,24 @@ describe("Pi runtime cursor durability", () => {
 			parentId: "user-changed",
 			message: { role: "assistant", content: [] },
 		});
+		const captureBaseline = vi.spyOn(SnapshotStore.prototype, "captureBaseline");
 		const git = vi.spyOn(GitRunner.prototype, "run");
 		try {
 			await runtime.controller.agentSettled();
+			expect(captureBaseline).not.toHaveBeenCalled();
 			expect(git.mock.calls.some(([args]) => args.includes("write-tree"))).toBe(true);
 		} finally {
 			git.mockRestore();
+			captureBaseline.mockRestore();
 		}
 		const checkpoint = runtime.controller.listCheckpoints().at(-1);
 		expect(checkpoint?.changedPaths).toEqual(["tracked.txt"]);
 		expect(checkpoint?.beforeManifestId).not.toBe(checkpoint?.afterManifestId);
+		runtime.setCommandContext(fixture.commandContext as any);
+		expect(await runtime.controller.undo()).toMatchObject({ code: "ok", changedFiles: 1 });
+		expect(await readFile(join(fixture.workspace, "tracked.txt"), "utf8")).toBe("before\n");
+		expect(await runtime.controller.redo()).toMatchObject({ code: "ok", changedFiles: 1 });
+		expect(await readFile(join(fixture.workspace, "tracked.txt"), "utf8")).toBe("after\n");
 	});
 
 	it("append cursor 后使用最新 leaf 校验当前 branch", async () => {

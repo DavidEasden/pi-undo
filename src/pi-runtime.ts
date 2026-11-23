@@ -57,8 +57,21 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 	const workspaceLock = new WorkspaceLock();
 	let commandContext: ExtensionCommandContext | undefined;
 	let internalNavigation = false;
+	// 输入基线使用的 topology 只缓存最近几份；作用域结算在文件级变化时直接复用，
+	// 不重新执行目录发现。fingerprint 失效时回退完整结算。
+	const captureTopologies = new Map<string, RootTopology>();
+	const rememberTopology = (topology: RootTopology): RootTopology => {
+		captureTopologies.delete(topology.fingerprint);
+		captureTopologies.set(topology.fingerprint, topology);
+		while (captureTopologies.size > 8) {
+			const oldest = captureTopologies.keys().next().value;
+			if (oldest === undefined) break;
+			captureTopologies.delete(oldest);
+		}
+		return topology;
+	};
 	const capture = async (scopePaths?: readonly string[]) => {
-		const topology = await discovery.discover(context.cwd);
+		const topology = rememberTopology(await discovery.discover(context.cwd));
 		if (topology.workspaceIdentity !== initialTopology.workspaceIdentity) {
 			throw new Error("workspace_identity_changed: workspace root canonical path changed; run /undo-recover");
 		}
@@ -85,6 +98,7 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 		if (topology.workspaceIdentity !== initialTopology.workspaceIdentity) {
 			throw new Error("workspace_identity_changed: workspace root canonical path changed; run /undo-recover");
 		}
+		rememberTopology(topology);
 		return store.captureBaseline(topology, baseline, undefined, {
 			topologyAlreadyValidated: true,
 			...(options.skipBaselineProbe === true ? { skipBaselineProbe: true } : {}),
@@ -274,6 +288,18 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 		appendCursor: async (cursor) => cursorWriter.appendCursor(cursor, pi, sourceFor(manager)),
 		capture,
 		captureBaseline,
+		captureScoped: async (scopePaths, topologyFingerprint) => {
+			const topology = captureTopologies.get(topologyFingerprint);
+			if (topology === undefined) throw new Error("scoped_capture_topology_missing");
+			if (topology.workspaceIdentity !== initialTopology.workspaceIdentity) {
+				throw new Error("workspace_identity_changed: workspace root canonical path changed; run /undo-recover");
+			}
+			return store.capture(topology, scopePaths, {
+				topologyAlreadyValidated: true,
+				skipPostTopologyCheck: true,
+				persistLeafCache: false,
+			});
+		},
 		changeCursor: () => discovery.changeCursor(),
 		probeChanges: (cursor) => discovery.changesSince(context.cwd, cursor),
 		keepAlive: () => discovery.keepAlive(),
