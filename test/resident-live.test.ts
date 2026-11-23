@@ -80,8 +80,12 @@ describe.skipIf(process.env.PI_UNDO_RUN_RESIDENT_LIVE !== "1" || (process.platfo
 			expect(instance.length).toBeGreaterThan(0);
 
 			await writeFile(join(workspace, "src/value.txt"), "after\n");
-			await new Promise((resolve) => setTimeout(resolve, 50));
-			const delta = await client.changesSince(sequence, instance);
+			let delta: Record<string, unknown> | undefined;
+			for (let attempt = 0; attempt < 40; attempt += 1) {
+				delta = await client.changesSince(sequence, instance);
+				if (Array.isArray(delta?.changedFiles) && delta.changedFiles.includes("src/value.txt")) break;
+				await new Promise((resolve) => setTimeout(resolve, 50));
+			}
 			expect(delta).toMatchObject({
 				ok: true,
 				supported: true,
