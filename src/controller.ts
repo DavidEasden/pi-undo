@@ -51,6 +51,12 @@ export interface ControllerDependencies {
 		onTiming?: (phase: string, durationMs: number) => void,
 		options?: CaptureBaselineOptions,
 	) => Promise<SnapshotManifest>;
+	/** 输入基线完成时的 native 变更游标；不可用时返回 undefined。 */
+	readonly changeCursor?: () => SettledChangeCursor | undefined;
+	/** 查询自输入基线以来的可信变化；不可信或不可用时返回 undefined。 */
+	readonly probeChanges?: (cursor: SettledChangeCursor) => Promise<SettledChangeProbe | undefined>;
+	/** 仅重置常驻 helper 看门狗；失败不影响 Agent run。 */
+	readonly keepAlive?: () => void;
 	readonly captureSafety?: (
 		referenceManifestId: ManifestId,
 		targetManifestId: ManifestId,
@@ -86,6 +92,17 @@ export interface ControllerDependencies {
 	readonly onProcess?: (diagnostic: ProcessDiagnostic) => void;
 	readonly onOperationEnd?: (opId: string, result: OperationResult) => Promise<void>;
 	readonly onSettlement?: (diagnostic: SettlementDiagnostic) => void | Promise<void>;
+}
+
+export interface SettledChangeCursor {
+	readonly sequence: number;
+	readonly instance: string;
+}
+
+export interface SettledChangeProbe {
+	readonly files: readonly string[];
+	readonly directories: readonly string[];
+	readonly trusted: boolean;
 }
 
 export interface CaptureBaselineOptions {
@@ -133,6 +150,8 @@ export interface SettlementDiagnostic {
 	readonly failureName?: string;
 	readonly failureCode?: string;
 	readonly captures?: readonly CaptureDiagnostic[];
+	/** 结算走了无需全量捕获的快速路径；用于诊断和基准核验。 */
+	readonly fastPath?: "no_changes";
 }
 
 export interface OperationResult {
@@ -215,6 +234,8 @@ interface StagedRun {
 	readonly rawPrompt: string;
 	readonly before: SnapshotManifest;
 	readonly sourceLogicalLeaf: string | null;
+	/** 输入基线对应的 native 变更游标；结算时据此判断是否完全无变化。 */
+	readonly changeCursor?: SettledChangeCursor;
 	startEntryId?: string | null;
 }
 
@@ -268,6 +289,7 @@ export class UndoControllerImpl implements UndoController {
 	private warmUpInFlight: Promise<void> | undefined;
 	private warmUpManifest: SnapshotManifest | undefined;
 	private pendingInputCapture: { readonly token: symbol; readonly promise: Promise<void> } | undefined;
+	private keepAliveTimer: ReturnType<typeof setInterval> | undefined;
 	private deferAgentStartUntilMessageEnd = false;
 	private runCompletion: RunCompletion | undefined;
 	private settling: Promise<void> | undefined;
@@ -310,6 +332,7 @@ export class UndoControllerImpl implements UndoController {
 
 	async dispose(): Promise<void> {
 		this.disposed = true;
+		this.stopKeepAlive();
 		this.cancelOperation();
 		for (const scope of this.backgroundScopes) scope.cancel();
 		await this.activeOperation;
@@ -432,12 +455,16 @@ export class UndoControllerImpl implements UndoController {
 		if (context.streaming || text.length === 0) return { action: "continue" };
 		if (this.disposed || this.runCompletion?.started || this.settling !== undefined) return { action: "defer" };
 		const run = this.beginRun();
+		this.startKeepAlive();
 		try {
-			const before = await this.runBackground(() => this.captureInputBaseline());
-			if (this.runCompletion === run && !this.disposed) this.stageInput(text, before);
+			const captured = await this.runBackground(() => this.captureInputBaseline());
+			if (this.runCompletion === run && !this.disposed) {
+				this.stageInput(text, captured.manifest, captured.changeCursor);
+			}
 			return { action: "continue" };
 		} catch (error) {
 			// 无法证明输入前状态：放弃记录本次历史，但绝不吞掉用户输入。
+			this.stopKeepAlive();
 			this.recordCaptureFailure(error);
 			return { action: "continue" };
 		}
@@ -450,6 +477,7 @@ export class UndoControllerImpl implements UndoController {
 		if (context.streaming || text.length === 0) return { action: "continue" };
 		if (this.disposed || this.runCompletion?.started || this.settling !== undefined) return { action: "defer" };
 		this.beginRun();
+		this.startKeepAlive();
 		this.staged = undefined;
 		this.lastCaptureFailed = false;
 		this.lastCaptureFailureMessage = undefined;
@@ -497,8 +525,28 @@ export class UndoControllerImpl implements UndoController {
 	}
 
 	private finishRun(run: RunCompletion | undefined): void {
+		this.stopKeepAlive();
 		if (this.runCompletion === run) this.runCompletion = undefined;
 		run?.resolve();
+	}
+
+	private startKeepAlive(): void {
+		this.stopKeepAlive();
+		const keepAlive = this.dependencies.keepAlive;
+		if (keepAlive === undefined) return;
+		const timer = setInterval(() => {
+			try {
+				keepAlive();
+			} catch { /* 看门狗只是性能优化，不能影响 Agent run。 */ }
+		}, 5_000);
+		timer.unref();
+		this.keepAliveTimer = timer;
+	}
+
+	private stopKeepAlive(): void {
+		if (this.keepAliveTimer === undefined) return;
+		clearInterval(this.keepAliveTimer);
+		this.keepAliveTimer = undefined;
 	}
 
 	private async startAgentRun(): Promise<void> {
@@ -531,7 +579,7 @@ export class UndoControllerImpl implements UndoController {
 		this.redoStack.length = 0;
 	}
 
-	private async captureInputBaseline(): Promise<SnapshotManifest> {
+	private async captureInputBaseline(): Promise<{ manifest: SnapshotManifest; changeCursor?: SettledChangeCursor }> {
 		// warm-up 仍在进行时先等待，确保随后可以消费已完成的 baseline，而不是再次完整 capture。
 		const warmUp = this.warmUpInFlight;
 		if (warmUp !== undefined) await warmUp;
@@ -543,34 +591,47 @@ export class UndoControllerImpl implements UndoController {
 		const capture = (): Promise<SnapshotManifest> => warmUpManifest !== undefined && this.dependencies.captureBaseline !== undefined
 			? this.captureBaselineWithWorkspaceLock(warmUpManifest)
 			: this.captureWithWorkspaceLock();
+		// 在捕获前固定游标：后台 durable prepare 可能在捕获期间触发新的 discovery；
+		// 若用捕获后的游标，会把基线读取之后、该扫描之前的变化误算进基线。
+		const changeCursor = this.dependencies.changeCursor?.();
+		const completed = (manifest: SnapshotManifest): { manifest: SnapshotManifest; changeCursor?: SettledChangeCursor } =>
+			({ manifest, ...(changeCursor === undefined ? {} : { changeCursor }) });
 		try {
-			return await capture();
+			return completed(await capture());
 		} catch (error) {
 			// 输入前捕获也可能撞上短暂的工作区竞态；重试一次后仍失败才放弃本轮历史。
 			if (!isTransientCaptureFailure(error)) throw error;
 			await sleep(INPUT_CAPTURE_RETRY_DELAY_MS);
 			checkOperation();
-			return capture();
+			return completed(await capture());
 		}
 	}
 
 	private async captureInputForToken(text: string, token: symbol): Promise<void> {
 		try {
-			const before = await this.captureInputBaseline();
+			const captured = await this.captureInputBaseline();
 			if (this.pendingInputCapture?.token !== token) return;
-			this.stageInput(text, before);
+			this.stageInput(text, captured.manifest, captured.changeCursor);
 		} catch (error) {
 			if (this.pendingInputCapture?.token !== token) return;
 			// 无法证明输入前状态：放弃记录本次历史，但绝不吞掉用户输入。
+			this.stopKeepAlive();
 			this.recordCaptureFailure(error);
 		}
 	}
 
-	private stageInput(text: string, before: SnapshotManifest): void {
+	private stageInput(text: string, before: SnapshotManifest, changeCursor?: SettledChangeCursor): void {
 		this.lastCaptureFailed = false;
 		this.lastCaptureFailureMessage = undefined;
 		this.historyPaused = false;
-		this.staged = { rawPrompt: text, before, sourceLogicalLeaf: this.dependencies.getLogicalLeafId() };
+		this.staged = {
+			rawPrompt: text,
+			before,
+			sourceLogicalLeaf: this.dependencies.getLogicalLeafId(),
+			...(changeCursor === undefined ? {} : { changeCursor }),
+		};
+		if (changeCursor === undefined) this.stopKeepAlive();
+		else this.startKeepAlive();
 	}
 
 	private recordCaptureFailure(error: unknown): void {
@@ -622,6 +683,7 @@ export class UndoControllerImpl implements UndoController {
 		let failureName: string | undefined;
 		let failureCode: string | undefined;
 		let changedFiles: number | undefined;
+		let fastPath: SettlementDiagnostic["fastPath"];
 		let outcome: SettlementDiagnostic["outcome"] = "failed";
 		const measure = async <T>(phase: string, operation: () => Promise<T>): Promise<T> => {
 			this.dependencies.onProgress?.(phase);
@@ -639,21 +701,40 @@ export class UndoControllerImpl implements UndoController {
 			// collectVisibleLeaves；只有超过 2s 后才能从 target manifest 受益。
 			const appliedTargetInRacyWindow = appliedTargetManifest !== undefined &&
 				appliedTargetAt !== undefined && performance.now() - appliedTargetAt < 2_000;
-			const after = await measure("settled.capture", () =>
-				this.captureSettledBaselineWithRetry(
-					appliedTargetManifest !== undefined && appliedTargetAt !== undefined &&
-						!appliedTargetInRacyWindow
-						? appliedTargetManifest
-						: staged.before,
-					(diagnostic) => captureDiagnostics.push(diagnostic),
-					recordCaptureTiming,
-					// 窗口内传入的 baseline 是 restore 前的 staged.before，已确定失效；
-					// 探测只会白跑一轮，直接进入 fullCapture。
-					{ skipBaselineProbe: appliedTargetInRacyWindow },
-				));
+			let probe: SettledChangeProbe | undefined;
+			if (staged.changeCursor !== undefined && this.dependencies.probeChanges !== undefined) {
+				try {
+					probe = await measure("settled.changeProbe", () =>
+						this.dependencies.probeChanges!(staged.changeCursor!));
+				} catch (error) {
+					// 取消/超时应中断结算；普通探测失败只意味着退回完整捕获。
+					rethrowOperationFailure(error);
+				}
+			}
+			let after: SnapshotManifest;
+			if (probe?.trusted === true && probe.files.length === 0 && probe.directories.length === 0) {
+				// 事件覆盖证明自输入基线以来没有工作区变化：before 就是 after，无需全量 hash。
+				after = staged.before;
+				fastPath = "no_changes";
+			} else {
+				after = await measure("settled.capture", () =>
+					this.captureSettledBaselineWithRetry(
+						appliedTargetManifest !== undefined && appliedTargetAt !== undefined &&
+							!appliedTargetInRacyWindow
+							? appliedTargetManifest
+							: staged.before,
+						(diagnostic) => captureDiagnostics.push(diagnostic),
+						recordCaptureTiming,
+						// 窗口内传入的 baseline 是 restore 前的 staged.before，已确定失效；
+						// 探测只会白跑一轮，直接进入 fullCapture。
+						{ skipBaselineProbe: appliedTargetInRacyWindow },
+					));
+			}
 			failureStage = "settled.changedPaths";
-			const changedPaths = await measure("settled.changedPaths", () =>
-				this.dependencies.changedPaths(staged.before, after));
+			const changedPaths = fastPath === "no_changes"
+				? []
+				: await measure("settled.changedPaths", () =>
+					this.dependencies.changedPaths(staged.before, after));
 			changedFiles = changedPaths.length;
 			const endLeafId = this.dependencies.getLogicalLeafId() ?? staged.startEntryId;
 			const checkpoint = this.createCheckpoint(staged, after, changedPaths, userEntryId, endLeafId);
@@ -702,6 +783,7 @@ export class UndoControllerImpl implements UndoController {
 				durationMs: Math.round(performance.now() - startedAt),
 				timings: phaseTimings,
 				...(changedFiles === undefined ? {} : { changedFiles }),
+				...(fastPath === undefined ? {} : { fastPath }),
 				...(outcome === "failed" ? { failureStage, failureName, ...(failureCode === undefined ? {} : { failureCode }) } : {}),
 				...(captureDiagnostics.length === 0 ? {} : { captures: captureDiagnostics }),
 			};
@@ -936,7 +1018,8 @@ export class UndoControllerImpl implements UndoController {
 		let settlement: SettlementDiagnostic | undefined;
 		const done = (result: OperationResult): OperationResult => profile.attach({
 			...result,
-			...(settlement === undefined || (settlement.outcome === "ok" && settlement.durationMs < 1_000)
+			...(settlement === undefined || (settlement.outcome === "ok" &&
+				settlement.durationMs < 1_000 && settlement.fastPath === undefined)
 				? {} : { settlement }),
 		});
 		this.operationInFlight = true;

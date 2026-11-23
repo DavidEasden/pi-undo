@@ -1668,6 +1668,67 @@ describe("UndoController", () => {
 		expect(controller.history()).toEqual({ undoCount: 1, redoCount: 0, locked: false });
 	});
 
+
+	it("可信空变更结算复用 before 且 undo 不再等待全量捕获", async () => {
+		let enter!: () => void;
+		let release!: () => void;
+		const entered = new Promise<void>((resolve) => { enter = resolve; });
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const captureBaseline = vi.fn(async () => manifest("c"));
+		const changedPaths = vi.fn(async () => ["file.txt"]);
+		const probeChanges = vi.fn(async (cursor: { sequence: number; instance: string }) => {
+			expect(cursor).toEqual({ sequence: 7, instance: "helper-test" });
+			enter();
+			await gate;
+			return { files: [], directories: [], trusted: true };
+		});
+		const controller = new UndoControllerImpl(dependencies({
+			changeCursor: () => ({ sequence: 7, instance: "helper-test" }),
+			probeChanges,
+			captureBaseline,
+			changedPaths,
+		}));
+		await controller.prepareInput("本轮", { streaming: false });
+		await controller.beforeAgentStart();
+
+		const settled = controller.agentSettled();
+		await entered;
+		const undo = controller.undo();
+		release();
+		await settled;
+		const result = await undo;
+
+		expect(probeChanges).toHaveBeenCalledOnce();
+		expect(captureBaseline).not.toHaveBeenCalled();
+		expect(changedPaths).not.toHaveBeenCalled();
+		expect(result).toMatchObject({ code: "ok", changedFiles: 0 });
+		expect(result.settlement).toMatchObject({ outcome: "ok", fastPath: "no_changes", changedFiles: 0 });
+		expect(controller.history()).toEqual({ undoCount: 0, redoCount: 1, locked: false });
+	});
+
+	it("探测到变化或不可信时退回完整结算捕获", async () => {
+		for (const probe of [
+			{ files: ["file.txt"], directories: [], trusted: true },
+			{ files: [], directories: [], trusted: false },
+		]) {
+			const captureBaseline = vi.fn(async () => manifest("c"));
+			const changedPaths = vi.fn(async () => ["file.txt"]);
+			const controller = new UndoControllerImpl(dependencies({
+				changeCursor: () => ({ sequence: 7, instance: "helper-test" }),
+				probeChanges: async () => probe,
+				captureBaseline,
+				changedPaths,
+			}));
+			await controller.prepareInput("本轮", { streaming: false });
+			await controller.beforeAgentStart();
+			await controller.agentSettled();
+
+			expect(captureBaseline).toHaveBeenCalledOnce();
+			expect(changedPaths).toHaveBeenCalledOnce();
+			expect(controller.history()).toMatchObject({ undoCount: 1 });
+		}
+	});
+
 	it("tree observed leaf 与预检目标不一致时进入 recovery lock 且不恢复", async () => {
 		const deps = dependencies({
 			resolveTreeTarget: async () => ({ logicalLeafId: "tree-leaf", targetManifestId: "a".repeat(64) as ManifestId, undoStack: [] }),

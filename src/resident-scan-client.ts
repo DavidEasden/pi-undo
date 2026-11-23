@@ -47,12 +47,34 @@ export class ResidentScanClient {
 	}
 
 	scan(timeoutMs = this.timeoutMs, leafRoots?: readonly string[], ifLeafDigest?: string): Promise<JsonObject | undefined> {
+		return this.enqueue(() => this.scanOne(timeoutMs, leafRoots, ifLeafDigest));
+	}
+
+	/** 查询自 sinceSeq 以来的文件/目录变化；不消费目录缓存事件。 */
+	changesSince(sinceSeq: number, sinceInstance: string, timeoutMs = this.timeoutMs): Promise<JsonObject | undefined> {
+		if (!Number.isSafeInteger(sinceSeq) || sinceSeq < 0 ||
+			sinceInstance.length === 0 || sinceInstance.length > 128 || sinceInstance.includes("\0")) {
+			return Promise.resolve(undefined);
+		}
+		return this.enqueue(() => this.request(JSON.stringify({
+			schemaVersion: 1,
+			sinceSeq,
+			sinceInstance,
+		}), timeoutMs));
+	}
+
+	/** 仅为 reset serve 看门狗；不触发扫描。 */
+	keepAlive(timeoutMs = 1_000): Promise<JsonObject | undefined> {
+		return this.enqueue(() => this.request(JSON.stringify({
+			schemaVersion: 1,
+			keepAlive: true,
+		}), timeoutMs));
+	}
+
+	private enqueue<T>(operation: () => Promise<T>): Promise<T> {
 		if (this.idleTimer !== undefined) clearTimeout(this.idleTimer);
 		this.pendingScans += 1;
-		const result = this.queue.then(
-			() => this.scanOne(timeoutMs, leafRoots, ifLeafDigest),
-			() => this.scanOne(timeoutMs, leafRoots, ifLeafDigest),
-		);
+		const result = this.queue.then(operation, operation);
 		const settled = result.finally(() => {
 			this.pendingScans -= 1;
 			if (this.pendingScans === 0) this.scheduleIdle();
@@ -62,14 +84,18 @@ export class ResidentScanClient {
 	}
 
 	private async scanOne(timeoutMs: number, leafRoots?: readonly string[], ifLeafDigest?: string): Promise<JsonObject | undefined> {
-		if (this.closed) return undefined;
-		const child = await this.ensureChild(timeoutMs);
-		if (child === undefined) return undefined;
-		const line = await this.requestLine(child, JSON.stringify({
+		return this.request(JSON.stringify({
 			schemaVersion: 1,
 			...(leafRoots === undefined ? {} : { leafRoots }),
 			...(ifLeafDigest === undefined ? {} : { ifLeafDigest }),
 		}), timeoutMs);
+	}
+
+	private async request(payload: string, timeoutMs: number): Promise<JsonObject | undefined> {
+		if (this.closed) return undefined;
+		const child = await this.ensureChild(timeoutMs);
+		if (child === undefined) return undefined;
+		const line = await this.requestLine(child, payload, timeoutMs);
 		if (line === undefined) return undefined;
 		try {
 			return parseObject(line);

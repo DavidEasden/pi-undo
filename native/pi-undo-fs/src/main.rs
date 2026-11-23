@@ -129,6 +129,11 @@ fn run() -> Result<(), String> {
     if first == "--capabilities" {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
+            // 增量变更探测目前只在 macOS 的 FSEvents 监听上提供；
+            // Linux 继续使用 inotify 的目录缓存路径，避免把未验证语义当成完整覆盖。
+            #[cfg(target_os = "macos")]
+            let capabilities = r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","inspect-batches-v1","scan-directories-v1","scan-directories-v2","scan-serve-v1","scan-serve-cache-v1","scan-serve-leaves-v1","scan-serve-leaf-digest-v1","scan-serve-changes-v1","restore-files-v2","restore-files-v3"]}"#;
+            #[cfg(target_os = "linux")]
             let capabilities = r#"{"ok":true,"capabilities":["restore-v1","inspect-v1","inspect-batches-v1","scan-directories-v1","scan-directories-v2","scan-serve-v1","scan-serve-cache-v1","scan-serve-leaves-v1","scan-serve-leaf-digest-v1","restore-files-v2","restore-files-v3"]}"#;
             println!("{capabilities}");
         }

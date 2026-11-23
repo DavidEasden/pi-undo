@@ -65,6 +65,44 @@ describe.skipIf(process.env.PI_UNDO_RUN_RESIDENT_LIVE !== "1" || (process.platfo
 		}
 	});
 
+	it.skipIf(process.platform !== "darwin")("变更探测返回精确路径且不消费目录缓存事件", async () => {
+		const base = await realpath(await mkdtemp(join(tmpdir(), "pi-undo-changes-")));
+		const workspace = join(base, "workspace");
+		const client = new ResidentScanClient(binary, workspace, 5_000);
+		try {
+			await mkdir(join(workspace, "src"), { recursive: true });
+			await writeFile(join(workspace, "src/value.txt"), "before\n");
+			const first = await client.scan();
+			expect(first?.ok).toBe(true);
+			const sequence = Number(first?.changeSeq);
+			const instance = String(first?.changeInstance);
+			expect(Number.isSafeInteger(sequence)).toBe(true);
+			expect(instance.length).toBeGreaterThan(0);
+
+			await writeFile(join(workspace, "src/value.txt"), "after\n");
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			const delta = await client.changesSince(sequence, instance);
+			expect(delta).toMatchObject({
+				ok: true,
+				supported: true,
+				trusted: true,
+				changedFiles: ["src/value.txt"],
+			});
+			// helper 重启后序号不可复用：实例不匹配时必须拒绝快速路径。
+			expect(await client.changesSince(sequence, "different-helper-instance")).toMatchObject({
+				ok: true,
+				trusted: false,
+			});
+
+			// peek 不消费事件：后续叶子扫描仍能看到同一批变化并返回最新内容对应的路径。
+			const leaves = await client.scan(undefined, ["src"]);
+			expect(leaves).toMatchObject({ ok: true, leaves: ["src/value.txt"] });
+		} finally {
+			await client.close();
+			await rm(base, { recursive: true, force: true });
+		}
+	});
+
 	it("预热后复用缓存并在目录事件后重扫", async () => {
 		const root = await realpath(await mkdtemp(join(tmpdir(), "pi-undo-resident-live-")));
 		const scanner = new NativeDirectoryScanner(binary);

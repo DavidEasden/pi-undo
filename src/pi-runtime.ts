@@ -49,7 +49,7 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 	const initialTopology = await discovery.discover(context.cwd);
 	// 初始 topology 建立后启动常驻 helper，避免冷启动预热与首次 discovery 争用目录读取；
 	// 首次 prompt capture 会等待这次预热完成并复用同一缓存。
-	discovery.warmScanCache(context.cwd);
+	discovery.warmScanCache(initialTopology.workspaceIdentity);
 	const store = new SnapshotStore({ storeRoot: privateRoot, discovery });
 	const restore = new RestoreEngine({ workspaceRoot: context.cwd, store, discovery });
 	const journal = new JournalStore({ transactionsRoot: join(privateRoot, "transactions") });
@@ -274,6 +274,9 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 		appendCursor: async (cursor) => cursorWriter.appendCursor(cursor, pi, sourceFor(manager)),
 		capture,
 		captureBaseline,
+		changeCursor: () => discovery.changeCursor(),
+		probeChanges: (cursor) => discovery.changesSince(context.cwd, cursor),
+		keepAlive: () => discovery.keepAlive(),
 		captureSafety: async (referenceManifestId, targetManifestId, scopePaths) => {
 			const [reference, target] = await allCompleted([
 				store.loadManifest(referenceManifestId),
@@ -339,7 +342,7 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 			});
 		},
 		onSettlement: async (settlement: SettlementDiagnostic) => {
-			if (settlement.outcome === "ok" && settlement.durationMs < 1_000) return;
+			if (settlement.outcome === "ok" && settlement.durationMs < 1_000 && settlement.fastPath === undefined) return;
 			await writeJsonAtomic(join(privateRoot, "diagnostics", `${manager.getSessionId()}-settlement-diagnostic.json`), {
 				schemaVersion: 1,
 				settlement,
