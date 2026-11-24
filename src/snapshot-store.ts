@@ -1375,13 +1375,16 @@ export class SnapshotStore {
 		const pinPath = join(dirname(dirname(manifestPath)), "pins", `${id}${MANIFEST_SUFFIX}`);
 		const current = await readPin(pinPath, id);
 		const reasons = [...new Set([...(current?.reasons ?? []), reason])].sort(comparePaths);
-		await writeJsonAtomic(pinPath, {
-			schemaVersion: SCHEMA_VERSION,
-			manifestId: id,
-			reasons,
-			updatedAt: new Date(this.clock()).toISOString(),
-		} satisfies PinRecord);
-		await this.touchStore(dirname(dirname(manifestPath)));
+		// 两项写入全部结束后才释放 store 锁；失败可能遗留 pin，不能留下迟到写入。
+		await allCompleted([
+			writeJsonAtomic(pinPath, {
+				schemaVersion: SCHEMA_VERSION,
+				manifestId: id,
+				reasons,
+				updatedAt: new Date(this.clock()).toISOString(),
+			} satisfies PinRecord),
+			this.touchStore(dirname(dirname(manifestPath))),
+		]);
 	}
 
 	async unpin(id: ManifestId, reason: string): Promise<void> {

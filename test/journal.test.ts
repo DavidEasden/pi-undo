@@ -2,7 +2,8 @@ import { appendFile, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as atomicFs from "../src/atomic-fs.ts";
 import { canonicalJson, checksum } from "../src/encoding.ts";
 import {
 	JournalStore,
@@ -116,6 +117,41 @@ describe("JournalStore", () => {
 		expect(pending[0]).toMatchObject({ descriptor: operation, state: { phase: "PREPARED", revision: 1 } });
 		await expect(readFile(join(root, "transactions", operation.opId, "descriptor.json"), "utf8"))
 			.resolves.toBe(canonicalJson(operation));
+	});
+
+	it("prepare 一项失败时等待另一项落盘结束，且不发布 PREPARED", async () => {
+		const root = await temporaryRoot("pi-undo-journal-drain-");
+		const store = new JournalStore({ transactionsRoot: join(root, "transactions") });
+		const operation = descriptor(join(root, "session.jsonl"));
+		const directory = join(root, "transactions", operation.opId);
+		const write = atomicFs.writeContentAddressed;
+		let entered!: () => void;
+		let release!: () => void;
+		const started = new Promise<void>((resolve) => { entered = resolve; });
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const injected = new Error("注入 descriptor 持久化失败");
+		const mock = vi.spyOn(atomicFs, "writeContentAddressed").mockImplementation(async (file, bytes, mode) => {
+			if (file.endsWith("descriptor.json")) throw injected;
+			entered();
+			await gate;
+			await write(file, bytes, mode);
+		});
+		let finished = false;
+		const preparation = store.prepare(operation, { paths: [], planDigest: operation.planDigest })
+			.then(() => { finished = true; return undefined; }, (error: unknown) => { finished = true; return error; });
+		try {
+			await started;
+			expect(finished).toBe(false);
+			release();
+			expect(await preparation).toBe(injected);
+			await expect(readFile(join(directory, "restore-plan.json"), "utf8")).resolves.toContain(operation.planDigest);
+			await expect(readFile(join(directory, "state.json"))).rejects.toMatchObject({ code: "ENOENT" });
+			expect(await store.loadPending()).toEqual([]);
+		} finally {
+			release();
+			await preparation;
+			mock.mockRestore();
+		}
 	});
 
 	it("相位只能单调推进，并持久化 observed logical leaf", async () => {

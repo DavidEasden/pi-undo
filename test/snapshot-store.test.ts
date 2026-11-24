@@ -2,9 +2,10 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { access, chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, unlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as atomicFs from "../src/atomic-fs.ts";
 import * as ignoredDirectoryScan from "../src/ignored-directory-scan.ts";
 import { canonicalJson, checksum, ignoredPresentClosure } from "../src/encoding.ts";
 import { AfterManifestIndex } from "../src/after-manifest-index.ts";
@@ -2485,6 +2486,51 @@ describe("SnapshotStore", () => {
 		await store.unpin(manifest.manifestId, "session");
 		expect(await store.loadManifest(manifest.manifestId)).toEqual(manifest);
 		expect((await filesBelow(storeRoot)).filter((file) => file.includes("/pins/"))).toEqual([]);
+	});
+
+	it.each(["pin", "gc"])("%s 写入失败时，等待另一项落盘后才释放存储锁", async (failedWrite) => {
+		const workspace = await temporaryRoot("pi-undo-snapshot-");
+		await writeFixtureFile(workspace, "file.txt", "content\n");
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		const topology = await new RootDiscovery().discover(workspace);
+		const lock = new WorkspaceLock({ lockRoot: join(storeRoot, "locks") });
+		const store = new SnapshotStore({ storeRoot, lock });
+		const manifest = await store.capture(topology);
+		const started = deferred();
+		const release = deferred();
+		const failure = new Error("注入固定记录失败");
+		const write = atomicFs.writeJsonAtomic;
+		const writeSpy = vi.spyOn(atomicFs, "writeJsonAtomic").mockImplementation(async (path, value) => {
+			const kind = basename(path) === "gc.json" ? "gc" : basename(dirname(path)) === "pins" ? "pin" : undefined;
+			if (kind === failedWrite) throw failure;
+			if (kind !== undefined) {
+				started.resolve();
+				await release.promise;
+			}
+			await write(path, value);
+		});
+		const acquire = lock.acquire.bind(lock);
+		let released = false;
+		const lockSpy = vi.spyOn(lock, "acquire").mockImplementation(async (identity) => {
+			const lease = await acquire(identity);
+			return { ...lease, release: async () => { released = true; await lease.release(); } };
+		});
+		let finished = false;
+		const result = store.pin(manifest.manifestId, "session").catch((error: unknown) => error)
+			.finally(() => { finished = true; });
+		try {
+			await started.promise;
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(finished).toBe(false);
+			expect(released).toBe(false);
+		} finally {
+			release.resolve();
+			await result;
+			writeSpy.mockRestore();
+			lockSpy.mockRestore();
+		}
+		expect(await result).toBe(failure);
+		expect(released).toBe(true);
 	});
 
 	it("最后一个 reason 的 unpin 刷新 GC 元数据失败时保留 pin", async () => {

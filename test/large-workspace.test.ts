@@ -8,6 +8,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 
 import { RootDiscovery } from "../src/root-discovery.ts";
+import { createGitRepo, createNestedRepo } from "./fixtures.ts";
 import { closeHarness, createHarness, createTempRoot, waitForRecoveryDrain } from "./pi-sdk.fixture.ts";
 
 /** 大工作区基准按需运行，常规 CI 通过 performance.test.ts 断言调用次数。 */
@@ -19,8 +20,18 @@ describe.skipIf(process.env.PI_UNDO_LARGE_WORKSPACE !== "1")("大型工作区真
 		{ packages: 10_000, changedFiles: 100 },
 	])("$packages 个依赖包，修改 $changedFiles 个文件", async ({ packages, changedFiles }) => {
 		const temp = await createTempRoot();
+		const roots = Number(process.env.PI_UNDO_BENCH_ROOTS ?? "1");
+		expect(Number.isSafeInteger(roots) && roots > 0).toBe(true);
+		const gitBacked = process.env.PI_UNDO_BENCH_GIT === "1" || roots > 1;
+		if (gitBacked) await createGitRepo(temp.workspace);
+		for (let index = 1; index < roots; index += 1) {
+			await createNestedRepo(temp.workspace, `repositories/root-${index}`);
+		}
 		await writeFile(join(temp.workspace, ".gitignore"), "node_modules/\n");
-		const paths = Array.from({ length: changedFiles }, (_, index) => `value-${index}.txt`);
+		const paths = Array.from({ length: changedFiles }, (_, index) => {
+			const prefix = index % roots === 0 ? "" : `repositories/root-${index % roots}/`;
+			return `${prefix}value-${index}.txt`;
+		});
 		const createVisibleFiles = () => Promise.all(paths.map((path) => writeFile(join(temp.workspace, path), "before\n")));
 		const existingFiles = process.env.PI_UNDO_BENCH_EXISTING_FILES === "1";
 		if (existingFiles) {
@@ -59,6 +70,10 @@ describe.skipIf(process.env.PI_UNDO_LARGE_WORKSPACE !== "1")("大型工作区真
 				expect(controller.listCheckpoints().at(-1)?.changedPaths).toEqual([...paths].sort());
 				expect(checkpointMs).toBeDefined();
 			} finally { timer.mockRestore(); }
+			// 等待发生在计时前，用于单独测量后台 after 已有机会完成的首次 undo。
+			const delayMs = Number(process.env.PI_UNDO_BENCH_DELAY_MS ?? "0");
+			expect(Number.isFinite(delayMs) && delayMs >= 0).toBe(true);
+			if (delayMs > 0) await delay(delayMs);
 			const timings: number[] = [];
 			const redoTimings: number[] = [];
 			const scans: number[] = [];
@@ -100,7 +115,7 @@ describe.skipIf(process.env.PI_UNDO_LARGE_WORKSPACE !== "1")("大型工作区真
 				expect(scan).toBeLessThanOrEqual(maxScans);
 			}
 			const report = JSON.stringify({
-				packages, changedFiles, existingFiles, checkpointMs, timingsMs: timings, redoTimingsMs: redoTimings, scans,
+				packages, changedFiles, roots, existingFiles, gitBacked, delayMs, checkpointMs, timingsMs: timings, redoTimingsMs: redoTimings, scans,
 				nativeDisabled: process.env.PI_UNDO_DISABLE_NATIVE === "1",
 				medianMs: [...timings].sort((a, b) => a - b)[1],
 				peakRssMiB: Math.round(peakRss / 1024 / 1024),

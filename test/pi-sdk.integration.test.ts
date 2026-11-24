@@ -1,7 +1,10 @@
+import { join } from "node:path";
+
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 
+import { JournalStore } from "../src/journal.ts";
 import { RootDiscovery } from "../src/root-discovery.ts";
 import {
 	closeHarness,
@@ -100,6 +103,52 @@ describe("真实 pi 1.2.0 SDK", () => {
 			expect(restarted.runtime().controller.history()).toEqual({ undoCount: 1, redoCount: 0, locked: false });
 		} finally {
 			await closeHarness(restarted, temp.sessionDir);
+		}
+	});
+
+	it.each([
+		{ label: "合并相位写入前", writeBeforeFailure: false, phase: "APPLYING" },
+		{ label: "合并相位写入后", writeBeforeFailure: true, phase: "CURSOR_COMMITTED" },
+	])("cursor 已持久化但$label失败，重启后补完并可 redo", async ({ writeBeforeFailure, phase }) => {
+		const { temp, harness } = await createFreshHarness();
+		const original = JournalStore.prototype.setPhases;
+		const injected = vi.spyOn(JournalStore.prototype, "setPhases").mockImplementation(async function (this: JournalStore, opId, transitions) {
+			if (transitions.some((transition) => transition.phase === "FILES_VERIFIED")) {
+				if (writeBeforeFailure) await original.call(this, opId, transitions);
+				throw new Error("注入 cursor 后相位提交失败");
+			}
+			await original.call(this, opId, transitions);
+		});
+		let restarted: Awaited<ReturnType<typeof createHarness>> | undefined;
+		try {
+			setUpRun(harness.faux, "value.txt", "after\n", "完成");
+			await harness.session.prompt("修改文件");
+			await harness.session.prompt("/undo");
+			expect(await readValue(temp.workspace)).toBe("before\n");
+			expect(harness.runtime().controller.history().locked).toBe(true);
+			const journals = await new JournalStore({
+				transactionsRoot: join(temp.sessionDir, ".pi-undo", "transactions"),
+			}).loadPending();
+			expect(journals).toHaveLength(1);
+			expect(journals[0]?.state.phase).toBe(phase);
+			const sessionFile = harness.session.sessionFile!;
+			injected.mockRestore();
+			await closeHarness(harness, temp.sessionDir);
+			restarted = await createHarness({
+				workspace: temp.workspace,
+				agentDir: temp.agentDir,
+				sessionManager: SessionManager.open(sessionFile),
+			});
+			expect(await readValue(temp.workspace)).toBe("before\n");
+			expect(restarted.runtime().controller.history()).toEqual({ undoCount: 0, redoCount: 1, locked: false });
+			await waitForRecoveryDrain(temp.sessionDir);
+			await restarted.session.prompt("/redo");
+			expect(await readValue(temp.workspace)).toBe("after\n");
+			expect(restarted.runtime().controller.history()).toEqual({ undoCount: 1, redoCount: 0, locked: false });
+		} finally {
+			injected.mockRestore();
+			await closeHarness(harness, temp.sessionDir);
+			if (restarted !== undefined) await closeHarness(restarted, temp.sessionDir);
 		}
 	});
 

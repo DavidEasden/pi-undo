@@ -18,6 +18,7 @@ import type {
 	OperationDescriptor,
 } from "./model.ts";
 import { MutationJournal } from "./mutation-journal.ts";
+import { allCompleted } from "./operation-context.ts";
 
 export interface PendingJournal {
 	readonly descriptor: OperationDescriptor;
@@ -64,8 +65,12 @@ export class JournalStore {
 			throw new Error("restore plan 与 descriptor 不匹配");
 		}
 		const directory = this.operationDirectory(descriptor.opId);
-		await writeContentAddressed(join(directory, "descriptor.json"), Buffer.from(canonicalJson(descriptor), "utf8"));
-		await writeContentAddressed(join(directory, "restore-plan.json"), Buffer.from(canonicalJson(plan), "utf8"));
+		// 两个不可变控制文件可并行持久化；全部完成后才能发布 PREPARED。
+		// 失败时也等待另一项结束，避免释放 workspace lease 后仍有迟到写入。
+		await allCompleted([
+			writeContentAddressed(join(directory, "descriptor.json"), Buffer.from(canonicalJson(descriptor), "utf8")),
+			writeContentAddressed(join(directory, "restore-plan.json"), Buffer.from(canonicalJson(plan), "utf8")),
+		]);
 		const statePath = join(directory, "state.json");
 		try {
 			const existing = assertJournalState(JSON.parse(await readFile(statePath, "utf8")));

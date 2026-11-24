@@ -1238,9 +1238,40 @@ describe("UndoController", () => {
 		expect(await controller.undo()).toMatchObject({ code: "ok", changedFiles: 1 });
 		expect(deps.calls).toEqual([
 			"capture", "prepare", "navigate", "phase:SESSION_MOVED", "phase:APPLYING", "restore",
-			"phase:FILES_VERIFIED", "cursor", "phase:CURSOR_COMMITTED", "committed",
+			"cursor", "phase:FILES_VERIFIED", "phase:CURSOR_COMMITTED", "committed",
 		]);
 		expect(controller.history()).toEqual({ undoCount: 0, redoCount: 1, locked: false });
+	});
+
+	it.each([
+		{ label: "成功", failCommit: false },
+		{ label: "失败", failCommit: true },
+	])("durable cursor 后合并提交$label时不提前推进历史或回滚文件", async ({ failCommit }) => {
+		const deps = dependencies();
+		const groups: string[][] = [];
+		const controller = new UndoControllerImpl({
+			...deps,
+			journal: {
+				...deps.journal,
+				setPhases: async (opId, transitions) => {
+					groups.push(transitions.map(({ phase }) => phase));
+					if (transitions[0]?.phase === "FILES_VERIFIED") {
+						expect(deps.calls).toContain("cursor");
+						expect(controller.history()).toEqual({ undoCount: 1, redoCount: 0, locked: false });
+						if (failCommit) throw new OperationError("operation_cancelled", "注入提交阶段取消");
+					}
+					for (const { phase } of transitions) await deps.journal.setPhase(opId, phase);
+				},
+			},
+		}, { undoStack: [restoredCheckpoint()] });
+
+		expect((await controller.undo()).code).toBe(failCommit ? "recovery_required" : "ok");
+		expect(groups).toEqual([["SESSION_MOVED", "APPLYING"], ["FILES_VERIFIED", "CURSOR_COMMITTED"]]);
+		expect(deps.calls.filter((call) => call === "restore")).toHaveLength(1);
+		expect(deps.calls).not.toContain("session-rollback");
+		expect(controller.history()).toEqual(failCommit
+			? { undoCount: 1, redoCount: 0, locked: true }
+			: { undoCount: 0, redoCount: 1, locked: false });
 	});
 
 	it("undo/redo restore saga 在 cursor 与 journal 提交后才释放 workspace lease", async () => {

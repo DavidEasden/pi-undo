@@ -1208,8 +1208,8 @@ export class UndoControllerImpl implements UndoController {
 				return done(result.code === "restore_failed_safe" && applied.failureCode !== undefined
 					? { ...result, code: applied.failureCode } : result);
 			}
-			await profile.measure("journal", () =>
-				this.dependencies.journal.setPhase(descriptor.opId, "FILES_VERIFIED"));
+			// 恢复器依据 durable cursor 决定回滚或补完；cursor 发布前保留 APPLYING，
+			// 发布成功后将 FILES_VERIFIED 与 CURSOR_COMMITTED 合并为一次原子写入。
 			const cursor = this.createCursor(descriptor, action, checkpoint);
 			const cursorResult = await profile.measure("cursor", () => this.dependencies.appendCursor(cursor));
 			if (cursorResult.kind === "recovery_required") {
@@ -1227,7 +1227,10 @@ export class UndoControllerImpl implements UndoController {
 			}
 			this.transaction.cursorDurable = true;
 			await profile.measure("commit", async () => {
-				await this.dependencies.journal.setPhase(descriptor.opId, "CURSOR_COMMITTED");
+				await this.setJournalPhases(descriptor.opId, [
+					{ phase: "FILES_VERIFIED" },
+					{ phase: "CURSOR_COMMITTED" },
+				]);
 				await this.dependencies.journal.markCommitted(descriptor.opId);
 			});
 			this.lastSafetyManifestId = rollback.manifestId;

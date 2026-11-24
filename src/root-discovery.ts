@@ -15,6 +15,7 @@ import {
 import { allCompleted, checkOperation, OperationError, reportOperationProgress } from "./operation-context.ts";
 
 const DIRECTORY_SCAN_CONCURRENCY = 16;
+const REPOSITORY_READ_CONCURRENCY = 4;
 const NATIVE_SCAN_MIN_DIRECTORIES = 64;
 const GIT_POINTER_MAX_BYTES = 4096;
 
@@ -188,14 +189,17 @@ export class RootDiscovery {
 		if (!topologyChangeSetIsStable(changes, cursor)) return undefined;
 
 		const activeRoots = new Map<string, DiscoveredRoot>();
-		for (const root of previous.roots) {
+		for (let index = 0; index < previous.roots.length; index += REPOSITORY_READ_CONCURRENCY) {
 			checkOperation();
-			const absoluteRoot = root.relativeRoot === "."
-				? workspaceIdentity : join(workspaceIdentity, root.relativeRoot);
-			const inspection = await this.inspectRepository(absoluteRoot, workspaceIdentity);
-			if (inspection.kind !== "active" || inspection.repository.absoluteRoot !== absoluteRoot) return undefined;
-			const discovered = this.activeRoot(workspaceIdentity, inspection.repository);
-			activeRoots.set(absoluteRoot, discovered);
+			const inspections = await allCompleted(previous.roots.slice(index, index + REPOSITORY_READ_CONCURRENCY).map(async (root) => {
+				const absoluteRoot = root.relativeRoot === "."
+					? workspaceIdentity : join(workspaceIdentity, root.relativeRoot);
+				return { absoluteRoot, inspection: await this.inspectRepository(absoluteRoot, workspaceIdentity) };
+			}));
+			for (const { absoluteRoot, inspection } of inspections) {
+				if (inspection.kind !== "active" || inspection.repository.absoluteRoot !== absoluteRoot) return undefined;
+				activeRoots.set(absoluteRoot, this.activeRoot(workspaceIdentity, inspection.repository));
+			}
 		}
 		const gitlinkRoots = await this.discoverGitlinks(workspaceIdentity, activeRoots);
 		if (gitlinkRoots.size > 0 || [...activeRoots.values()].some((root) => root.gitlinkOid !== undefined)) {
@@ -396,38 +400,43 @@ export class RootDiscovery {
 		activeRoots: Map<string, DiscoveredRoot>,
 	): Promise<Map<string, DiscoveredRoot>> {
 		const result = new Map<string, DiscoveredRoot>();
-		for (const root of activeRoots.values()) {
+		const roots = [...activeRoots.values()].filter((root) => root.gitBacked && root.state === "active");
+		for (let index = 0; index < roots.length; index += REPOSITORY_READ_CONCURRENCY) {
 			checkOperation();
-			if (!root.gitBacked || root.state !== "active") {
-				continue;
-			}
-			const stage = await this.gitOutput(["-C", root.absoluteRoot, "ls-files", "--stage", "-z"]);
-			if (stage === null) {
-				throw new RootDiscoveryError("discovery_failed", "无法读取 Git index");
-			}
-			for (const gitlink of parseGitlinks(stage)) {
-				const absolutePath = resolve(root.absoluteRoot, gitlink.relativePath);
-				if (!isWithin(workspaceIdentity, absolutePath)) {
-					continue;
+			// 独立 index 限量并行读取；全部结束后仍按原顺序合并 gitlink，失败也不能留下在途进程。
+			const stages = await allCompleted(roots.slice(index, index + REPOSITORY_READ_CONCURRENCY).map(async (root) => ({
+				root,
+				stage: await this.gitOutput(["-C", root.absoluteRoot, "ls-files", "--stage", "-z"]),
+			})));
+			for (const { root, stage } of stages) {
+				checkOperation();
+				if (stage === null) {
+					throw new RootDiscoveryError("discovery_failed", "无法读取 Git index");
 				}
-				const relativeRoot = workspaceRelativePath(workspaceIdentity, absolutePath);
-				const existing = [...activeRoots.entries()].find(([, candidate]) => candidate.relativeRoot === relativeRoot);
-				if (existing !== undefined) {
-					activeRoots.set(existing[0], { ...existing[1], gitlinkOid: gitlink.oid });
-					continue;
+				for (const gitlink of parseGitlinks(stage)) {
+					const absolutePath = resolve(root.absoluteRoot, gitlink.relativePath);
+					if (!isWithin(workspaceIdentity, absolutePath)) {
+						continue;
+					}
+					const relativeRoot = workspaceRelativePath(workspaceIdentity, absolutePath);
+					const existing = [...activeRoots.entries()].find(([, candidate]) => candidate.relativeRoot === relativeRoot);
+					if (existing !== undefined) {
+						activeRoots.set(existing[0], { ...existing[1], gitlinkOid: gitlink.oid });
+						continue;
+					}
+					const state = await gitlinkState(absolutePath);
+					const sourceIdentity = `${root.sourceIdentity}:${relativeRoot}`;
+					result.set(relativeRoot, {
+						absoluteRoot: absolutePath,
+						relativeRoot,
+						gitBacked: true,
+						state,
+						sourceIdentity,
+						privateRepositoryId: checksum(sourceIdentity),
+						treeId: null,
+						gitlinkOid: gitlink.oid,
+					});
 				}
-				const state = await gitlinkState(absolutePath);
-				const sourceIdentity = `${root.sourceIdentity}:${relativeRoot}`;
-				result.set(relativeRoot, {
-					absoluteRoot: absolutePath,
-					relativeRoot,
-					gitBacked: true,
-					state,
-					sourceIdentity,
-					privateRepositoryId: checksum(sourceIdentity),
-					treeId: null,
-					gitlinkOid: gitlink.oid,
-				});
 			}
 		}
 		return result;

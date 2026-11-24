@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { GitRunError, GitRunner, type GitRunOptions, type GitRunResult } from "../src/git-runner.ts";
 import { createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
+import type { NativeRepositoryCandidate } from "../src/native-directory-scan.ts";
 import { RootDiscovery } from "../src/root-discovery.ts";
 import { WorkspaceLock, workspaceLockPath } from "../src/workspace-lock.ts";
 import {
@@ -280,6 +281,90 @@ describe("RootDiscovery", () => {
 			original.roots.map(({ relativeRoot, parentRoot, state, gitlinkOid }) =>
 				({ relativeRoot, parentRoot, state, gitlinkOid })),
 		);
+	});
+
+	it("多根恢复限量并行核验仓库和 index，保持拓扑及完整发现结果一致", async () => {
+		const outer = await createGitRepo();
+		temporaryRoots.push(outer.root);
+		const repositories: NativeRepositoryCandidate[] = [];
+		for (let index = 0; index < 5; index += 1) {
+			const path = `packages/child-${index}`;
+			const child = await createNestedRepo(outer.root, path);
+			const metadata = await lstat(child.root, { bigint: true });
+			repositories.push({ path, dev: metadata.dev, ino: metadata.ino });
+		}
+		const scan = vi.fn(async () => ({ directories: 64, repositories, changeSequence: 10, changeInstance: "helper-1" }));
+		const changesSince = vi.fn(async () => ({ files: [], directories: [], trusted: true, sequence: 11, instance: "helper-1" }));
+		const git = new GitRunner();
+		const discovery = new RootDiscovery(git, { scan, changesSince });
+		const original = await discovery.discover(outer.root);
+		const run = git.run.bind(git);
+		const active = { "rev-parse": 0, "ls-files": 0 };
+		const maximum = { "rev-parse": 0, "ls-files": 0 };
+		vi.spyOn(git, "run").mockImplementation(async (args, options) => {
+			const command = args.includes("rev-parse") ? "rev-parse" : args.includes("ls-files") ? "ls-files" : undefined;
+			if (command === undefined) return run(args, options);
+			active[command] += 1;
+			maximum[command] = Math.max(maximum[command], active[command]);
+			try {
+				await new Promise((resolve) => setTimeout(resolve, 10));
+				return await run(args, options);
+			} finally { active[command] -= 1; }
+		});
+
+		const restored = await discovery.discover(outer.root, "restore-pre");
+
+		expect(restored).toEqual(original);
+		expect(scan).toHaveBeenCalledOnce();
+		expect(changesSince).toHaveBeenCalledTimes(2);
+		for (const count of Object.values(maximum)) {
+			expect(count).toBeGreaterThan(1);
+			expect(count).toBeLessThanOrEqual(4);
+		}
+		expect(active).toEqual({ "rev-parse": 0, "ls-files": 0 });
+		maximum["ls-files"] = 0;
+		expect(await discovery.discover(outer.root, "restore-post")).toEqual(original);
+		expect(maximum["ls-files"]).toBeGreaterThan(1);
+		expect(maximum["ls-files"]).toBeLessThanOrEqual(4);
+	});
+
+	it.each(["rev-parse", "ls-files"])("多根 %s 失败时等待本批读取结束且不启动下一批", async (command) => {
+		const outer = await createGitRepo();
+		temporaryRoots.push(outer.root);
+		const repositories: NativeRepositoryCandidate[] = [];
+		for (let index = 0; index < 4; index += 1) {
+			const path = `child-${index}`;
+			const child = await createNestedRepo(outer.root, path);
+			const metadata = await lstat(child.root, { bigint: true });
+			repositories.push({ path, dev: metadata.dev, ino: metadata.ino });
+		}
+		const git = new GitRunner();
+		const discovery = new RootDiscovery(git, {
+			scan: async () => ({ directories: 64, repositories, changeSequence: 10, changeInstance: "helper-1" }),
+			changesSince: async () => ({ files: [], directories: [], trusted: true, sequence: 11, instance: "helper-1" }),
+		});
+		await discovery.discover(outer.root);
+		const run = git.run.bind(git);
+		let started = 0;
+		let release!: () => void;
+		const pending = new Promise<void>((resolve) => { release = resolve; });
+		vi.spyOn(git, "run").mockImplementation(async (args, options) => {
+			if (args.includes(command)) {
+				started += 1;
+				if (started === 1) throw new GitRunError("git_termination_failed", "注入的未确认终止");
+				await pending;
+			}
+			return run(args, options);
+		});
+		let finished = false;
+		const result = discovery.discover(outer.root, "restore-pre").catch((error: unknown) => error)
+			.finally(() => { finished = true; });
+		try {
+			await waitUntil(() => started === 4);
+			expect(finished).toBe(false);
+		} finally { release(); }
+		expect(await result).toMatchObject({ code: "git_termination_failed" });
+		expect(started).toBe(4);
 	});
 
 	it.each([
