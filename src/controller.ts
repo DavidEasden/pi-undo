@@ -58,6 +58,12 @@ export interface ControllerDependencies {
 		scopePaths: readonly string[],
 		topologyFingerprint: string,
 	) => Promise<SnapshotManifest>;
+	/** 将可信目录事件展开成 before/current 的精确路径；无法证明时退回完整结算。 */
+	readonly prepareSettlementScope?: (before: SnapshotManifest, probe: SettledChangeProbe) => Promise<readonly string[] | undefined>;
+	/** 在可信事件覆盖下由完整 before 增量生成完整 after。 */
+	readonly captureIncremental?: (before: SnapshotManifest, scopePaths: readonly string[], cursor: SettledChangeCursor) => Promise<SnapshotManifest>;
+	/** 完整 after 的持久化索引；成功后才能让下一轮覆盖当前工作区。 */
+	readonly persistMaterializedAfter?: (checkpoint: CheckpointRecord, manifest: SnapshotManifest) => Promise<void>;
 	/** 输入基线完成时的 native 变更游标；不可用时返回 undefined。 */
 	readonly changeCursor?: () => SettledChangeCursor | undefined;
 	/** 查询自输入基线以来的可信变化；不可信或不可用时返回 undefined。 */
@@ -290,6 +296,8 @@ export class UndoControllerImpl implements UndoController {
 	private readonly pendingAfter = new Map<string, {
 		readonly promise: Promise<ManifestId | undefined>;
 		readonly topologyFingerprint: string;
+		readonly before?: SnapshotManifest;
+		readonly cursor?: SettledChangeCursor;
 	}>();
 	private staged: StagedRun | undefined;
 	private pendingTree: PendingTree | undefined;
@@ -746,11 +754,17 @@ export class UndoControllerImpl implements UndoController {
 					rethrowOperationFailure(error);
 				}
 			}
-			let scopedFiles: string[] | undefined;
-			if (probe?.trusted === true && probe.files.length > 0 && probe.directories.length === 0 &&
-				staged.before.coverage === "complete" && this.dependencies.captureScoped !== undefined) {
-				const unique = [...new Set(probe.files)].sort();
-				if (unique.length > 0 && unique.length <= MAX_SCOPED_SETTLE_PATHS) scopedFiles = unique;
+			let scopedFiles: readonly string[] | undefined;
+			const hasTrustedChanges = probe?.trusted === true && (probe.files.length > 0 || probe.directories.length > 0);
+			if (hasTrustedChanges && staged.before.coverage === "complete" && this.dependencies.captureScoped !== undefined) {
+				if (this.dependencies.prepareSettlementScope !== undefined) {
+					try {
+						scopedFiles = await measure("settled.scope", () => this.dependencies.prepareSettlementScope!(staged.before, probe!));
+					} catch (error) { rethrowOperationFailure(error); }
+				} else if (probe!.directories.length === 0) {
+					scopedFiles = [...new Set(probe!.files)].sort();
+				}
+				if (scopedFiles !== undefined && (scopedFiles.length === 0 || scopedFiles.length > MAX_SCOPED_SETTLE_PATHS)) scopedFiles = undefined;
 			}
 			let after: SnapshotManifest | undefined;
 			let changedPaths: readonly string[] = [];
@@ -778,7 +792,8 @@ export class UndoControllerImpl implements UndoController {
 						recordCaptureTiming,
 						// 窗口内传入的 baseline 是 restore 前的 staged.before，已确定失效；
 						// 探测只会白跑一轮，直接进入 fullCapture。
-						{ skipBaselineProbe: appliedTargetInRacyWindow },
+						// 事件可能已经改回原内容；直接完整捕获仍正确，只省去一次可能失配的复核。
+						{ skipBaselineProbe: appliedTargetInRacyWindow || hasTrustedChanges },
 					));
 				failureStage = "settled.changedPaths";
 				changedPaths = await measure("settled.changedPaths", () =>
@@ -799,7 +814,7 @@ export class UndoControllerImpl implements UndoController {
 			outcome = "ok";
 			this.undoStack.push(checkpoint);
 			if (pendingTopologyFingerprint !== undefined) {
-				this.startPendingAfterMaterialization(checkpoint, pendingTopologyFingerprint);
+				this.startPendingAfterMaterialization(checkpoint, pendingTopologyFingerprint, staged.before, staged.changeCursor);
 			}
 			// agentSettled 的 finally 会在结算摘要写入 run 后解除等待；durable pack 继续后台预制。
 			// applyRestore 有惰性路径，可在预制未完成时现场创建 durable pack。
@@ -1447,12 +1462,17 @@ export class UndoControllerImpl implements UndoController {
 	private startPendingAfterMaterialization(
 		checkpoint: CheckpointRecord,
 		topologyFingerprint: string,
+		before?: SnapshotManifest,
+		cursor?: SettledChangeCursor,
 	): void {
 		const checkpointId = checkpoint.checkpointId;
 		if (this.pendingAfter.has(checkpointId)) return;
 		const promise = this.runBackground(async () => {
 			try {
-				const manifest = await this.captureScopedWithWorkspaceLock(checkpoint.changedPaths, topologyFingerprint);
+				const manifest = before !== undefined && cursor !== undefined && this.dependencies.captureIncremental !== undefined
+					? await this.captureIncrementalWithWorkspaceLock(before, checkpoint.changedPaths, cursor)
+					: await this.captureScopedWithWorkspaceLock(checkpoint.changedPaths, topologyFingerprint);
+				await this.persistMaterializedAfter(checkpoint, manifest);
 				this.applyMaterializedAfter(checkpointId, manifest.manifestId);
 				return manifest.manifestId;
 			} catch (error) {
@@ -1460,7 +1480,25 @@ export class UndoControllerImpl implements UndoController {
 				return undefined;
 			}
 		}, true);
-		this.pendingAfter.set(checkpointId, { promise, topologyFingerprint });
+		this.pendingAfter.set(checkpointId, { promise, topologyFingerprint, before, cursor });
+	}
+
+	private async captureIncrementalWithWorkspaceLock(
+		before: SnapshotManifest, paths: readonly string[], cursor: SettledChangeCursor,
+	): Promise<SnapshotManifest> {
+		const lease = await this.dependencies.acquireWorkspaceLock();
+		try {
+			return await this.dependencies.captureIncremental!(before, paths, cursor);
+		} catch (error) {
+			this.recordUnsafeExit(error);
+			throw error;
+		} finally {
+			if (!this.unsafeExit) await lease.release();
+		}
+	}
+
+	private async persistMaterializedAfter(checkpoint: CheckpointRecord, manifest: SnapshotManifest): Promise<void> {
+		if (manifest.coverage === "complete") await this.dependencies.persistMaterializedAfter?.(checkpoint, manifest);
 	}
 
 	private applyMaterializedAfter(checkpointId: string, afterManifestId: ManifestId): void {
@@ -1500,9 +1538,12 @@ export class UndoControllerImpl implements UndoController {
 		if (this.undoStack.at(-1)?.checkpointId !== checkpoint.checkpointId) return undefined;
 		const pending = this.pendingAfter.get(checkpoint.checkpointId);
 		try {
-			const manifest = pending !== undefined
-				? await this.captureScopedWithWorkspaceLock(checkpoint.changedPaths, pending.topologyFingerprint)
-				: await this.captureWithWorkspaceLock(false, checkpoint.changedPaths);
+			const manifest = pending?.before !== undefined && pending.cursor !== undefined && this.dependencies.captureIncremental !== undefined
+				? await this.captureIncrementalWithWorkspaceLock(pending.before, checkpoint.changedPaths, pending.cursor)
+				: pending !== undefined
+					? await this.captureScopedWithWorkspaceLock(checkpoint.changedPaths, pending.topologyFingerprint)
+					: await this.captureWithWorkspaceLock(false, checkpoint.changedPaths);
+			await this.persistMaterializedAfter(checkpoint, manifest);
 			this.applyMaterializedAfter(checkpoint.checkpointId, manifest.manifestId);
 			return manifest.manifestId;
 		} catch (error) {
@@ -1512,6 +1553,7 @@ export class UndoControllerImpl implements UndoController {
 		// 缓存 topology 或作用域捕获失败时，退回一次完整发现的作用域捕获，避免直接丢历史。
 		try {
 			const manifest = await this.captureWithWorkspaceLock(false, checkpoint.changedPaths);
+			await this.persistMaterializedAfter(checkpoint, manifest);
 			this.applyMaterializedAfter(checkpoint.checkpointId, manifest.manifestId);
 			return manifest.manifestId;
 		} catch (error) {

@@ -7,11 +7,13 @@ import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as ignoredDirectoryScan from "../src/ignored-directory-scan.ts";
 import { canonicalJson, checksum, ignoredPresentClosure } from "../src/encoding.ts";
+import { AfterManifestIndex } from "../src/after-manifest-index.ts";
 import { GitRunError, GitRunner, type GitRunOptions, type GitRunResult } from "../src/git-runner.ts";
-import type { ManifestId, SnapshotManifest } from "../src/model.ts";
+import type { CheckpointRecord, ManifestId, SessionFileIdentity, SnapshotManifest } from "../src/model.ts";
 import { createOperationScope, runWithOperationContext } from "../src/operation-context.ts";
 import { RootDiscovery, type RootDiscoveryReason, type RootTopology } from "../src/root-discovery.ts";
 import type { NativeMetadataEntry, NativeMetadataPort } from "../src/native-metadata.ts";
+import { changesNeedFullCapture, prepareSettlementScope } from "../src/settlement-scope.ts";
 import { SnapshotStore, type CaptureDiagnostic } from "../src/snapshot-store.ts";
 import { WorkspaceLock } from "../src/workspace-lock.ts";
 import {
@@ -373,6 +375,95 @@ async function publishManifestWithIgnoredPath(
 }
 
 describe("SnapshotStore", () => {
+	it("忽略规则与 Git 边界变化不允许增量 scope", () => {
+		expect(changesNeedFullCapture(["nested/.gitignore"])).toBe(true);
+		expect(changesNeedFullCapture(["nested/.gitattributes"])).toBe(true);
+		expect(changesNeedFullCapture(["src/file.ts"])).toBe(false);
+	});
+
+	it("完整 after 索引绑定原 checkpoint checksum 并验证 manifest", async () => {
+		const repository = await createGitRepo();
+		temporaryRoots.push(repository.root);
+		await writeFixtureFile(repository.root, "file.txt", "before\n");
+		await runGit(repository.root, ["add", "file.txt"]);
+		await runGit(repository.root, ["commit", "-m", "baseline"]);
+		const topology = await new RootDiscovery().discover(repository.root);
+		const storeRoot = await temporaryRoot("pi-undo-store-");
+		const store = new SnapshotStore({ storeRoot });
+		const before = await store.capture(topology);
+		await writeFixtureFile(repository.root, "file.txt", "after\n");
+		const after = await store.capture(topology);
+		const sessionIdentity: SessionFileIdentity = {
+			path: join(repository.root, "session.jsonl"), headerChecksum: "a".repeat(64),
+		};
+		const checkpointContent = {
+			schemaVersion: 1 as const, checkpointId: "checkpoint-index", runId: "run-index", sessionIdentity,
+			startEntryId: "start", userEntryId: "user", endLeafId: "assistant", rawPrompt: "update",
+			beforeManifestId: before.manifestId, afterManifestId: before.manifestId, changedPaths: ["file.txt"],
+		};
+		const checkpoint: CheckpointRecord = {
+			...checkpointContent, checksum: checksum(canonicalJson(checkpointContent)),
+		};
+		const index = new AfterManifestIndex(storeRoot, store);
+		await index.save(checkpoint, after);
+		expect(await index.load(checkpoint)).toBe(after.manifestId);
+		expect(await index.load({ ...checkpoint, checksum: "f".repeat(64) })).toBeUndefined();
+	});
+
+	it("增量捕获合并精确范围内的创建、修改和删除，保留范围外树项", async () => {
+		const repository = await createGitRepo();
+		temporaryRoots.push(repository.root);
+		await writeFixtureFile(repository.root, ".gitignore", "ignored/\n");
+		await writeFixtureFile(repository.root, "keep.txt", "before\n");
+		await writeFixtureFile(repository.root, "remove.txt", "remove\n");
+		await writeFixtureFile(repository.root, "ignored/remove.log", "ignored\n");
+		await writeFixtureFile(repository.root, "outside/stable.txt", "stable\n");
+		await runGit(repository.root, ["add", "."]);
+		await runGit(repository.root, ["commit", "-m", "baseline"]);
+		const topology = await new RootDiscovery().discover(repository.root);
+		const store = new SnapshotStore({ storeRoot: await temporaryRoot("pi-undo-store-") });
+		const baseline = await store.capture(topology);
+
+		await writeFixtureFile(repository.root, "keep.txt", "after\n");
+		await unlink(join(repository.root, "remove.txt"));
+		await writeFixtureFile(repository.root, "created.txt", "created\n");
+		await unlink(join(repository.root, "ignored/remove.log"));
+		await writeFixtureFile(repository.root, "ignored/new.log", "ignored\n");
+		const after = await store.captureIncremental(topology, baseline,
+			["keep.txt", "remove.txt", "created.txt", "ignored/remove.log", "ignored/new.log"], async () => {}, { topologyAlreadyValidated: true });
+
+		expect(after.coverage).toBe("complete");
+		expect(after.roots[0]?.treeId).not.toBe(baseline.roots[0]?.treeId);
+		const entries = await store.listTree(after.manifestId, ".");
+		expect(entries.map((entry) => entry.relativePath)).toEqual([".gitignore", "README.md", "created.txt", "keep.txt", "outside", "outside/stable.txt"]);
+		expect(after.roots[0]?.ignoredPresentPaths).toEqual(["ignored/new.log"]);
+		const keep = entries.find((entry) => entry.relativePath === "keep.txt")!;
+		expect(Buffer.from(await store.readBlob(after.manifestId, ".", keep.blobId!)).toString()).toBe("after\n");
+	});
+
+	it("目录范围增量捕获包含旧树与新树的后代", async () => {
+		const repository = await createGitRepo();
+		temporaryRoots.push(repository.root);
+		await writeFixtureFile(repository.root, "nested/old.txt", "old\n");
+		await writeFixtureFile(repository.root, "outside.txt", "stable\n");
+		await runGit(repository.root, ["add", "."]);
+		await runGit(repository.root, ["commit", "-m", "baseline"]);
+		const topology = await new RootDiscovery().discover(repository.root);
+		const store = new SnapshotStore({ storeRoot: await temporaryRoot("pi-undo-store-") });
+		const baseline = await store.capture(topology);
+
+		await rm(join(repository.root, "nested"), { recursive: true });
+		await writeFixtureFile(repository.root, "nested/new.txt", "new\n");
+		const scope = await prepareSettlementScope(store, topology, baseline, {
+			files: ["nested/new.txt"], directories: ["nested"], trusted: true,
+		});
+		expect(scope).toEqual(expect.arrayContaining(["nested", "nested/old.txt", "nested/new.txt"]));
+		const after = await store.captureIncremental(topology, baseline, scope!,
+			async () => {}, { topologyAlreadyValidated: true });
+		const entries = await store.listTree(after.manifestId, ".");
+		expect(entries.map((entry) => entry.relativePath)).toEqual(["README.md", "nested", "nested/new.txt", "outside.txt"]);
+	});
+
 	it("capture 内的 Git 调用注入 operation 默认预算与取消信号", async () => {
 		const repository = await createGitRepo();
 		temporaryRoots.push(repository.root);

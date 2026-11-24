@@ -1,4 +1,7 @@
 import { join, resolve } from "node:path";
+import { AfterManifestIndex } from "./after-manifest-index.ts";
+import { IdleMaintenance } from "./idle-maintenance.ts";
+import { changesNeedFullCapture, prepareSettlementScope } from "./settlement-scope.ts";
 import { writeJsonAtomic } from "./atomic-fs.ts";
 
 import type {
@@ -32,7 +35,7 @@ import { DurableCursorWriter, SessionState, type SessionEntrySource } from "./se
 import { SnapshotStore, type CaptureDiagnostic } from "./snapshot-store.ts";
 import { StatusReporter } from "./status-reporter.ts";
 import { WorkspaceLock } from "./workspace-lock.ts";
-import { allCompleted, checkOperation, configuredTimeout, currentOperationContext, isUnconfirmedExit, operationHasUnconfirmedExit, runWithOperationContext, withRecoveryBudget, type ProcessDiagnostic } from "./operation-context.ts";
+import { allCompleted, checkOperation, configuredTimeout, currentOperationContext, isUnconfirmedExit, operationHasUnconfirmedExit, rethrowOperationFailure, runWithOperationContext, withRecoveryBudget, type ProcessDiagnostic } from "./operation-context.ts";
 
 type ReadonlySessionManager = ExtensionContext["sessionManager"];
 
@@ -52,6 +55,7 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 	// 首次 prompt capture 会等待这次预热完成并复用同一缓存。
 	discovery.warmScanCache(initialTopology.workspaceIdentity);
 	const store = new SnapshotStore({ storeRoot: privateRoot, discovery });
+	const afterIndex = new AfterManifestIndex(privateRoot, store);
 	const restore = new RestoreEngine({ workspaceRoot: context.cwd, store, discovery });
 	const journal = new JournalStore({ transactionsRoot: join(privateRoot, "transactions") });
 	const cursorWriter = new DurableCursorWriter();
@@ -61,11 +65,13 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 	// 输入基线使用的 topology 只缓存最近几份；作用域结算在文件级变化时直接复用，
 	// 不重新执行目录发现。fingerprint 失效时回退完整结算。
 	const captureTopologies = new Map<string, RootTopology>();
-	// runtime 内已物化的 pending after；不写回 session，重启后按 pending 处理。
+	// 完整 after 的独立索引绑定原 checkpoint；不在后台修改 session 分支。
 	const resolvedAfter = new Map<string, ManifestId>();
+	let maintenanceTopology = initialTopology;
 	const rememberTopology = (topology: RootTopology): RootTopology => {
 		captureTopologies.delete(topology.fingerprint);
 		captureTopologies.set(topology.fingerprint, topology);
+		maintenanceTopology = topology;
 		while (captureTopologies.size > 8) {
 			const oldest = captureTopologies.keys().next().value;
 			if (oldest === undefined) break;
@@ -104,6 +110,7 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 		rememberTopology(topology);
 		return store.captureBaseline(topology, baseline, undefined, {
 			topologyAlreadyValidated: true,
+			deferMaintenance: true,
 			...(options.skipBaselineProbe === true ? { skipBaselineProbe: true } : {}),
 			// captureBaselineWithWorkspaceLock 已持有工作区独占锁，且此处刚完成 discover；
 			// post-capture topology 校验在锁内是冗余的，跳过以节省一次全量目录扫描。
@@ -195,6 +202,12 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 	let finalizationQueue: Promise<void> = Promise.resolve();
 	let finalizationFailure: unknown;
 	let controller: UndoControllerImpl | undefined;
+	const maintenance = new IdleMaintenance(() => context.isIdle(), async () => {
+		await waitForFinalization();
+		const lease = await workspaceLock.acquire(initialTopology.workspaceIdentity);
+		try { await store.maintain(maintenanceTopology); }
+		finally { if (!operationHasUnconfirmedExit()) await lease.release(); }
+	}, () => { controller?.markRecoveryRequired("maintenance_process_exit_unconfirmed"); });
 	const waitForFinalization = async (): Promise<void> => {
 		await finalizationQueue;
 		if (finalizationFailure !== undefined) throw finalizationFailure;
@@ -247,6 +260,7 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 
 	const diagnostics: ProcessDiagnostic[] = [];
 	const phases: Array<{ phase: string; elapsedMs: number }> = [];
+	const restoreTimings: Array<{ phase: string; durationMs: number }> = [];
 	let operationStarted = 0;
 	const dependencies: ControllerDependencies = {
 		workspaceIdentity: initialTopology.workspaceIdentity,
@@ -256,6 +270,7 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 		waitForIdle: async (deadlineMs) => waitForIdle(commandContext, deadlineMs),
 		getLogicalLeafId: () => sessionStateFor(manager).getLogicalLeafId(),
 		acquireWorkspaceLock: async () => {
+			await maintenance.pause();
 			await waitForFinalization();
 			return workspaceLock.acquire(initialTopology.workspaceIdentity);
 		},
@@ -304,6 +319,33 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 				persistLeafCache: false,
 			});
 		},
+		prepareSettlementScope: async (before, probe) => {
+			if (changesNeedFullCapture([...probe.files, ...probe.directories])) return undefined;
+			const topology = probe.directories.length === 0
+				? captureTopologies.get(before.topologyFingerprint)
+				: rememberTopology(await discovery.discover(context.cwd, "settled-capture"));
+			return topology === undefined ? undefined : prepareSettlementScope(store, topology, before, probe);
+		},
+		captureIncremental: async (before, scopePaths, cursor) => {
+			const paths = new Set(scopePaths);
+			const verifyChanges = async () => {
+				const changes = await discovery.changesSince(context.cwd, cursor);
+				if (changes?.trusted !== true || changes.instance !== cursor.instance || changes.sequence < cursor.sequence ||
+					changesNeedFullCapture([...changes.files, ...changes.directories]) ||
+					[...changes.files, ...changes.directories].some((path) => !paths.has(path))) {
+					throw new Error("incremental_change_proof_unavailable");
+				}
+			};
+			const topology = captureTopologies.get(before.topologyFingerprint);
+			if (topology === undefined || topology.workspaceIdentity !== initialTopology.workspaceIdentity) {
+				throw new Error("incremental_topology_unavailable");
+			}
+			// scope 已由受信变更游标闭合；拓扑敏感路径会在准备 scope 时转完整捕获，避免增量路径重复全树发现。
+			return await store.captureIncremental(topology, before, scopePaths, verifyChanges, {
+				topologyAlreadyValidated: true, skipPostTopologyCheck: true, deferMaintenance: true,
+			});
+		},
+		persistMaterializedAfter: (checkpoint, manifest) => afterIndex.save(checkpoint, manifest),
 		changeCursor: () => discovery.changeCursor(),
 		probeChanges: (cursor) => discovery.changesSince(context.cwd, cursor),
 		keepAlive: () => discovery.keepAlive(),
@@ -335,8 +377,7 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 			workspaceLockHeld: true,
 			onTiming: (phase, durationMs) => {
 				try {
-					phases.push({ phase, elapsedMs: Math.round(performance.now() - operationStarted) });
-					void durationMs;
+					restoreTimings.push({ phase, durationMs: Math.round(durationMs) });
 				} catch { /* 诊断回调不影响恢复。 */ }
 			},
 		}),
@@ -351,6 +392,7 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 			operationStarted = performance.now();
 			diagnostics.length = 0;
 			phases.length = 0;
+			restoreTimings.length = 0;
 			reporter.startOperation(opId);
 		},
 		onProgress: (phase) => {
@@ -367,11 +409,12 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 			const totalMs = Math.round(performance.now() - operationStarted);
 			if (totalMs < 1_000 && (result.code === "ok" || result.code === "noop")) return;
 			await writeJsonAtomic(join(privateRoot, "diagnostics", `${manager.getSessionId()}-latest.json`), {
-				schemaVersion: 1, opId, code: result.code, totalMs, phases,
+				schemaVersion: 1, opId, code: result.code, totalMs, phases, restoreTimings,
 				operationTimings: result.timings ?? [], settlement: result.settlement ?? null, processes: diagnostics,
 			});
 		},
 		onSettlement: async (settlement: SettlementDiagnostic) => {
+			if (settlement.outcome === "ok") maintenance.schedule();
 			if (settlement.outcome === "ok" && settlement.durationMs < 1_000 && settlement.fastPath === undefined) return;
 			await writeJsonAtomic(join(privateRoot, "diagnostics", `${manager.getSessionId()}-settlement-diagnostic.json`), {
 				schemaVersion: 1,
@@ -383,8 +426,17 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 		initialTopology.workspaceIdentity,
 		() => recovery.recover(),
 	);
+	const rebuilt = rebuildControllerState(manager, sessionIdentity);
+	const pending = [...(rebuilt.undoStack ?? []), ...(rebuilt.redoStack ?? []).map((entry) => entry.checkpoint)]
+		.filter((checkpoint) => isCheckpointAfterPending(checkpoint));
+	for (const checkpoint of pending) {
+		const id = await afterIndex.load(checkpoint);
+		if (id !== undefined) resolvedAfter.set(checkpoint.checkpointId, id);
+	}
 	controller = new UndoControllerImpl(dependencies, {
-		...rebuildControllerState(manager, sessionIdentity),
+		...rebuilt,
+		undoStack: rebuilt.undoStack?.map((checkpoint) => applyResolvedAfter(checkpoint, resolvedAfter)),
+		redoStack: rebuilt.redoStack?.map((entry) => ({ ...entry, checkpoint: applyResolvedAfter(entry.checkpoint, resolvedAfter) })),
 		resolvedAfter,
 		locked: startupRecovery.kind === "locked",
 		recoveryReason: startupRecovery.kind === "locked" ? startupRecovery.reason : undefined,
@@ -401,6 +453,7 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 			: undefined,
 		async dispose(): Promise<void> {
 			try {
+				await maintenance.dispose();
 				await activeController.dispose();
 				await finalizationQueue;
 				if (isUnconfirmedExit(finalizationFailure)) throw finalizationFailure;
@@ -628,7 +681,10 @@ function applyResolvedAfter(
 	resolvedAfter?: ReadonlyMap<string, ManifestId>,
 ): CheckpointRecord {
 	const materialized = resolvedAfter?.get(checkpoint.checkpointId);
-	return materialized === undefined ? checkpoint : { ...checkpoint, afterManifestId: materialized };
+	if (materialized === undefined) return checkpoint;
+	const { checksum: _checksum, ...original } = checkpoint;
+	const content = { ...original, afterManifestId: materialized };
+	return { ...content, checksum: checksum(canonicalJson(content)) };
 }
 
 function findCheckpointByEndLeaf(

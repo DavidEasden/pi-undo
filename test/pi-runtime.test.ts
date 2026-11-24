@@ -209,7 +209,7 @@ describe("Pi runtime cursor durability", () => {
 		await Promise.all(Array.from({ length: 70 }, (_, index) =>
 			mkdir(join(fixture.workspace, `dir-${index}`), { recursive: true })));
 		const runtime = await createPiUndoRuntime(fixture.context as any, fixture.pi as any);
-		const capture = vi.spyOn(SnapshotStore.prototype, "capture");
+		const captureIncremental = vi.spyOn(SnapshotStore.prototype, "captureIncremental");
 		const captureBaseline = vi.spyOn(SnapshotStore.prototype, "captureBaseline");
 		try {
 			expect(await runtime.controller.prepareInput("写入 run", { streaming: false })).toEqual({ action: "continue" });
@@ -251,14 +251,13 @@ describe("Pi runtime cursor durability", () => {
 			});
 			runtime.setCommandContext(fixture.commandContext as any);
 			expect(await runtime.controller.undo()).toMatchObject({ code: "ok", changedFiles: 1 });
-			expect(capture.mock.calls.some(([, scope]) =>
-				Array.isArray(scope) && scope.includes("tracked.txt"))).toBe(true);
+			expect(captureIncremental.mock.calls.some(([, , scope]) => scope.includes("tracked.txt"))).toBe(true);
 			await expect(readFile(join(fixture.workspace, "tracked.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 			expect(await runtime.controller.redo()).toMatchObject({ code: "ok", changedFiles: 1 });
 			expect(await readFile(join(fixture.workspace, "tracked.txt"), "utf8")).toBe("after\n");
 		} finally {
 			captureBaseline.mockRestore();
-			capture.mockRestore();
+			captureIncremental.mockRestore();
 		}
 	});
 
@@ -324,7 +323,8 @@ describe("Pi runtime cursor durability", () => {
 		await new Promise((resolve) => setTimeout(resolve, 50));
 		await runtime.controller.agentSettled();
 
-		expect(await runtime.controller.beforeTree({ targetLeafId: "assistant-tree-pending" })).toBeUndefined();
+		const treePreparation = await runtime.controller.beforeTree({ targetLeafId: "assistant-tree-pending" });
+		expect(treePreparation).toBeUndefined();
 		await runtime.controller.afterTree({ newLeafId: "assistant-tree-pending" });
 		expect(runtime.controller.history().undoCount).toBe(1);
 	});

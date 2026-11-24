@@ -252,6 +252,112 @@ describe("RootDiscovery", () => {
 		}
 	});
 
+	it("restore-pre 在可信纯文件变化时复用 topology，并前后复核事件游标", async () => {
+		const repository = await createGitRepo();
+		temporaryRoots.push(repository.root);
+		const scan = vi.fn(async () => ({
+			directories: 64,
+			repositories: [],
+			changeSequence: 10,
+			changeInstance: "helper-1",
+		}));
+		const changesSince = vi.fn(async () => ({
+			files: ["src/changed.ts"],
+			directories: [],
+			trusted: true,
+			sequence: 11,
+			instance: "helper-1",
+		}));
+		const discovery = new RootDiscovery(new GitRunner(), { scan, changesSince });
+		const original = await discovery.discover(repository.root);
+
+		const restored = await discovery.discover(repository.root, "restore-pre");
+
+		expect(scan).toHaveBeenCalledOnce();
+		expect(changesSince).toHaveBeenCalledTimes(2);
+		expect(restored.roots.map(({ relativeRoot, parentRoot, state, gitlinkOid }) =>
+			({ relativeRoot, parentRoot, state, gitlinkOid }))).toEqual(
+			original.roots.map(({ relativeRoot, parentRoot, state, gitlinkOid }) =>
+				({ relativeRoot, parentRoot, state, gitlinkOid })),
+		);
+	});
+
+	it.each([
+		{ label: "目录变化", files: [], directories: ["new-directory"], trusted: true },
+		{ label: ".git marker 变化", files: ["nested/.git"], directories: [], trusted: true },
+		{ label: "事件不可信", files: [], directories: [], trusted: false },
+	])("restore-pre 遇到$label时执行完整扫描", async ({ files, directories, trusted }) => {
+		const repository = await createGitRepo();
+		temporaryRoots.push(repository.root);
+		const scan = vi.fn(async () => ({
+			directories: 64,
+			repositories: [],
+			changeSequence: 10,
+			changeInstance: "helper-1",
+		}));
+		const changesSince = vi.fn(async () => ({
+			files,
+			directories,
+			trusted,
+			sequence: 11,
+			instance: "helper-1",
+		}));
+		const discovery = new RootDiscovery(new GitRunner(), { scan, changesSince });
+		await discovery.discover(repository.root);
+
+		await discovery.discover(repository.root, "restore-pre");
+
+		expect(scan).toHaveBeenCalledTimes(2);
+	});
+
+	it("restore-pre 检查期间出现目录事件时回退完整扫描", async () => {
+		const repository = await createGitRepo();
+		temporaryRoots.push(repository.root);
+		const scan = vi.fn(async () => ({
+			directories: 64,
+			repositories: [],
+			changeSequence: 10,
+			changeInstance: "helper-1",
+		}));
+		let query = 0;
+		const changesSince = vi.fn(async () => {
+			query += 1;
+			return query === 1
+				? { files: [], directories: [], trusted: true, sequence: 11, instance: "helper-1" }
+				: { files: [], directories: ["new-directory"], trusted: true, sequence: 12, instance: "helper-1" };
+		});
+		const discovery = new RootDiscovery(new GitRunner(), { scan, changesSince });
+		await discovery.discover(repository.root);
+
+		await discovery.discover(repository.root, "restore-pre");
+
+		expect(changesSince).toHaveBeenCalledTimes(2);
+		expect(scan).toHaveBeenCalledTimes(2);
+	});
+
+	it("restore-pre 对包含 gitlink 的 topology 保留完整扫描", async () => {
+		const outer = await createGitRepo();
+		temporaryRoots.push(outer.root);
+		await createLocalSubmodule(outer.root, "modules/child");
+		const scan = vi.fn(async () => ({
+			directories: 64,
+			repositories: [],
+			changeSequence: 10,
+			changeInstance: "helper-1",
+		}));
+		const changesSince = vi.fn(async () => ({
+			files: [], directories: [], trusted: true, sequence: 11, instance: "helper-1",
+		}));
+		const discovery = new RootDiscovery(new GitRunner(), { scan, changesSince });
+		const topology = await discovery.discover(outer.root);
+		expect(topology.roots.some((root) => root.gitlinkOid !== undefined)).toBe(true);
+
+		await discovery.discover(outer.root, "restore-pre");
+
+		expect(scan).toHaveBeenCalledTimes(2);
+		expect(changesSince).not.toHaveBeenCalled();
+	});
+
 	it("存在无效 .git marker 时记录 broken root，而不是静默降级 synthetic", async () => {
 		const root = await temporaryRoot();
 		await writeFile(join(root, ".git"), "gitdir: missing-git-directory\n");

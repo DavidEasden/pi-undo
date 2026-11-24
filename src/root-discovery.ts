@@ -8,6 +8,7 @@ import type { DiscoveryRoot } from "./model.ts";
 import {
 	NativeDirectoryScanner,
 	type NativeChangeCursor,
+	type NativeChangeSet,
 	type NativeDirectoryScanPort,
 	type NativeRepositoryCandidate,
 } from "./native-directory-scan.ts";
@@ -85,6 +86,7 @@ export class RootDiscovery {
 	private readonly nativeScan: NativeDirectoryScanPort;
 	/** 最近一次 discover 实际使用 native 扫描时的变更游标；TS 回退必须视为不可用。 */
 	private lastChangeCursor: NativeChangeCursor | undefined;
+	private lastTopology: RootTopology | undefined;
 	/** 共享盘 TypeScript 扫描的目录项缓存；ignored 扫描与恢复前后发现复用同一份。 */
 	readonly listingCache = new DirectoryListingCache();
 
@@ -130,6 +132,10 @@ export class RootDiscovery {
 		reportOperationProgress(`discover_roots:${reason}`);
 		const workspaceIdentity = await canonicalWorkspaceRoot(workspaceRoot);
 		checkOperation();
+		if (reason === "restore-pre") {
+			const reused = await this.reuseRestoreTopology(workspaceIdentity);
+			if (reused !== undefined) return reused;
+		}
 		const activeRoots = new Map<string, DiscoveredRoot>();
 		const nestedRoots = new Map<string, DiscoveredRoot>();
 		// 子目录扫描不读取外层仓库信息；两项都结束后仍按外层优先的顺序解析 gitlink。
@@ -154,12 +160,59 @@ export class RootDiscovery {
 		const gitlinkRoots = await this.discoverGitlinks(workspaceIdentity, activeRoots);
 		checkOperation();
 		const roots = buildRoots([...activeRoots.values(), ...gitlinkRoots.values()]);
-		return {
+		const topology: RootTopology = {
 			workspaceIdentity,
 			roots,
 			fingerprint: topologyFingerprint(workspaceIdentity, roots),
 			directoriesVisited: this.lastDirectoryCount ?? 0,
 		};
+		this.lastTopology = topology;
+		return topology;
+	}
+
+	private async reuseRestoreTopology(workspaceIdentity: string): Promise<RootTopology | undefined> {
+		const previous = this.lastTopology;
+		const cursor = this.lastChangeCursor;
+		if (previous === undefined || previous.workspaceIdentity !== workspaceIdentity || cursor === undefined ||
+			previous.roots.length === 0 || previous.roots.some((root) =>
+				!root.gitBacked || root.state !== "active" || root.gitlinkOid !== undefined)) return undefined;
+		const readChanges = async () => {
+			try {
+				return await this.nativeScan.changesSince?.(workspaceIdentity, cursor);
+			} catch {
+				checkOperation();
+				return undefined;
+			}
+		};
+		const changes = await readChanges();
+		if (!topologyChangeSetIsStable(changes, cursor)) return undefined;
+
+		const activeRoots = new Map<string, DiscoveredRoot>();
+		for (const root of previous.roots) {
+			checkOperation();
+			const absoluteRoot = root.relativeRoot === "."
+				? workspaceIdentity : join(workspaceIdentity, root.relativeRoot);
+			const inspection = await this.inspectRepository(absoluteRoot, workspaceIdentity);
+			if (inspection.kind !== "active" || inspection.repository.absoluteRoot !== absoluteRoot) return undefined;
+			const discovered = this.activeRoot(workspaceIdentity, inspection.repository);
+			activeRoots.set(absoluteRoot, discovered);
+		}
+		const gitlinkRoots = await this.discoverGitlinks(workspaceIdentity, activeRoots);
+		if (gitlinkRoots.size > 0 || [...activeRoots.values()].some((root) => root.gitlinkOid !== undefined)) {
+			return undefined;
+		}
+		const finalChanges = await readChanges();
+		if (!topologyChangeSetIsStable(finalChanges, cursor)) return undefined;
+		this.lastChangeCursor = { sequence: finalChanges!.sequence, instance: finalChanges!.instance };
+		const roots = buildRoots([...activeRoots.values()]);
+		const topology: RootTopology = {
+			workspaceIdentity,
+			roots,
+			fingerprint: topologyFingerprint(workspaceIdentity, roots),
+			directoriesVisited: previous.directoriesVisited,
+		};
+		this.lastTopology = topology;
+		return topology;
 	}
 
 	private async scanDirectory(
@@ -401,6 +454,15 @@ export class RootDiscovery {
 			return null;
 		}
 	}
+}
+
+function topologyChangeSetIsStable(
+	changes: NativeChangeSet | undefined,
+	cursor: NativeChangeCursor,
+): changes is NativeChangeSet {
+	return changes !== undefined && changes.trusted && changes.instance === cursor.instance &&
+		changes.sequence >= cursor.sequence && changes.directories.length === 0 &&
+		!changes.files.some((path) => path.split("/").at(-1)?.toLowerCase() === ".git");
 }
 
 async function assertNativeCandidate(path: string, candidate: NativeRepositoryCandidate): Promise<void> {

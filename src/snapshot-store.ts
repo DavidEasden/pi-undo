@@ -109,7 +109,7 @@ interface CapturedRootResult {
 	readonly ignoredPresentPaths: readonly string[];
 	readonly ignoreClosure: string;
 	readonly objectClosure: string;
-	readonly cacheUpdate: VisibleLeafCacheUpdate;
+	readonly cacheUpdate?: VisibleLeafCacheUpdate;
 }
 
 interface VisibleLeafMetadata {
@@ -174,7 +174,7 @@ interface PersistedLeafCacheEntry {
 }
 
 export interface CaptureDiagnostic {
-	readonly strategy: "full" | "baseline-check" | "baseline-reused" | "baseline-fallback";
+	readonly strategy: "full" | "incremental" | "baseline-check" | "baseline-reused" | "baseline-fallback";
 	readonly rootCount: number;
 	readonly directoriesVisited: number;
 	readonly visibleFilesInspected: number;
@@ -282,6 +282,8 @@ export interface CaptureOptions {
 	 * 进程重启后由下一次完整 capture 重建。
 	 */
 	readonly persistLeafCache?: boolean;
+	/** 结算发布后由空闲维护统一刷新缓存与整理对象，不阻塞检查点。 */
+	readonly deferMaintenance?: boolean;
 	/** 只报告数量和错误类型，不包含路径、文件内容或异常消息。 */
 	readonly onDiagnostics?: (diagnostic: CaptureDiagnostic) => void;
 	/** 报告 capture 内部 wall-time 阶段；回调失败不影响捕获。 */
@@ -469,18 +471,58 @@ export class SnapshotStore {
 		}
 	}
 
+	/** 调用方提供覆盖整个捕获窗口的变更证明；该证明不能跨 helper 实例或退化事件使用。 */
+	async captureIncremental(
+		topology: RootTopology, baseline: SnapshotManifest, scope: readonly string[],
+		verifyChanges: () => Promise<void>, options: CaptureOptions = {},
+	): Promise<SnapshotManifest> {
+		assertManifest(baseline);
+		if (baseline.coverage !== COMPLETE_COVERAGE || baseline.workspaceIdentity !== topology.workspaceIdentity ||
+			baseline.topologyFingerprint !== topology.fingerprint || scope.length === 0 ||
+			scope.some((path) => relativeSafePath(topology.workspaceIdentity, path) === "." ||
+				path.split("/").some((part) => part.toLowerCase() === ".git"))) {
+			throw new SnapshotStoreError("capture_failed", "增量捕获缺少完整且相容的基线或精确范围");
+		}
+		await this.assertPrivateStore(topology.workspaceIdentity);
+		const lockIdentity = `snapshot-store:${await prospectiveCanonicalPath(this.storesRoot)}`;
+		const diagnostic = createCaptureDiagnostic("incremental", topology.roots.length, topology.directoriesVisited ?? 0);
+		try {
+			return await this.lock.withLock(lockIdentity, async () => {
+				// 重新读取内容寻址清单，不能让内存对象掩盖持久化文件损坏。
+				const checked = await this.loadManifest(baseline.manifestId);
+				await verifyChanges();
+				return this.captureLocked(topology, scope, options, diagnostic, { baseline: checked, verifyChanges });
+			});
+		} finally {
+			publishCaptureDiagnostic(options.onDiagnostics, diagnostic);
+		}
+	}
+
+	/** 与捕获使用同一 store 锁；调用方还须协调工作区恢复及取消。 */
+	async maintain(topology: RootTopology): Promise<void> {
+		await this.assertPrivateStore(topology.workspaceIdentity);
+		const lockIdentity = `snapshot-store:${await prospectiveCanonicalPath(this.storesRoot)}`;
+		await this.lock.withLock(lockIdentity, async () => {
+			checkOperation();
+			await this.persistLeafCache(this.storeDirectory(topology));
+			checkOperation();
+			await this.compactLooseObjectsLocked(topology);
+		});
+	}
+
 	private async captureLocked(
 		topology: RootTopology,
 		scope: readonly string[] | undefined,
 		options: CaptureOptions,
 		diagnostic?: MutableCaptureDiagnostic,
+		incremental?: { readonly baseline: SnapshotManifest; readonly verifyChanges: () => Promise<void> },
 	): Promise<SnapshotManifest> {
 		let transactionDirectory: string | undefined;
 		try {
 			if (topology.fingerprint !== topologyFingerprint(topology.workspaceIdentity, topology.roots)) {
 				throw new SnapshotStoreError("capture_failed", "topology fingerprint 与 roots 不匹配");
 			}
-			const coverage = captureCoverage(topology.workspaceIdentity, scope);
+			const coverage = incremental === undefined ? captureCoverage(topology.workspaceIdentity, scope) : COMPLETE_COVERAGE;
 			const artifactExclusions = captureExclusions(topology.workspaceIdentity, options.excludePaths);
 			if (options.topologyAlreadyValidated !== true) {
 				await this.assertTopology(topology, "捕获前 topology 已变化", "safety-snapshot");
@@ -505,7 +547,7 @@ export class SnapshotStore {
 				ROOT_CAPTURE_CONCURRENCY,
 				async (root): Promise<{ readonly root: SnapshotRoot; readonly cacheUpdate?: VisibleLeafCacheUpdate }> => {
 					if (root.state !== "active") {
-						const coverage = rootCaptureCoverage(root.relativeRoot, scope);
+						const coverage = incremental === undefined ? rootCaptureCoverage(root.relativeRoot, scope) : COMPLETE_COVERAGE;
 						return {
 							root: snapshotRoot(root, {
 								treeId: null,
@@ -515,14 +557,10 @@ export class SnapshotStore {
 							}),
 						};
 					}
-					const captured = await this.captureRoot(
-						topology,
-						root,
-						activeTransactionDirectory,
-						scope,
-						artifactExclusions,
-						diagnostic,
-					);
+					const captured = incremental === undefined
+						? await this.captureRoot(topology, root, activeTransactionDirectory, scope, artifactExclusions, diagnostic)
+						: await this.captureIncrementalRoot(topology, root, activeTransactionDirectory, scope!, artifactExclusions,
+							incremental.baseline.roots.find((candidate) => candidate.relativeRoot === root.relativeRoot)!, diagnostic);
 					return {
 						root: snapshotRoot(root, captured),
 						cacheUpdate: captured.cacheUpdate,
@@ -536,6 +574,7 @@ export class SnapshotStore {
 			if (options.skipPostTopologyCheck !== true) {
 				await this.assertTopology(topology, "捕获期间 topology 已变化", "safety-snapshot");
 			}
+			await incremental?.verifyChanges();
 			const content = {
 				schemaVersion: SCHEMA_VERSION as 1,
 				workspaceIdentity: topology.workspaceIdentity,
@@ -554,7 +593,7 @@ export class SnapshotStore {
 			this.manifestLocations.set(manifestId, manifestPath);
 			for (const update of cacheUpdates) this.rememberVisibleLeaves(update);
 			// 指纹缓存落盘：让下一个进程（新会话）的首次 capture 跳过全量内容 hash。
-			if (options.persistLeafCache !== false) await this.persistLeafCache(storeDirectory);
+			if (options.persistLeafCache !== false && options.deferMaintenance !== true) await this.persistLeafCache(storeDirectory);
 			// 只冻结 capture 自建的清单及其嵌套容器；弱集合不会延长路径列表的生命周期。
 			for (const root of roots) {
 				Object.freeze(root.ignoredPresentPaths);
@@ -654,7 +693,7 @@ export class SnapshotStore {
 			// 完整捕获刚写入一批 loose object；结算路径已持有 store 与 workspace 锁，
 			// 是唯一可以在不打断恢复读取的情况下做维护的窗口。维护时长单独报告。
 			const compactStartedAt = performance.now();
-			await this.compactLooseObjectsLocked(topology);
+			if (options.deferMaintenance !== true) await this.compactLooseObjectsLocked(topology);
 			publishCaptureTiming(options.onTiming, "settled.compact", compactStartedAt);
 			return captured;
 		} catch (error) {
@@ -687,9 +726,9 @@ export class SnapshotStore {
 		for (const root of roots) {
 			try {
 				await this.compactGitDirectory(join(storeDirectory, "roots", root, "git"));
-			} catch {
-				// 维护是 best-effort：capture 已经完成，repack 失败/取消不影响本次结果，
-				// 未合并的 loose object 会在下一次阈值检查时重试。
+			} catch (error) {
+				// 普通维护失败只影响后续性能；取消与未确认退出必须交给持锁的调用方。
+				rethrowOperationFailure(error);
 			}
 		}
 	}
@@ -1035,9 +1074,9 @@ export class SnapshotStore {
 		const storeDirectory = dirname(dirname(manifestPath));
 		try {
 			for (const root of manifest.roots) {
+				// loadManifest 已验证原始字节摘要及 manifest closure；这里只验证 scope 对应的 Git 对象闭包。
 				if (
 					root.ignorePolicy !== IGNORE_POLICY ||
-					root.ignoreClosure !== ignoredPresentClosure(root) ||
 					root.objectClosure === undefined
 				) {
 					throw new SnapshotStoreError("object_missing", "manifest root 元数据不受支持");
@@ -1485,6 +1524,66 @@ export class SnapshotStore {
 			...ignoredPresentProof(coverage, ignoredPresentPaths),
 			objectClosure: treeObjectClosure(treeId, entries),
 			cacheUpdate: { gitDirectory, staged, inclusions },
+		};
+	}
+
+	private async captureIncrementalRoot(
+		topology: RootTopology, root: DiscoveryRoot, transactionDirectory: string,
+		scope: readonly string[], artifactExclusions: readonly string[], baseline: SnapshotRoot,
+		diagnostic?: MutableCaptureDiagnostic,
+	): Promise<CapturedRootResult> {
+		if (baseline?.treeId === null || baseline?.treeId === undefined || baseline.coverage !== COMPLETE_COVERAGE) {
+			throw new SnapshotStoreError("capture_failed", "增量 root 缺少完整 tree");
+		}
+		const gitDirectory = this.rootGitDirectory(this.storeDirectory(topology), root);
+		await this.assertNoAlternates(gitDirectory);
+		const exclusions = topology.roots.filter((candidate) => isStrictRootAncestor(root.relativeRoot, candidate.relativeRoot))
+			.map((candidate) => rootRelativePath(root.relativeRoot, candidate.relativeRoot));
+		const inclusions = ownedRootInclusions(rootScopePathspecs(root.relativeRoot, scope), exclusions);
+		const affected = (path: string) => inclusions !== null &&
+			(inclusions.length === 0 || inclusions.some((item) => isPathAtOrBelow(item, path)));
+		const before = await this.readTreeEntries(gitDirectory, baseline.treeId);
+		const delta = inclusions === null ? undefined
+			: await this.captureRoot(topology, root, transactionDirectory, scope, artifactExclusions, diagnostic);
+		const replacements = delta?.treeId === undefined || delta.treeId === null
+			? [] : await this.readTreeEntries(gitDirectory, delta.treeId);
+		const entries = [...before.filter((entry) => !affected(entry.relativePath)), ...replacements]
+			.sort((left, right) => comparePaths(left.relativePath, right.relativePath));
+		const cwd = workspaceRootPath(topology.workspaceIdentity, root.relativeRoot);
+		const environment = privateGitEnvironment(gitDirectory, cwd, join(transactionDirectory, `${rootStoreId(root)}.merge.index`));
+		await this.runGit(["read-tree", "--empty"], { cwd, env: environment });
+		const exactExclusions = ownedArtifactExclusions(topology.roots, root.relativeRoot, artifactExclusions);
+		// 当前 Git 规则/index 仍全量取证，避免 .git 内配置变化扩大可见集合时漏项。
+		const census = () => this.queryVisibleLeafPaths(cwd, environment, root.gitBacked, [], exclusions, exactExclusions, true);
+		const visible = await census();
+		if (!samePathList([...new Set(visible)].sort(comparePaths), entries.map((entry) => entry.relativePath))) {
+			throw new SnapshotStoreError("capture_failed", "增量范围之外的可见路径已变化");
+		}
+		// 受信任 scope 内的 ignored proof 可局部更新；规则文件与 .git 配置变化会在调用方转完整捕获。
+		const ignoredDelta = inclusions === null ? [] : await this.captureIgnoredPresentPaths(
+			cwd, environment, root.gitBacked, inclusions, exclusions, exactExclusions, transactionDirectory);
+		const ignoredPresentPaths = inclusions === null ? [...baseline.ignoredPresentPaths]
+			: [...baseline.ignoredPresentPaths.filter((path) => !affected(path)), ...ignoredDelta].sort(comparePaths);
+		if (diagnostic !== undefined) diagnostic.ignoredFiles += ignoredDelta.length;
+		// census 必须使用空 index，synthetic root 不能把合成索引当成源 index。
+		if (!samePathList([...new Set(await census())].sort(comparePaths), [...new Set(visible)].sort(comparePaths))) {
+			throw new SnapshotStoreError("capture_failed", "增量捕获期间可见路径已变化");
+		}
+		let treeId = baseline.treeId;
+		if (delta !== undefined) {
+			const objectIds = new Map(entries.map((entry) => [entry.relativePath, entry.objectId]));
+			for (const input of indexInfoBatches(entries, objectIds)) {
+				await this.runGit(["update-index", "-z", "--index-info"], { cwd, env: environment, stdin: input });
+			}
+			treeId = (await this.runGit(["write-tree"], { cwd, env: environment })).trim();
+			if (!isObjectId(treeId)) throw new SnapshotStoreError("capture_failed", "增量 write-tree ID 无效");
+		}
+		await this.assertObjectsComplete(gitDirectory, treeId, entries);
+		return {
+			treeId, coverage: COMPLETE_COVERAGE,
+			...ignoredPresentProof(COMPLETE_COVERAGE, ignoredPresentPaths),
+			objectClosure: treeObjectClosure(treeId, entries),
+			...(delta?.cacheUpdate === undefined ? {} : { cacheUpdate: delta.cacheUpdate }),
 		};
 	}
 
@@ -3062,7 +3161,7 @@ function parseBatchBlobOutputByOrder(
 }
 
 function indexInfoBatches(
-	leaves: readonly VisibleLeaf[],
+	leaves: readonly Pick<VisibleLeaf, "relativePath" | "mode">[],
 	objectIds: ReadonlyMap<string, string>,
 ): Buffer[] {
 	const result: Buffer[] = [];
