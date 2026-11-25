@@ -815,26 +815,8 @@ export class UndoControllerImpl implements UndoController {
 			this.undoStack.push(checkpoint);
 			if (pendingTopologyFingerprint !== undefined) {
 				this.startPendingAfterMaterialization(checkpoint, pendingTopologyFingerprint, staged.before, staged.changeCursor);
-			}
-			// agentSettled 的 finally 会在结算摘要写入 run 后解除等待；durable pack 继续后台预制。
-			// applyRestore 有惰性路径，可在预制未完成时现场创建 durable pack。
-			// 两个方向放在同一个后台任务里串行：并发创建两份 durable pack 会让文件 IO
-			// 与事件循环压力翻倍，大工作区下足以让 TUI 按键（含 Esc 中断）得不到处理。
-			if (changedPaths.length > 0 && fastPath !== "pending_delta" &&
-				this.dependencies.prepareDurableRestore !== undefined) {
-				const prepareDurable = this.runBackground(async () => {
-					try {
-						// undo 是撤回时立即需要的方向，优先预制。
-						await this.dependencies.prepareDurableRestore!(after, staged.before, changedPaths);
-						if (this.operationAction !== "undo") {
-							await this.dependencies.prepareDurableRestore!(staged.before, after, changedPaths);
-						}
-					} catch (error) {
-						// 两个方向都有安全的惰性路径；后台预制失败不应暂停当前历史。
-						this.recordUnsafeExit(error);
-					}
-				});
-				void prepareDurable.catch(() => {});
+			} else if (changedPaths.length > 0) {
+				this.prepareRestorePacks(after, staged.before, changedPaths);
 			}
 		} catch (error) {
 			const candidate = error as { name?: unknown; code?: unknown };
@@ -1462,6 +1444,16 @@ export class UndoControllerImpl implements UndoController {
 		}
 	}
 
+	private prepareRestorePacks(source: SnapshotManifest, target: SnapshotManifest, paths: readonly string[]): void {
+		const prepare = this.dependencies.prepareDurableRestore;
+		if (this.disposed || this.locked || prepare === undefined) return;
+		// 两个方向串行预制，避免争抢磁盘。命令只等待快照，缓存未就绪时可现场创建包。
+		void this.runBackground(async () => {
+			await prepare(source, target, paths);
+			if (!this.disposed && this.operationAction !== "undo") await prepare(target, source, paths);
+		}).catch((error) => { this.recordUnsafeExit(error); });
+	}
+
 	private startPendingAfterMaterialization(
 		checkpoint: CheckpointRecord,
 		topologyFingerprint: string,
@@ -1477,6 +1469,19 @@ export class UndoControllerImpl implements UndoController {
 					: await this.captureScopedWithWorkspaceLock(checkpoint.changedPaths, topologyFingerprint);
 				await this.persistMaterializedAfter(checkpoint, manifest);
 				this.applyMaterializedAfter(checkpointId, manifest.manifestId);
+				if (before !== undefined && manifest.coverage === "complete") {
+					const undo = this.operationAction === "undo" ? this.activeOperation : undefined;
+					if (undo === undefined) {
+						this.prepareRestorePacks(manifest, before, checkpoint.changedPaths);
+					} else {
+						// 用户已在等此快照：先让前台撤销，勿与它重复建包。提交后按实际 redo 目标预制。
+						void undo.then((result) => {
+							const next = this.redoStack.at(-1);
+							if (result.code === "ok" && next?.checkpoint.checkpointId === checkpointId &&
+								next.targetManifestId === manifest.manifestId) this.prepareRestorePacks(before, manifest, checkpoint.changedPaths);
+						}).catch(() => {});
+					}
+				}
 				return manifest.manifestId;
 			} catch (error) {
 				this.recordUnsafeExit(error);

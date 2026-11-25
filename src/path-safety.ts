@@ -207,12 +207,18 @@ export class MutationPathIndex {
 
 /** 排序数组中第一个以 prefix 开头的项；供 ignored proof 与 mutation 索引复用。 */
 export function sortedStartsWith(sorted: readonly string[], prefix: string): boolean {
-	let low = 0;
-	let high = sorted.length;
-	while (low < high) {
-		const middle = (low + high) >>> 1;
-		if (sorted[middle]! < prefix) low = middle + 1;
-		else high = middle;
+	return sorted[lowerBound(sorted, prefix)]?.startsWith(prefix) ?? false;
+}
+
+export function sortedHasPath(sorted: readonly string[], path: string): boolean {
+	return sorted[lowerBound(sorted, path)] === path;
+}
+
+/** 两侧路径已校验，清单的 ignored 叶子按 UTF-16 码元严格排序。 */
+export function sortedPathOverlaps(sorted: readonly string[], path: string): boolean {
+	if (sortedHasPath(sorted, path) || sortedStartsWith(sorted, `${path}/`)) return true;
+	for (let end = path.lastIndexOf("/"); end > 0; end = path.lastIndexOf("/", end - 1)) {
+		if (sortedHasPath(sorted, path.slice(0, end))) return true;
 	}
-	return low < sorted.length && sorted[low]!.startsWith(prefix);
+	return false;
 }

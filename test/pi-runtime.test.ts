@@ -12,6 +12,7 @@ import type { CheckpointRecord, CursorState, ManifestId, SessionFileIdentity } f
 import { createPiUndoRuntime as createRuntime } from "../src/pi-runtime.ts";
 import { JournalRecovery } from "../src/recovery.ts";
 import { RestoreEngine } from "../src/restore-engine.ts";
+import { RootDiscovery } from "../src/root-discovery.ts";
 import { SnapshotStore } from "../src/snapshot-store.ts";
 
 const temporaryRoots: string[] = [];
@@ -329,10 +330,15 @@ describe("Pi runtime cursor durability", () => {
 		expect(runtime.controller.history().undoCount).toBe(1);
 	});
 
-	it("settled 发现文件变化时生成作用域快照", async () => {
+	it.each([true, false])("settled 按变更证明选择增量或完整捕获，两者均可撤销、重做（可信游标=%s）", async (trusted) => {
 		const fixture = await liveOperationFixture();
 		await writeFile(join(fixture.workspace, "tracked.txt"), "before\n");
 		const runtime = await createPiUndoRuntime(fixture.context as any, fixture.pi as any);
+		const cursor = { sequence: 1, instance: "test" };
+		using cursorSpy = vi.spyOn(RootDiscovery.prototype, "changeCursor").mockReturnValue(trusted ? cursor : undefined);
+		using changes = vi.spyOn(RootDiscovery.prototype, "changesSince").mockResolvedValue({
+			...cursor, sequence: 2, trusted: true, files: ["tracked.txt"], directories: [],
+		});
 		expect(await runtime.controller.prepareInput("改文件", { streaming: false })).toEqual({ action: "continue" });
 		await runtime.controller.beforeAgentStart();
 		const startEntryId = fixture.manager.getLeafId();
@@ -355,11 +361,13 @@ describe("Pi runtime cursor durability", () => {
 			await runtime.controller.agentSettled();
 			const checkpoint = runtime.controller.listCheckpoints().at(-1);
 			expect(checkpoint?.changedPaths).toEqual(["tracked.txt"]);
-			expect(isCheckpointAfterPending(checkpoint!)).toBe(true);
-			expect(captureBaseline).not.toHaveBeenCalled();
+			expect(cursorSpy).toHaveBeenCalled();
+			expect(changes.mock.calls.length > 0).toBe(trusted);
+			expect(isCheckpointAfterPending(checkpoint!)).toBe(trusted);
+			expect(captureBaseline).toHaveBeenCalledTimes(trusted ? 0 : 1);
 			runtime.setCommandContext(fixture.commandContext as any);
 			expect(await runtime.controller.undo()).toMatchObject({ code: "ok", changedFiles: 1 });
-			expect(captureBaseline).not.toHaveBeenCalled();
+			expect(captureBaseline).toHaveBeenCalledTimes(trusted ? 0 : 1);
 			expect(git.mock.calls.some(([args]) => args.includes("write-tree"))).toBe(true);
 			expect(await readFile(join(fixture.workspace, "tracked.txt"), "utf8")).toBe("before\n");
 			expect(await runtime.controller.redo()).toMatchObject({ code: "ok", changedFiles: 1 });

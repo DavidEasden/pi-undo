@@ -1795,6 +1795,45 @@ describe("UndoController", () => {
 		expect(isCheckpointAfterPending(checkpoint!)).toBe(false);
 	});
 
+	it.each([true, false])("undo 等待增量 after 落盘，但不等恢复包预制结束（立即撤销=%s）", async (immediate) => {
+		let publish!: () => void;
+		const publishGate = new Promise<void>((resolve) => { publish = resolve; });
+		let release!: () => void;
+		const packGate = new Promise<void>((resolve) => { release = resolve; });
+		const persisted = vi.fn(async () => publishGate);
+		const prepare = vi.fn(async () => packGate);
+		const before = manifest("a"), after = manifest("c");
+		const captureSafety = vi.fn(async () => after);
+		const controller = new UndoControllerImpl(dependencies({
+			changeCursor: () => ({ sequence: 7, instance: "helper-test" }),
+			probeChanges: async () => ({ files: ["file.txt"], directories: [], trusted: true }),
+			capture: async () => before,
+			captureScoped: async () => { throw new Error("不应回退作用域捕获"); },
+			captureIncremental: async () => after,
+			persistMaterializedAfter: persisted, prepareDurableRestore: prepare, captureSafety,
+		}));
+		try {
+			await controller.prepareInput("写入 run", { streaming: false });
+			await controller.beforeAgentStart();
+			await controller.agentSettled();
+			const immediateUndo = immediate ? controller.undo() : undefined;
+			await vi.waitFor(() => expect(persisted).toHaveBeenCalledOnce());
+			expect(prepare).not.toHaveBeenCalled();
+			expect(captureSafety).not.toHaveBeenCalled();
+			publish();
+			if (!immediate) await vi.waitFor(() => expect(prepare).toHaveBeenCalledWith(after, before, ["file.txt"]));
+			expect((await (immediateUndo ?? controller.undo())).code).toBe("ok");
+			if (immediate) await vi.waitFor(() => expect(prepare).toHaveBeenCalledWith(before, after, ["file.txt"]));
+			expect(prepare).toHaveBeenCalledTimes(1);
+			expect(captureSafety).toHaveBeenCalledWith(after.manifestId, before.manifestId, ["file.txt"]);
+			expect(controller.history()).toEqual({ undoCount: 0, redoCount: 1, locked: false });
+		} finally {
+			publish();
+			release();
+			await controller.dispose();
+		}
+	});
+
 	it("目录变化或文件数超限时保守退回完整结算", async () => {
 		for (const probe of [
 			{ files: [], directories: ["new-dir"], trusted: true },

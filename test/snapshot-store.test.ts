@@ -344,11 +344,10 @@ async function expectNoPublishedManifest(storeRoot: string): Promise<void> {
 async function publishManifestWithIgnoredPath(
 	storeRoot: string,
 	manifest: SnapshotManifest,
-	ignoredPath: string,
+	ignoredPresentPaths: readonly string[],
 ): Promise<SnapshotManifest> {
 	const roots = manifest.roots.map((root, index) => {
 		if (index !== 0) return root;
-		const ignoredPresentPaths = [ignoredPath];
 		return {
 			...root,
 			ignoredPresentPaths,
@@ -422,7 +421,8 @@ describe("SnapshotStore", () => {
 		await runGit(repository.root, ["add", "."]);
 		await runGit(repository.root, ["commit", "-m", "baseline"]);
 		const topology = await new RootDiscovery().discover(repository.root);
-		const store = new SnapshotStore({ storeRoot: await temporaryRoot("pi-undo-store-") });
+		const git = new RecordingGitRunner();
+		const store = new SnapshotStore({ storeRoot: await temporaryRoot("pi-undo-store-"), git });
 		const baseline = await store.capture(topology);
 
 		await writeFixtureFile(repository.root, "keep.txt", "after\n");
@@ -430,9 +430,11 @@ describe("SnapshotStore", () => {
 		await writeFixtureFile(repository.root, "created.txt", "created\n");
 		await unlink(join(repository.root, "ignored/remove.log"));
 		await writeFixtureFile(repository.root, "ignored/new.log", "ignored\n");
+		git.calls.length = 0;
 		const after = await store.captureIncremental(topology, baseline,
 			["keep.txt", "remove.txt", "created.txt", "ignored/remove.log", "ignored/new.log"], async () => {}, { topologyAlreadyValidated: true });
 
+		expect(git.calls.filter((call) => call.args[0] === "write-tree")).toHaveLength(1);
 		expect(after.coverage).toBe("complete");
 		expect(after.roots[0]?.treeId).not.toBe(baseline.roots[0]?.treeId);
 		const entries = await store.listTree(after.manifestId, ".");
@@ -1533,24 +1535,38 @@ describe("SnapshotStore", () => {
 			} finally { validate.mockRestore(); }
 		});
 
-		it("热读仍拒绝同长篡改、内容与文件名不符和文件消失", async () => {
+		it("只读请求共享冻结原件，默认请求和同 ID 外部对象保持隔离", async () => {
+			const { store, manifest } = await fixture();
+			const id = manifest.manifestId;
+			const frozen = await store.loadManifest(id, { immutable: true });
+			expect(await store.loadManifest(id, { immutable: true })).toBe(frozen);
+			for (const value of [frozen, frozen.roots, frozen.roots[0], frozen.roots[0]!.ignoredPresentPaths]) {
+				expect(Object.isFrozen(value)).toBe(true);
+			}
+			const copy = await store.loadManifest(id);
+			(copy.roots[0]!.ignoredPresentPaths as string[]).push("额外路径");
+			expect(await store.loadManifest(id, { immutable: true })).toEqual(manifest);
+			expect(() => SnapshotStore.validateManifest(store, Object.freeze(copy))).toThrow();
+		});
+
+		it.each([false, true])("热读仍拒绝同长篡改、内容与文件名不符和文件消失（只读=%s）", async (immutable) => {
 			const { store, manifest, manifestPath } = await fixture();
 			const id = manifest.manifestId;
 			const original = await readFile(manifestPath, "utf8");
 			const metadata = await stat(manifestPath);
-			await store.loadManifest(id);
+			const originalManifest = await store.loadManifest(id, { immutable });
 			await writeFile(manifestPath, original.replace(manifest.createdAt, "0".repeat(manifest.createdAt.length)));
 			await utimes(manifestPath, metadata.atime, metadata.mtime);
 			for (let attempt = 0; attempt < 2; attempt++) {
-				await expect(store.loadManifest(id)).rejects.toMatchObject({ code: "manifest_invalid" });
+				await expect(store.loadManifest(id, { immutable })).rejects.toMatchObject({ code: "manifest_invalid" });
 			}
 			await writeFile(manifestPath, original);
-			expect(await store.loadManifest(id)).toEqual(manifest);
+			expect(await store.loadManifest(id, { immutable })).toEqual(originalManifest);
 			const other = checksum("另一份清单") as ManifestId;
 			await writeFile(join(dirname(manifestPath), `${other}.json`), original);
-			await expect(store.loadManifest(other)).rejects.toMatchObject({ code: "manifest_invalid" });
+			await expect(store.loadManifest(other, { immutable })).rejects.toMatchObject({ code: "manifest_invalid" });
 			await unlink(manifestPath);
-			await expect(store.loadManifest(id)).rejects.toMatchObject({ code: "manifest_invalid" });
+			await expect(store.loadManifest(id, { immutable })).rejects.toMatchObject({ code: "manifest_invalid" });
 		});
 
 		it("第 33 份清单只淘汰最久未读取的摘要", async () => {
@@ -2482,6 +2498,11 @@ describe("SnapshotStore", () => {
 		expect(JSON.parse(await readFile(join(storeRoot, pinPath as string), "utf8"))).toEqual(
 			expect.objectContaining({ manifestId: manifest.manifestId, reasons: ["session"] }),
 		);
+		const write = vi.spyOn(atomicFs, "writeJsonAtomic");
+		try {
+			await store.unpin(manifest.manifestId, "未持有的引用");
+			expect(write).not.toHaveBeenCalled();
+		} finally { write.mockRestore(); }
 		await store.unpin(manifest.manifestId, "session");
 		await store.unpin(manifest.manifestId, "session");
 		expect(await store.loadManifest(manifest.manifestId)).toEqual(manifest);
@@ -2586,7 +2607,8 @@ describe("SnapshotStore", () => {
 		const topology = await new RootDiscovery().discover(workspace);
 		const store = new SnapshotStore({ storeRoot });
 		const manifest = await store.capture(topology);
-		const forged = await publishManifestWithIgnoredPath(storeRoot, manifest, ignoredPath);
+		// ignored 叶子多于可见叶子，命中按可见路径二分检查的分支。
+		const forged = await publishManifestWithIgnoredPath(storeRoot, manifest, ["unrelated.txt", ignoredPath].sort());
 
 		await expect(store.assertComplete(forged.manifestId)).rejects.toMatchObject({ code: "object_missing" });
 	});

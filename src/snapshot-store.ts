@@ -25,7 +25,7 @@ import type {
 import type { NativeMetadataEntry, NativeMetadataPort } from "./native-metadata.ts";
 import { NativeMetadataInspector } from "./native-metadata.ts";
 import { allCompleted, checkOperation, configuredTimeout, OperationError, operationProcessOptions, rethrowOperationFailure } from "./operation-context.ts";
-import { assertNoSymlinkEscape, assertNoSymlinkParents, pathSetsOverlap, relativeSafePath } from "./path-safety.ts";
+import { assertNoSymlinkEscape, assertNoSymlinkParents, pathSetsOverlap, relativeSafePath, sortedPathOverlaps } from "./path-safety.ts";
 import { RootDiscovery, type RootDiscoveryReason, type RootTopology } from "./root-discovery.ts";
 import { WorkspaceLock } from "./workspace-lock.ts";
 
@@ -329,7 +329,7 @@ export interface SnapshotStore {
 		options?: CaptureOptions,
 	): Promise<SnapshotManifest>;
 	listVisibleLeafPaths(topology: RootTopology, options?: VisibleLeafOptions): Promise<readonly string[]>;
-	loadManifest(id: ManifestId): Promise<SnapshotManifest>;
+	loadManifest(id: ManifestId, options?: { readonly immutable?: boolean }): Promise<SnapshotManifest>;
 	assertComplete(id: ManifestId, scopePaths?: readonly string[]): Promise<void>;
 	listTree(id: ManifestId, root: string, rootScopePaths?: readonly string[]): Promise<readonly RestorePath[]>;
 	readBlob(id: ManifestId, root: string, blobId: string, relativePath?: string): Promise<Uint8Array>;
@@ -352,8 +352,8 @@ export class SnapshotStore {
 	private readonly blobCacheMaxBytes: number;
 	private lastCompactCheckAt: number | undefined;
 	private readonly manifestLocations = new Map<ManifestId, string>();
-	private readonly validatedManifestDigests = new Map<ManifestId, string>();
-	private readonly frozenCaptures = new WeakSet<SnapshotManifest>();
+	private readonly validatedManifestDigests = new Map<ManifestId, { digest: string; immutable?: WeakRef<SnapshotManifest> }>();
+	private readonly validatedManifests = new WeakSet<SnapshotManifest>();
 	// Tree 与 blob 都由 object ID 内容寻址；缓存只复用已从私有 ODB 读取的不可变内容。
 	private readonly treeEntriesCache = new Map<string, Promise<CapturedTreeEntry[]>>();
 	private readonly treeEntryCounts = new Map<string, number>();
@@ -476,7 +476,7 @@ export class SnapshotStore {
 		topology: RootTopology, baseline: SnapshotManifest, scope: readonly string[],
 		verifyChanges: () => Promise<void>, options: CaptureOptions = {},
 	): Promise<SnapshotManifest> {
-		assertManifest(baseline);
+		SnapshotStore.validateManifest(this, baseline);
 		if (baseline.coverage !== COMPLETE_COVERAGE || baseline.workspaceIdentity !== topology.workspaceIdentity ||
 			baseline.topologyFingerprint !== topology.fingerprint || scope.length === 0 ||
 			scope.some((path) => relativeSafePath(topology.workspaceIdentity, path) === "." ||
@@ -489,7 +489,7 @@ export class SnapshotStore {
 		try {
 			return await this.lock.withLock(lockIdentity, async () => {
 				// 重新读取内容寻址清单，不能让内存对象掩盖持久化文件损坏。
-				const checked = await this.loadManifest(baseline.manifestId);
+				const checked = await this.loadManifest(baseline.manifestId, { immutable: true });
 				await verifyChanges();
 				return this.captureLocked(topology, scope, options, diagnostic, { baseline: checked, verifyChanges });
 			});
@@ -600,7 +600,7 @@ export class SnapshotStore {
 				Object.freeze(root);
 			}
 			Object.freeze(roots);
-			this.frozenCaptures.add(Object.freeze(manifest));
+			this.validatedManifests.add(Object.freeze(manifest));
 			return manifest;
 		} catch (error) {
 			if (error instanceof SnapshotStoreError) {
@@ -811,7 +811,7 @@ export class SnapshotStore {
 		options: CaptureOptions,
 		diagnostic?: MutableCaptureDiagnostic,
 	): Promise<boolean> {
-		const knownCapture = this.frozenCaptures.has(baseline);
+		const knownCapture = this.validatedManifests.has(baseline);
 		if (!knownCapture) {
 			try {
 				assertManifest(baseline);
@@ -996,24 +996,25 @@ export class SnapshotStore {
 					return safe;
 				}),
 			)].sort(comparePaths);
-			const result = new Set<string>();
-			for (const root of topology.roots) {
-				if (root.state !== "active") continue;
+			const activeDirectory = transactionDirectory;
+			const result = await mapConcurrentOrdered(topology.roots, ROOT_CAPTURE_CONCURRENCY, async (root) => {
+				if (root.state !== "active") return [];
 				const exclusions = topology.roots
 					.filter((candidate) => isStrictRootAncestor(root.relativeRoot, candidate.relativeRoot))
 					.map((candidate) => rootRelativePath(root.relativeRoot, candidate.relativeRoot));
 				const inclusions = ownedRootInclusions(rootScopePathspecs(root.relativeRoot, includePaths), exclusions);
-				if (inclusions === null) continue;
+				if (inclusions === null) return [];
 				const gitDirectory = this.rootGitDirectory(storeDirectory, root);
 				await this.ensurePrivateRepository(gitDirectory);
 				await this.assertNoAlternates(gitDirectory);
 				const absoluteRoot = workspaceRootPath(topology.workspaceIdentity, root.relativeRoot);
-				const indexPath = join(transactionDirectory, `${rootStoreId(root)}.index`);
+				const indexPath = join(activeDirectory, `${rootStoreId(root)}.index`);
 				const environment = privateGitEnvironment(gitDirectory, absoluteRoot, indexPath);
-				await this.runGit(["read-tree", "--empty"], { cwd: absoluteRoot, env: environment });
+				// Git 根的可见性取自源 index；只有合成根的查询读取临时 index。
+				if (!root.gitBacked) await this.runGit(["read-tree", "--empty"], { cwd: absoluteRoot, env: environment });
 				await this.validateIgnoreQuery(absoluteRoot, environment, root.gitBacked);
 				const exactExclusions = ownedArtifactExclusions(topology.roots, root.relativeRoot, artifactExclusions);
-				for (const relativePath of await this.queryVisibleLeafPaths(
+				const paths = await this.queryVisibleLeafPaths(
 					absoluteRoot,
 					environment,
 					root.gitBacked,
@@ -1021,14 +1022,13 @@ export class SnapshotStore {
 					exclusions,
 					exactExclusions,
 					true,
-				)) {
-					result.add(workspaceRelativePath(root.relativeRoot, relativePath));
-				}
-			}
+				);
+				return paths.map((path) => workspaceRelativePath(root.relativeRoot, path));
+			});
 			if (options.skipPostTopologyCheck !== true) {
 				await this.assertTopology(topology, "可见路径枚举期间 topology 已变化", "visible-paths-post");
 			}
-			return [...result].sort(comparePaths);
+			return [...new Set(result.flat())].sort(comparePaths);
 		} catch (error) {
 			if (error instanceof SnapshotStoreError) throw error;
 			throw new SnapshotStoreError("capture_failed", errorMessage(error), { cause: error });
@@ -1039,22 +1039,37 @@ export class SnapshotStore {
 		}
 	}
 
-	async loadManifest(id: ManifestId): Promise<SnapshotManifest> {
-		return this.loadManifestFromPath(id, await this.findManifestPath(id));
+	/** 只复用本实例验证并冻结的原件；外部清单即使 ID 相同或已冻结也要完整校验。 */
+	static validateManifest(store: SnapshotStore, manifest: SnapshotManifest): void {
+		if (!(store instanceof SnapshotStore) || !store.validatedManifests.has(manifest)) assertManifest(manifest);
 	}
 
-	private async loadManifestFromPath(id: ManifestId, manifestPath: string): Promise<SnapshotManifest> {
+	async loadManifest(id: ManifestId, options: { readonly immutable?: boolean } = {}): Promise<SnapshotManifest> {
+		return this.loadManifestFromPath(id, await this.findManifestPath(id), options.immutable === true);
+	}
+
+	private async loadManifestFromPath(id: ManifestId, manifestPath: string, immutable = true): Promise<SnapshotManifest> {
 		try {
 			const bytes = await readFile(manifestPath);
 			const digest = checksum(bytes);
-			const value: unknown = JSON.parse(bytes.toString("utf8"));
-			// 同一 ID 的原始字节完全一致才复用校验结果；返回本次解析的对象，避免调用方改动污染热读。
-			const manifest = this.validatedManifestDigests.get(id) === digest ? value as SnapshotManifest : assertManifest(value);
-			if (manifest.manifestId !== id) {
-				throw new SnapshotStoreError("manifest_invalid", "manifest 文件名与内容 ID 不一致");
+			const cached = this.validatedManifestDigests.get(id);
+			const entry = cached?.digest === digest ? cached : { digest };
+			// 即使有原件也必须重读磁盘字节。默认不分享对象，保留调用方可修改副本的语义。
+			let manifest = immutable ? entry.immutable?.deref() : undefined;
+			if (manifest === undefined) {
+				const value: unknown = JSON.parse(bytes.toString("utf8"));
+				manifest = entry === cached ? value as SnapshotManifest : assertManifest(value);
+				if (manifest.manifestId !== id) {
+					throw new SnapshotStoreError("manifest_invalid", "manifest 文件名与内容 ID 不一致");
+				}
+				if (immutable) {
+					freezeParsedJson(manifest);
+					this.validatedManifests.add(manifest);
+					entry.immutable = new WeakRef(manifest);
+				}
 			}
 			this.validatedManifestDigests.delete(id);
-			this.validatedManifestDigests.set(id, digest);
+			this.validatedManifestDigests.set(id, entry);
 			if (this.validatedManifestDigests.size > MANIFEST_DIGEST_CACHE_LIMIT) {
 				const oldest = this.validatedManifestDigests.keys().next().value;
 				if (oldest !== undefined) this.validatedManifestDigests.delete(oldest);
@@ -1070,7 +1085,7 @@ export class SnapshotStore {
 
 	async assertComplete(id: ManifestId, scopePaths?: readonly string[]): Promise<void> {
 		const manifestPath = await this.findManifestPath(id);
-		const manifest = await this.loadManifest(id);
+		const manifest = await this.loadManifest(id, { immutable: true });
 		const storeDirectory = dirname(dirname(manifestPath));
 		try {
 			for (const root of manifest.roots) {
@@ -1092,10 +1107,11 @@ export class SnapshotStore {
 				const gitDirectory = this.rootGitDirectory(storeDirectory, root);
 				await this.assertNoAlternates(gitDirectory);
 				const entries = await this.readTreeEntries(gitDirectory, root.treeId, rootScope);
-				if (pathSetsOverlap(
-					root.ignoredPresentPaths,
-					entries.map((entry) => entry.relativePath),
-				)) {
+				const ignored = root.ignoredPresentPaths;
+				const overlaps = entries.length < ignored.length && this.validatedManifests.has(manifest)
+					? entries.some((entry) => sortedPathOverlaps(ignored, entry.relativePath))
+					: pathSetsOverlap(ignored, entries.map((entry) => entry.relativePath));
+				if (overlaps) {
 					throw new SnapshotStoreError("object_missing", "ignored-present proof 与 root tree 冲突");
 				}
 				await this.assertObjectsComplete(gitDirectory, root.treeId, entries, scopePaths !== undefined);
@@ -1118,7 +1134,7 @@ export class SnapshotStore {
 	): Promise<readonly RestorePath[]> {
 		relativeSafePath("/", rootPath);
 		const manifestPath = await this.findManifestPath(id);
-		const manifest = await this.loadManifest(id);
+		const manifest = await this.loadManifest(id, { immutable: true });
 		const root = manifest.roots.find((candidate) => candidate.relativeRoot === rootPath);
 		if (root === undefined) {
 			throw new SnapshotStoreError("root_not_found", "manifest 中不存在指定 root");
@@ -1249,7 +1265,7 @@ export class SnapshotStore {
 		const manifestPath = await this.findManifestPath(id);
 		const manifest = revalidateManifest
 			? await this.loadManifestFromPath(id, manifestPath)
-			: await this.loadManifest(id);
+			: await this.loadManifest(id, { immutable: true });
 		const roots = new Map(manifest.roots.map((root) => [root.relativeRoot, root]));
 		const storeDirectory = dirname(dirname(manifestPath));
 		try {
@@ -1371,7 +1387,7 @@ export class SnapshotStore {
 	private async pinLocked(id: ManifestId, reason: string): Promise<void> {
 		assertPinReason(reason);
 		const manifestPath = await this.findManifestPath(id);
-		await this.loadManifest(id);
+		await this.loadManifest(id, { immutable: true });
 		const pinPath = join(dirname(dirname(manifestPath)), "pins", `${id}${MANIFEST_SUFFIX}`);
 		const current = await readPin(pinPath, id);
 		const reasons = [...new Set([...(current?.reasons ?? []), reason])].sort(comparePaths);
@@ -1397,7 +1413,8 @@ export class SnapshotStore {
 		const manifestPath = await this.findManifestPath(id);
 		const pinPath = join(dirname(dirname(manifestPath)), "pins", `${id}${MANIFEST_SUFFIX}`);
 		const current = await readPin(pinPath, id);
-		if (current === null) {
+		// 现场恢复完成后也会尝试释放 recovery reason；若只有缓存 pin，不应重写它。
+		if (current === null || (current.reasons.length > 0 && !current.reasons.includes(reason))) {
 			return;
 		}
 		const reasons = current.reasons.filter((candidate) => candidate !== reason);
@@ -1504,6 +1521,10 @@ export class SnapshotStore {
 			transactionDirectory,
 			diagnostic,
 		);
+		for (const input of indexInfoBatches(staged.leaves, staged.objectIds)) {
+			await this.runGit(["update-index", "-z", "--index-info"], { cwd: absoluteRoot, env: environment, stdin: input });
+		}
+		await this.assertVisibleLeavesUnchanged(absoluteRoot, staged.leaves, transactionDirectory, staged.objectIds, environment);
 		const coverage = rootCoverageFromInclusions(inclusions);
 		const ignoredPresentPaths = await this.captureIgnoredPresentPaths(
 			absoluteRoot,
@@ -1546,20 +1567,23 @@ export class SnapshotStore {
 		const affected = (path: string) => inclusions !== null &&
 			(inclusions.length === 0 || inclusions.some((item) => isPathAtOrBelow(item, path)));
 		const before = await this.readTreeEntries(gitDirectory, baseline.treeId);
-		const delta = inclusions === null ? undefined
-			: await this.captureRoot(topology, root, transactionDirectory, scope, artifactExclusions, diagnostic);
-		const replacements = delta?.treeId === undefined || delta.treeId === null
-			? [] : await this.readTreeEntries(gitDirectory, delta.treeId);
-		const entries = [...before.filter((entry) => !affected(entry.relativePath)), ...replacements]
-			.sort((left, right) => comparePaths(left.relativePath, right.relativePath));
 		const cwd = workspaceRootPath(topology.workspaceIdentity, root.relativeRoot);
 		const environment = privateGitEnvironment(gitDirectory, cwd, join(transactionDirectory, `${rootStoreId(root)}.merge.index`));
 		await this.runGit(["read-tree", "--empty"], { cwd, env: environment });
 		const exactExclusions = ownedArtifactExclusions(topology.roots, root.relativeRoot, artifactExclusions);
+		let staged: StagedWorktree | undefined;
+		if (inclusions !== null) {
+			await this.validateIgnoreQuery(cwd, environment, root.gitBacked);
+			// 只生成范围内的 blob，不为临时 delta 创建 index/tree；完整索引在普查后写一次。
+			staged = await this.stageWorktree(cwd, environment, root.gitBacked, inclusions, exclusions, exactExclusions,
+				this.visibleLeafCache.get(gitDirectory), transactionDirectory, diagnostic);
+		}
+		const retained = before.filter((entry) => !affected(entry.relativePath));
+		const leaves = [...retained, ...(staged?.leaves ?? [])].sort((a, b) => comparePaths(a.relativePath, b.relativePath));
+		const expectedPaths = leaves.map((entry) => entry.relativePath);
 		// 当前 Git 规则/index 仍全量取证，避免 .git 内配置变化扩大可见集合时漏项。
 		const census = () => this.queryVisibleLeafPaths(cwd, environment, root.gitBacked, [], exclusions, exactExclusions, true);
-		const visible = await census();
-		if (!samePathList([...new Set(visible)].sort(comparePaths), entries.map((entry) => entry.relativePath))) {
+		if (!samePathList([...new Set(await census())].sort(comparePaths), expectedPaths)) {
 			throw new SnapshotStoreError("capture_failed", "增量范围之外的可见路径已变化");
 		}
 		// 受信任 scope 内的 ignored proof 可局部更新；规则文件与 .git 配置变化会在调用方转完整捕获。
@@ -1569,24 +1593,33 @@ export class SnapshotStore {
 			: [...baseline.ignoredPresentPaths.filter((path) => !affected(path)), ...ignoredDelta].sort(comparePaths);
 		if (diagnostic !== undefined) diagnostic.ignoredFiles += ignoredDelta.length;
 		// census 必须使用空 index，synthetic root 不能把合成索引当成源 index。
-		if (!samePathList([...new Set(await census())].sort(comparePaths), [...new Set(visible)].sort(comparePaths))) {
+		if (!samePathList([...new Set(await census())].sort(comparePaths), expectedPaths)) {
 			throw new SnapshotStoreError("capture_failed", "增量捕获期间可见路径已变化");
 		}
 		let treeId = baseline.treeId;
-		if (delta !== undefined) {
-			const objectIds = new Map(entries.map((entry) => [entry.relativePath, entry.objectId]));
-			for (const input of indexInfoBatches(entries, objectIds)) {
+		let entries = before;
+		if (staged !== undefined) {
+			const objectIds = new Map(retained.map((entry) => [entry.relativePath, entry.objectId]));
+			for (const [path, id] of staged.objectIds) objectIds.set(path, id);
+			for (const input of indexInfoBatches(leaves, objectIds)) {
 				await this.runGit(["update-index", "-z", "--index-info"], { cwd, env: environment, stdin: input });
 			}
 			treeId = (await this.runGit(["write-tree"], { cwd, env: environment })).trim();
 			if (!isObjectId(treeId)) throw new SnapshotStoreError("capture_failed", "增量 write-tree ID 无效");
+			entries = await this.readTreeEntries(gitDirectory, treeId);
+			if (entries.length !== leaves.length || entries.some((entry, index) =>
+				entry.relativePath !== expectedPaths[index] || entry.mode !== leaves[index]!.mode ||
+				entry.objectId !== objectIds.get(entry.relativePath))) {
+				throw new SnapshotStoreError("capture_failed", "增量合并后的 Git tree 与预期不一致");
+			}
+			await this.assertVisibleLeavesUnchanged(cwd, staged.leaves, transactionDirectory, staged.objectIds, environment);
 		}
 		await this.assertObjectsComplete(gitDirectory, treeId, entries);
 		return {
 			treeId, coverage: COMPLETE_COVERAGE,
 			...ignoredPresentProof(COMPLETE_COVERAGE, ignoredPresentPaths),
 			objectClosure: treeObjectClosure(treeId, entries),
-			...(delta?.cacheUpdate === undefined ? {} : { cacheUpdate: delta.cacheUpdate }),
+			...(staged === undefined ? {} : { cacheUpdate: { gitDirectory, staged, inclusions } }),
 		};
 	}
 
@@ -1946,14 +1979,6 @@ export class SnapshotStore {
 			await this.assertVisibleLeafUnchanged(cwd, leaf, objectId, environment);
 			objectIds.set(leaf.relativePath, objectId);
 		}
-		for (const indexInput of indexInfoBatches(leaves, objectIds)) {
-			await this.runGit(["update-index", "-z", "--index-info"], {
-				cwd,
-				env: environment,
-				stdin: indexInput,
-			});
-		}
-		await this.assertVisibleLeavesUnchanged(cwd, leaves, requestDirectory, objectIds, environment);
 		return {
 			leaves,
 			objectIds,
@@ -2770,6 +2795,14 @@ export class SnapshotStore {
 			lastUsedAt: this.clock(),
 		} satisfies StoreGcRecord);
 	}
+}
+
+/** JSON.parse 的对象没有环或访问器；清单允许额外字段，它们也必须不可变。 */
+function freezeParsedJson(value: object): void {
+	for (const child of Object.values(value)) {
+		if (child !== null && typeof child === "object") freezeParsedJson(child);
+	}
+	Object.freeze(value);
 }
 
 function captureCoverage(workspaceIdentity: string, scope: readonly string[] | undefined): string {

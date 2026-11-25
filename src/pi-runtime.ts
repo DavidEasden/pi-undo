@@ -188,7 +188,7 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 			}
 		},
 		capture,
-		loadManifest: (manifestId) => store.loadManifest(manifestId),
+		loadManifest: (manifestId) => store.loadManifest(manifestId, { immutable: true }),
 		planRestore: (current, target, scopePaths) => restore.plan(current, target, scopePaths),
 		applyRestore: (plan, target, operation) => restore.apply(plan, target, {
 			opId: operation.opId,
@@ -351,8 +351,8 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 		keepAlive: () => discovery.keepAlive(),
 		captureSafety: async (referenceManifestId, targetManifestId, scopePaths) => {
 			const [reference, target] = await allCompleted([
-				store.loadManifest(referenceManifestId),
-				store.loadManifest(targetManifestId),
+				store.loadManifest(referenceManifestId, { immutable: true }),
+				store.loadManifest(targetManifestId, { immutable: true }),
 			]);
 			if (await restore.canReuseDurableSource(reference, target, scopePaths)) return reference;
 			// durable pack 可能仍在后台预制；若当前 scope 已经与 reference manifest 一致，
@@ -366,7 +366,7 @@ async function initializePiUndoRuntime(context: ExtensionContext, pi: ExtensionA
 			const plan = await restore.plan(before, after);
 			return [...new Set([...plan.deletePaths, ...plan.writePaths])].sort();
 		},
-		loadManifest: (manifestId) => store.loadManifest(manifestId),
+		loadManifest: (manifestId) => store.loadManifest(manifestId, { immutable: true }),
 		planRestore: (current, target, scopePaths) => restore.plan(current, target, scopePaths),
 		prepareDurableRestore: (current, target, scopePaths) =>
 			restore.prepareDurableRestore(current, target, scopePaths),

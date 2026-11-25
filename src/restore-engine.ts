@@ -19,7 +19,7 @@ import {
 	type DurablePack,
 	type DurablePackEntryInput,
 } from "./durable-pack.ts";
-import { assertManifest, assertOperationId, canonicalJson, checksum } from "./encoding.ts";
+import { assertOperationId, canonicalJson, checksum } from "./encoding.ts";
 import { MutationJournal } from "./mutation-journal.ts";
 import { allCompleted, checkOperation, rethrowOperationFailure, isUnconfirmedExit, operationFailure, withRecoveryBudget } from "./operation-context.ts";
 import { allowsNativeMountFastPaths } from "./native-capabilities.ts";
@@ -31,6 +31,7 @@ import {
 	assertNoSymlinkParents,
 	MutationPathIndex,
 	relativeSafePath,
+	sortedHasPath,
 	sortDeletePaths,
 	sortWritePaths,
 } from "./path-safety.ts";
@@ -263,8 +264,8 @@ export class RestoreEngine {
 		options: DurablePackPreparationOptions = {},
 	): Promise<RestorePlan> {
 		const validationStarted = performance.now();
-		assertManifest(current);
-		assertManifest(target);
+		SnapshotStore.validateManifest(this.store, current);
+		SnapshotStore.validateManifest(this.store, target);
 		const scope = scopePaths === undefined ? undefined : this.canonicalScope(scopePaths);
 		const canonicalScopePaths = scope === undefined ? undefined : [...scope];
 		assertCompatibleManifests(current, target, scope);
@@ -391,8 +392,8 @@ export class RestoreEngine {
 		try {
 			if (await this.assertWorkspaceRootIdentity() !== current.workspaceIdentity) return false;
 			if (fromPersistentIndex) {
-				assertManifest(current);
-				assertManifest(target);
+				SnapshotStore.validateManifest(this.store, current);
+				SnapshotStore.validateManifest(this.store, target);
 				const scope = this.canonicalScope(scopePaths);
 				assertCompatibleManifests(current, target, scope);
 				const expected = await this.computePlan(current, target, scope, [...scope]);
@@ -444,8 +445,8 @@ export class RestoreEngine {
 	): Promise<boolean> {
 		this.clearPendingSourceProof();
 		try {
-			assertManifest(current);
-			assertManifest(target);
+			SnapshotStore.validateManifest(this.store, current);
+			SnapshotStore.validateManifest(this.store, target);
 			if (await this.assertWorkspaceRootIdentity() !== current.workspaceIdentity) return false;
 			const scope = [...this.canonicalScope(scopePaths)];
 			assertCompatibleManifests(current, target, new Set(scope));
@@ -932,7 +933,7 @@ export class RestoreEngine {
 		effectiveOptions: RestoreApplyOptions,
 		compatibilityMode: boolean,
 	): Promise<RestoreResult> {
-		assertManifest(target);
+		SnapshotStore.validateManifest(this.store, target);
 		// Task 6 会由 controller 强制传入 operation identity；此兼容分支仅保持现有调用方可运行。
 		assertOperationId(effectiveOptions.opId);
 		if (effectiveOptions.opId !== effectiveOptions.mutationJournal.operationId) {
@@ -1019,10 +1020,10 @@ export class RestoreEngine {
 		pinsDeferred: boolean,
 	): Promise<RestoreResult> {
 		const [current, storedTarget] = await allCompleted([
-			this.store.loadManifest(plan.currentManifestId),
-			this.store.loadManifest(target.manifestId),
+			this.store.loadManifest(plan.currentManifestId, { immutable: true }),
+			this.store.loadManifest(target.manifestId, { immutable: true }),
 		]);
-		if (canonicalJson(storedTarget) !== canonicalJson(target)) {
+		if (storedTarget !== target && canonicalJson(storedTarget) !== canonicalJson(target)) {
 			throw new Error("target manifest 与 store 内容不一致");
 		}
 		assertCompatibleManifests(
@@ -2199,9 +2200,6 @@ export class RestoreEngine {
 		}
 		const allowedPaths = new Set<string>();
 		for (const [index, manifest] of allowedManifests.entries()) {
-			for (const path of ignoredWorkspacePaths(manifest, check.scopePaths)) {
-				allowedPaths.add(path);
-			}
 			const paths = check.ownedPaths?.[index] ?? await this.readOwnedPaths(manifest, check.scopePaths);
 			for (const [path, owned] of paths) {
 				if (owned.entry.kind !== "directory") {
@@ -2220,10 +2218,19 @@ export class RestoreEngine {
 			topologyAlreadyValidated: check.topologyValidated,
 			skipPostTopologyCheck: check.skipPostTopologyCheck,
 		});
+		// 大多数 live 叶子已经在 tree 中。只有多出来的叶子才需要查 ignored 证明。
+		let scopeIndex: MutationPathIndex | undefined;
 		for (const path of livePaths) {
-			if (!allowedPaths.has(path)) {
-				throw new Error(`complete coverage 发现 manifest 集合外路径：${path}`);
+			if (allowedPaths.has(path)) continue;
+			if (check.scopePaths === undefined || check.scopePaths.includes(".") ||
+				(scopeIndex ??= new MutationPathIndex(check.scopePaths, [])).affects(path)) {
+				if (allowedManifests.some((manifest) => manifest.roots.some((root) => {
+					if (!isStrictWorkspaceAncestor(root.relativeRoot, path)) return false;
+					const relative = root.relativeRoot === "." ? path : path.slice(root.relativeRoot.length + 1);
+					return sortedHasPath(root.ignoredPresentPaths, relative);
+				}))) continue;
 			}
+			throw new Error(`complete coverage 发现 manifest 集合外路径：${path}`);
 		}
 	}
 
@@ -2642,17 +2649,9 @@ function workspacePath(root: string, path: string): string {
 	return root === "." ? path : path === "." ? root : `${root}/${path}`;
 }
 
-function ignoredWorkspacePaths(
-	manifest: SnapshotManifest,
-	scopePaths?: readonly string[],
-): Set<string> {
-	const scope = scopePaths === undefined ? undefined : new Set(scopePaths);
-	const scopeAncestors = new Set(scopePaths?.flatMap(strictPathAncestors));
+function ignoredWorkspacePaths(manifest: SnapshotManifest): Set<string> {
 	return new Set(manifest.roots.flatMap((root) =>
-		root.ignoredPresentPaths
-			.map((path) => workspacePath(root.relativeRoot, path))
-			.filter((path) => scope === undefined || scope.has(".") || scope.has(path) ||
-				scopeAncestors.has(path) || strictPathAncestors(path).some((ancestor) => scope.has(ancestor)))
+		root.ignoredPresentPaths.map((path) => workspacePath(root.relativeRoot, path))
 	));
 }
 
