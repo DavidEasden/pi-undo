@@ -211,6 +211,54 @@ describe("真实 pi 1.2.0 SDK", () => {
 		}
 	});
 
+	it.each(["tui", "rpc"] as const)("输入快照挂起时 Esc 中断不等待扫描完成（%s）", async (mode) => {
+		const { temp, harness } = await createFreshHarness(undefined, { mode });
+		let release!: () => void;
+		let entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		const original = RootDiscovery.prototype.discover;
+		const scan = vi.spyOn(RootDiscovery.prototype, "discover").mockImplementation(async function (this: RootDiscovery, ...args) {
+			entered();
+			await gate;
+			return original.apply(this, args);
+		});
+		let run: Promise<void> | undefined;
+		let abort: Promise<void> | undefined;
+		try {
+			harness.faux.setResponses([fauxAssistantMessage("不应在取消后开始输出")]);
+			run = harness.session.prompt("取消输入快照");
+			await ready;
+			await vi.waitFor(() => expect(harness.session.agent.signal).toBeDefined());
+			abort = harness.session.abort();
+			const stopped = await Promise.race([abort.then(() => true), delay(500).then(() => false)]);
+			expect(stopped, "快照仍被 gate 阻塞时，Pi 必须响应 Esc 并结束 run").toBe(true);
+			expect(harness.faux.state.callCount).toBe(0);
+			await run;
+			expect(harness.session.isIdle).toBe(true);
+			expect(harness.runtime().controller.captureFailed()).toBe(false);
+			release();
+			await harness.runtime().controller.agentSettled();
+
+			// 取消后的旧扫描退出时，不得影响下一轮真实工具调用及其撤销记录。
+			setUpRun(harness.faux, "value.txt", "after\n", "取消后的下一轮完成");
+			await harness.session.prompt("取消后修改文件");
+			await vi.waitFor(() => expect(harness.runtime().controller.history()).toEqual({
+				undoCount: 1, redoCount: 0, locked: false,
+			}));
+			expect(await readValue(temp.workspace)).toBe("after\n");
+			await harness.session.prompt("/undo");
+			expect(await readValue(temp.workspace)).toBe("before\n");
+			expect(harness.runtime().controller.history()).toEqual({ undoCount: 0, redoCount: 1, locked: false });
+			expect(harness.notices.filter(({ type }) => type === "extension_error")).toEqual([]);
+		} finally {
+			release();
+			await Promise.allSettled([run, abort]);
+			scan.mockRestore();
+			await closeHarness(harness, temp.sessionDir);
+		}
+	});
+
 	it("TUI 的正常 settled 快照也不阻塞 prompt 和后续 Esc", async () => {
 		const { temp, harness } = await createFreshHarness(undefined, { mode: "tui" });
 		const controller = harness.runtime().controller;

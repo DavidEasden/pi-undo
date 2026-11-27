@@ -927,6 +927,123 @@ describe("UndoController", () => {
 		expect(captureStarted).toBe(true);
 	});
 
+	it.each([false, true])("取消输入后立即返回，迟到快照不污染下一轮（失败=%s）", async (failLateCapture) => {
+		let release!: () => void;
+		let entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		const released = vi.fn(async () => {});
+		let captureSignal: AbortSignal | undefined;
+		let captures = 0;
+		const deps = dependencies({
+			acquireWorkspaceLock: async () => ({ release: released }),
+			capture: async () => {
+				captures += 1;
+				if (captures === 1) {
+					captureSignal = currentOperationContext()?.signal;
+					entered();
+					// 模拟尚不能立即退出的文件系统调用，验证前台返回与后台清理分离。
+					await gate;
+					if (failLateCapture) throw new Error("迟到的快照失败");
+					return manifest("a");
+				}
+				return manifest(captures === 2 ? "b" : "c");
+			},
+		});
+		const checkpoint = restoredCheckpoint();
+		const controller = new UndoControllerImpl(deps, {
+			undoStack: [checkpoint],
+			redoStack: [{ checkpoint, targetManifestId: manifest("c").manifestId }],
+		});
+		try {
+			controller.beginInput("取消的输入", { streaming: false });
+			await controller.beforeAgentStart();
+			const abort = new AbortController();
+			let committed = false;
+			const commit = controller.commitInput(abort.signal).then(() => { committed = true; });
+			await ready;
+			abort.abort();
+			await vi.waitFor(() => expect(committed).toBe(true));
+			await commit;
+			expect(captureSignal?.aborted).toBe(true);
+			expect(released).not.toHaveBeenCalled();
+			await controller.agentSettled();
+			expect(controller.history()).toEqual({ undoCount: 1, redoCount: 1, locked: false });
+			expect(deps.calls).not.toContain("entry:pi-undo:start");
+
+			// 新一轮已经完成输入快照后，旧任务才退出，不能覆盖新一轮 staged 或失败状态。
+			expect(controller.beginInput("下一轮", { streaming: false })).toEqual({ action: "continue" });
+			await controller.commitInput(new AbortController().signal);
+			release();
+			await vi.waitFor(() => expect(released).toHaveBeenCalledTimes(2));
+			expect(controller.captureFailed()).toBe(false);
+			await controller.agentSettled();
+			expect(controller.listCheckpoints().at(-1)).toMatchObject({
+				rawPrompt: "下一轮", beforeManifestId: manifest("b").manifestId,
+			});
+			expect(controller.history()).toEqual({ undoCount: 2, redoCount: 0, locked: false });
+		} finally {
+			release();
+			await controller.dispose();
+		}
+	});
+
+	it("已取消的输入不启动延迟扫描，也不写入 start 或 checkpoint", async () => {
+		const capture = vi.fn(async () => manifest("a"));
+		const deps = dependencies({ capture });
+		const controller = new UndoControllerImpl(deps);
+		const abort = new AbortController();
+		abort.abort();
+		try {
+			controller.beginInput("已按 Esc", { streaming: false });
+			await controller.commitInput(abort.signal);
+			await controller.agentSettled();
+			expect(capture).not.toHaveBeenCalled();
+			expect(deps.calls).toEqual([]);
+			expect(controller.captureFailed()).toBe(false);
+			expect(controller.history()).toEqual({ undoCount: 0, redoCount: 0, locked: false });
+		} finally {
+			await controller.dispose();
+		}
+	});
+
+	it("等待共享预热时取消输入，下一轮仍可复用预热基线", async () => {
+		let release!: () => void;
+		let entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const ready = new Promise<void>((resolve) => { entered = resolve; });
+		const capture = vi.fn(async () => { entered(); await gate; return manifest("a"); });
+		const captureBaseline = vi.fn(async (baseline: SnapshotManifest) => baseline);
+		const controller = new UndoControllerImpl(dependencies({ capture, captureBaseline }));
+		try {
+			controller.warmUp();
+			await ready;
+			controller.beginInput("取消预热等待", { streaming: false });
+			const abort = new AbortController();
+			let committed = false;
+			const commit = controller.commitInput(abort.signal).then(() => { committed = true; });
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			abort.abort();
+			await vi.waitFor(() => expect(committed).toBe(true));
+			await commit;
+			await controller.agentSettled();
+
+			controller.beginInput("复用基线", { streaming: false });
+			const next = controller.commitInput(new AbortController().signal);
+			release();
+			await next;
+			expect(capture).toHaveBeenCalledOnce();
+			expect(captureBaseline).toHaveBeenCalledOnce();
+			expect(controller.captureFailed()).toBe(false);
+			await controller.agentSettled();
+			expect(controller.listCheckpoints().at(-1)?.rawPrompt).toBe("复用基线");
+			expect(controller.history()).toEqual({ undoCount: 1, redoCount: 0, locked: false });
+		} finally {
+			release();
+			await controller.dispose();
+		}
+	});
+
 	it("输入前快照遇到暂态捕获失败时重试一次", async () => {
 		let captures = 0;
 		const deps = dependencies({

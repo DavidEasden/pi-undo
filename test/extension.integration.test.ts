@@ -322,7 +322,7 @@ describe("pi-undo extension", () => {
 			captureFailureReason: () => undefined,
 			warmUp: () => {},
 			beginInput: () => { calls.push("begin"); return { action: "continue" as const }; },
-			commitInput: async () => { calls.push("commit"); },
+			commitInput: vi.fn(async (_signal?: AbortSignal) => { calls.push("commit"); }),
 			prepareInput: async () => ({ action: "continue" as const }),
 			beforeAgentStart: async () => { calls.push("before"); },
 			agentSettled: async () => {},
@@ -338,6 +338,7 @@ describe("pi-undo extension", () => {
 		createPiUndoExtension(async (context) => ({ controller, reporter: new StatusReporter(context) }))(pi);
 		const context = {
 			mode: "tui" as const,
+			signal: new AbortController().signal,
 			ui: { setStatus: () => {}, notify: () => {}, getEditorText: () => "", setEditorText: () => {} },
 		};
 
@@ -349,6 +350,7 @@ describe("pi-undo extension", () => {
 		expect(calls).toEqual(["begin", "before"]);
 		await handlers.get("message_end")!({ message: { role: "user" } }, context);
 		expect(calls).toEqual(["begin", "before", "commit"]);
+		expect(controller.commitInput).toHaveBeenCalledWith(context.signal);
 	});
 
 	it("runtime 未初始化时放行输入而不是吞掉（回归测试）", async () => {

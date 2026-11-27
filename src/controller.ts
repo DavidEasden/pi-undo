@@ -216,8 +216,8 @@ export interface UndoController {
 	prepareInput(text: string, context: InputContext): Promise<InputEventResult>;
 	/** 在 input hook 中启动快照，但不等待，供 message_end 前的快速路径使用。 */
 	beginInput?(text: string, context: InputContext): InputEventResult;
-	/** 在用户 message_end 后等待快照并写入 start entry。 */
-	commitInput?(): Promise<void>;
+	/** 在用户 message_end 后等待快照并写入 start entry；取消时立即退出等待。 */
+	commitInput?(signal?: AbortSignal): Promise<void>;
 	beforeAgentStart(): Promise<void>;
 	agentSettled(): Promise<void>;
 	undo(): Promise<OperationResult>;
@@ -317,7 +317,11 @@ export class UndoControllerImpl implements UndoController {
 	private lastCaptureFailureMessage: string | undefined;
 	private warmUpInFlight: Promise<void> | undefined;
 	private warmUpManifest: SnapshotManifest | undefined;
-	private pendingInputCapture: { readonly token: symbol; readonly promise: Promise<void> } | undefined;
+	private pendingInputCapture: {
+		readonly token: symbol;
+		readonly promise: Promise<void>;
+		readonly cancel: () => void;
+	} | undefined;
 	private keepAliveTimer: ReturnType<typeof setInterval> | undefined;
 	private deferAgentStartUntilMessageEnd = false;
 	private runCompletion: RunCompletion | undefined;
@@ -384,8 +388,8 @@ export class UndoControllerImpl implements UndoController {
 		return true;
 	}
 
-	private runBackground<T>(body: () => Promise<T>, deferStart = false): Promise<T> {
-		const scope = createOperationScope({ timeoutMs: this.operationTimeout() });
+	private runBackground<T>(body: () => Promise<T>, deferStart = false, signal?: AbortSignal): Promise<T> {
+		const scope = createOperationScope({ timeoutMs: this.operationTimeout(), signal });
 		this.backgroundScopes.add(scope);
 		const start = (): Promise<T> => runWithOperationContext(scope.context, async () => {
 			try {
@@ -513,28 +517,54 @@ export class UndoControllerImpl implements UndoController {
 		this.lastCaptureFailureMessage = undefined;
 		this.deferAgentStartUntilMessageEnd = true;
 		const token = Symbol("input-capture");
-		const promise = this.runBackground(() => this.captureInputForToken(text, token), true);
-		this.pendingInputCapture = { token, promise };
+		const cancellation = new AbortController();
+		const promise = this.runBackground(() => this.captureInputForToken(text, token), true, cancellation.signal);
+		this.pendingInputCapture = { token, promise, cancel: () => cancellation.abort() };
 		void promise.then(() => {
 			if (this.pendingInputCapture?.token === token) this.pendingInputCapture = undefined;
 		});
 		return { action: "continue" };
 	}
 
-	commitInput(): Promise<void> {
+	commitInput(signal?: AbortSignal): Promise<void> {
 		if (this.inputCommit !== undefined) return this.inputCommit;
-		const commit = this.commitCapturedInput();
+		const commit = this.commitCapturedInput(signal);
 		this.inputCommit = commit.finally(() => { this.inputCommit = undefined; });
 		return this.inputCommit;
 	}
 
-	private async commitCapturedInput(): Promise<void> {
+	private async commitCapturedInput(signal?: AbortSignal): Promise<void> {
 		if (!this.deferAgentStartUntilMessageEnd || this.disposed) return;
-		if (this.runCompletion !== undefined) this.runCompletion.started = true;
+		const run = this.runCompletion;
+		if (run !== undefined) run.started = true;
 		const pending = this.pendingInputCapture;
-		if (pending !== undefined) await pending.promise;
+		if (pending !== undefined) {
+			let cancel!: () => void;
+			const aborted = new Promise<void>((resolve) => {
+				cancel = () => {
+					// 先废弃归属，再取消扫描：迟到结果不能写入下一轮，也不能误报捕获失败。
+					if (this.pendingInputCapture === pending) this.pendingInputCapture = undefined;
+					pending.cancel();
+					resolve();
+				};
+			});
+			if (signal?.aborted) cancel();
+			else signal?.addEventListener("abort", cancel, { once: true });
+			try {
+				// 文件系统或共享预热可能尚未退出；Pi 的事件队列不能等待它们清理完毕。
+				await Promise.race([pending.promise, aborted]);
+			} finally {
+				signal?.removeEventListener("abort", cancel);
+			}
+		}
+		if (this.disposed || this.runCompletion !== run) return;
 		this.pendingInputCapture = undefined;
 		this.deferAgentStartUntilMessageEnd = false;
+		if (signal?.aborted) {
+			this.staged = undefined;
+			this.finishRun(run);
+			return;
+		}
 		await this.startAgentRun();
 	}
 
@@ -612,7 +642,9 @@ export class UndoControllerImpl implements UndoController {
 	private async materializePendingBeforeCapture(): Promise<void> {
 		const pending = this.undoStack.filter((checkpoint) => isCheckpointAfterPending(checkpoint));
 		for (const checkpoint of pending) {
+			checkOperation();
 			const materialized = await this.materializeAfter(checkpoint);
+			checkOperation();
 			if (materialized !== undefined) continue;
 			// 新 run 开始后当前状态就不再是该 checkpoint 的 after；无法物化时必须停止历史。
 			this.lock("pending_after_materialization_failed");
@@ -621,13 +653,16 @@ export class UndoControllerImpl implements UndoController {
 	}
 
 	private async captureInputBaseline(): Promise<{ manifest: SnapshotManifest; changeCursor?: SettledChangeCursor }> {
+		checkOperation();
 		// 新 run 的输入快照必须在 pending after 物化之后执行，避免把下一轮修改误当成上一轮 after。
 		await this.materializePendingBeforeCapture();
+		checkOperation();
 		// warm-up 仍在进行时先等待，确保随后可以消费已完成的 baseline，而不是再次完整 capture。
 		const warmUp = this.warmUpInFlight;
 		if (warmUp !== undefined) await warmUp;
 		// 输入事件已经返回后再进入实际捕获，优先让终端处理 Esc、命令和重绘。
 		await yieldToEventLoop();
+		checkOperation();
 		const warmUpManifest = this.warmUpManifest;
 		this.warmUpManifest = undefined;
 		if (this.warmUpInFlight === warmUp) this.warmUpInFlight = undefined;
@@ -1416,6 +1451,7 @@ export class UndoControllerImpl implements UndoController {
 		if (warmUp !== undefined) await warmUp;
 		const lease = await this.dependencies.acquireWorkspaceLock();
 		try {
+			checkOperation();
 			return await this.dependencies.capture(scopePaths);
 		} catch (error) {
 			this.recordUnsafeExit(error);
@@ -1587,6 +1623,7 @@ export class UndoControllerImpl implements UndoController {
 		}
 		const captureStartedAt = performance.now();
 		try {
+			checkOperation();
 			return await captureBaseline(baseline, onDiagnostics, onTiming, options);
 		} catch (error) {
 			this.recordUnsafeExit(error);

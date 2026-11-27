@@ -382,7 +382,7 @@ export function createPiUndoExtension(runtimeFactory: PiUndoRuntimeFactory): (pi
 			const active = runtime;
 			const messageGeneration = generation;
 			if (active === undefined || active.controller.commitInput === undefined) return;
-			await active.controller.commitInput();
+			await active.controller.commitInput(context.signal);
 			if (runtime !== active || generation !== messageGeneration) return;
 			if (active.controller.captureFailed() && !captureFailureNotified) {
 				captureFailureNotified = true;
