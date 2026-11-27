@@ -60,9 +60,9 @@
 		"proper-lockfile": "4.1.2"
 	},
 	"devDependencies": {
-		"@earendil-works/pi-ai": "1.4.0",
-		"@earendil-works/pi-coding-agent": "1.4.0",
-		"@earendil-works/pi-tui": "1.4.0",
+		"@earendil-works/pi-ai": "1.7.0",
+		"@earendil-works/pi-coding-agent": "1.7.0",
+		"@earendil-works/pi-tui": "1.7.0",
 		"@types/node": "24.12.4",
 		"@types/proper-lockfile": "4.1.4",
 		"typescript": "5.9.3",
